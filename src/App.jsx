@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import BrainGraph from './components/BrainGraph.jsx';
-import { MAX_IMPORT_ITEMS, parseImportText } from './lib/importers.js';
+import { MAX_IMPORT_ITEMS, isLogLikeChunk, parseImportText } from './lib/importers.js';
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 const SOURCE_COLORS = {
@@ -61,11 +62,17 @@ function App() {
   const [importFile, setImportFile] = useState(null);
   const [importText, setImportText] = useState('');
   const [includeAssistant, setIncludeAssistant] = useState(false);
+  const [skipLogText, setSkipLogText] = useState(true);
+  const [conversationPartCount, setConversationPartCount] = useState(0);
+  const [confirmLargeImport, setConfirmLargeImport] = useState(false);
   const [importParsed, setImportParsed] = useState(null);
   const [importError, setImportError] = useState('');
   const [importing, setImporting] = useState(false);
   const [importProgress, setImportProgress] = useState(0);
   const [importSummary, setImportSummary] = useState('');
+  const [recentImports, setRecentImports] = useState([]);
+  const [lastImport, setLastImport] = useState(null);
+  const [legacyCleanupStatus, setLegacyCleanupStatus] = useState({ count: 0, backupPath: null, error: '' });
   const [pendingImportPulse, setPendingImportPulse] = useState(null);
   const [embeddingStatus, setEmbeddingStatus] = useState({ state: 'loading' });
   const [databaseStatus, setDatabaseStatus] = useState({ writable: true, message: '' });
@@ -80,6 +87,13 @@ function App() {
   searchState.current = { query: debouncedQuery, sourceFilter };
 
   const selectedMemory = memories.find((memory) => String(memory.id) === String(selectedId)) || null;
+  useEffect(() => {
+    let active = true;
+    if (selectedMemory && / \(part \d+\/\d+\)$/.test(selectedMemory.title || '') && window.brain.countConversationParts) {
+      window.brain.countConversationParts(selectedMemory.id).then((count) => { if (active) setConversationPartCount(count); }).catch(() => { if (active) setConversationPartCount(0); });
+    } else setConversationPartCount(0);
+    return () => { active = false; };
+  }, [selectedMemory?.id, selectedMemory?.title]);
   const linkedMemories = useMemo(() => {
     if (!selectedMemory) return [];
     return links.flatMap((link) => {
@@ -96,13 +110,15 @@ function App() {
   const rejectedPairKeys = useMemo(() => new Set(rejectedLinks.map((row) => `${row.a_id}:${row.b_id}`)), [rejectedLinks]);
 
   async function refreshData() {
-    const [savedMemories, savedCounts, savedLinks, savedSuggestions, savedRejected] = await Promise.all([
-      window.brain.listMemories(), window.brain.countBySource(), window.brain.listLinks(), window.brain.listSuggestions(), window.brain.listRejected()
+    const [savedMemories, savedCounts, savedLinks, savedSuggestions, savedRejected, savedImports, cleanupStatus] = await Promise.all([
+      window.brain.listMemories(), window.brain.countBySource(), window.brain.listLinks(), window.brain.listSuggestions(), window.brain.listRejected(), window.brain.listRecentImports?.() || Promise.resolve([]), window.brain.getLegacyCleanupStatus?.() || Promise.resolve({ count: 0, backupPath: null, error: '' })
     ]);
     setMemories(savedMemories);
     setLinks(savedLinks);
     setSuggestions(savedSuggestions);
     setRejectedLinks(savedRejected);
+    setRecentImports(savedImports);
+    setLegacyCleanupStatus(cleanupStatus);
     setCounts({ ...EMPTY_COUNTS, ...savedCounts });
     return { savedMemories, savedLinks, savedCounts };
   }
@@ -117,13 +133,15 @@ function App() {
   useEffect(() => {
     let active = true;
     window.brain.getDatabaseStatus().then((status) => { if (active) setDatabaseStatus(status); }).catch(() => {});
-    Promise.all([window.brain.listMemories(), window.brain.countBySource(), window.brain.listLinks(), window.brain.listSuggestions(), window.brain.listRejected()]).then(([savedMemories, savedCounts, savedLinks, savedSuggestions, savedRejected]) => {
+    Promise.all([window.brain.listMemories(), window.brain.countBySource(), window.brain.listLinks(), window.brain.listSuggestions(), window.brain.listRejected(), window.brain.listRecentImports?.() || Promise.resolve([]), window.brain.getLegacyCleanupStatus?.() || Promise.resolve({ count: 0, backupPath: null, error: '' })]).then(([savedMemories, savedCounts, savedLinks, savedSuggestions, savedRejected, savedImports, cleanupStatus]) => {
       if (!active) return;
       setMemories(savedMemories);
       setCounts({ ...EMPTY_COUNTS, ...savedCounts });
       setLinks(savedLinks);
       setSuggestions(savedSuggestions);
       setRejectedLinks(savedRejected);
+      setRecentImports(savedImports);
+      setLegacyCleanupStatus(cleanupStatus);
       setDataReady(true);
     });
     return () => { active = false; };
@@ -213,6 +231,17 @@ function App() {
     await refreshSearch();
   }
 
+  async function handleDeleteConversationParts() {
+    if (!selectedMemory || conversationPartCount < 2) return;
+    const baseTitle = selectedMemory.title.replace(/ \(part \d+\/\d+\)$/, '');
+    if (!window.confirm(`Delete ${conversationPartCount} memories from '${baseTitle}'?`)) return;
+    await window.brain.deleteConversationParts(selectedMemory.id);
+    setSelectedId(null);
+    setPickerOpen(false);
+    await refreshData();
+    await refreshSearch();
+  }
+
   async function handleUnlink(linkId) {
     await window.brain.deleteLink(linkId);
     await refreshData();
@@ -276,9 +305,11 @@ function App() {
       if (!pasted && !importFile) throw new Error('Choose a file or paste conversation text first.');
       const rawText = pasted ? importText : await readFileText(importFile);
       const fileName = pasted ? 'Pasted text.txt' : importFile.name;
-      const parsed = parseImportText(rawText, fileName, includeAssistant);
+      const parsed = parseImportText(rawText, fileName, includeAssistant, skipLogText);
+      if (parsed.error) throw new Error(parsed.error);
       const items = parsed.items.map((item) => ({ ...item, source: importSource }));
-      setImportParsed({ ...parsed, items });
+      setImportParsed({ ...parsed, items, allItems: (parsed.allItems || parsed.items).map((item) => ({ ...item, source: importSource })) });
+      setConfirmLargeImport(false);
       if (!parsed.total) setImportError('No importable chunks found. Chunks shorter than 40 characters are skipped.');
     } catch (error) {
       setImportParsed(null);
@@ -286,8 +317,19 @@ function App() {
     }
   }
 
+  function toggleSkipLogText(checked) {
+    setSkipLogText(checked);
+    setImportParsed((current) => {
+      if (!current?.allItems) return current;
+      const logSkipped = current.allItems.filter((item) => isLogLikeChunk(item.content)).length;
+      const items = checked ? current.allItems.filter((item) => !isLogLikeChunk(item.content)) : current.allItems;
+      return { ...current, items, total: items.length, logSkipped };
+    });
+  }
+
   async function handleImport() {
     if (!importParsed || importing || importParsed.items.length === 0) return;
+    if (importParsed.rawTotal > 1500 && !confirmLargeImport) return;
     const items = importParsed.items.slice(0, MAX_IMPORT_ITEMS);
     const known = new Set(memories.filter((memory) => memory.source === importSource).map((memory) => normalizeImportedContent(memory.content)));
     const candidateContents = [];
@@ -303,13 +345,17 @@ function App() {
     setImportSummary('');
     let inserted = 0;
     let skipped = 0;
+    let importId = null;
     try {
+      if (window.brain.createImport) importId = await window.brain.createImport(importSource);
       for (let offset = 0; offset < items.length; offset += 200) {
-        const result = await window.brain.importMemories(items.slice(offset, offset + 200));
+        const result = await window.brain.importMemories(items.slice(offset, offset + 200), importId);
         inserted += result.inserted;
         skipped += result.skipped;
         setImportProgress(Math.round((Math.min(offset + 200, items.length) / items.length) * 100));
       }
+      const completedImport = importId !== null && window.brain.finishImport ? await window.brain.finishImport(importId) : null;
+      if (completedImport) setLastImport(completedImport);
       const { savedMemories } = await refreshData();
       await refreshSearch();
       if (inserted > 0) {
@@ -318,10 +364,31 @@ function App() {
       }
       setImportSummary(`Imported ${inserted}, skipped ${skipped} duplicates`);
     } catch (error) {
+      if (importId !== null && window.brain.finishImport) {
+        try { const completedImport = await window.brain.finishImport(importId); if (completedImport) setLastImport(completedImport); await refreshData(); } catch {}
+      }
       setImportError(error.message || 'Import failed. Some completed batches may already be saved.');
     } finally {
       setImporting(false);
     }
+  }
+
+  async function undoImport(importId) {
+    if (!window.brain.undoImport) return;
+    await window.brain.undoImport(importId);
+    setLastImport((last) => Number(last?.id) === Number(importId) ? null : last);
+    await refreshData();
+    await refreshSearch();
+  }
+
+  async function handleLegacyCleanup() {
+    if (!window.brain.cleanupLegacyJunk) return;
+    if (legacyCleanupStatus.count < 200 || !legacyCleanupStatus.backupPath) return;
+    if (!window.confirm(`Remove exactly ${legacyCleanupStatus.count} legacy Claude import memories? The encrypted backup is saved at ${legacyCleanupStatus.backupPath}.`)) return;
+    const result = await window.brain.cleanupLegacyJunk();
+    setImportSummary(`Removed ${result.deleted} legacy junk memories. Backup: ${result.backupPath}`);
+    await refreshData();
+    await refreshSearch();
   }
 
   const importDuplicateCount = useMemo(() => {
@@ -383,6 +450,7 @@ function App() {
               <section className="config-section"><h2>Claude Code</h2><pre>{claudeCodeCommand}</pre><button type="button" onClick={() => copyText(claudeCodeCommand, 'claude')}>{copied === 'claude' ? 'Copied' : 'Copy command'}</button></section>
               <section className="config-section"><h2>Codex CLI</h2><p>Add this to <code>~/.codex/config.toml</code>.</p><pre>{codexConfig}</pre><button type="button" onClick={() => copyText(codexConfig, 'codex')}>{copied === 'codex' ? 'Copied' : 'Copy config'}</button></section>
             </> : <p className="empty-note">Starting the local MCP server...</p>}
+            {legacyCleanupStatus.count >= 200 && <section className="legacy-cleanup-section"><h2>Legacy import cleanup</h2><p>{legacyCleanupStatus.count.toLocaleString()} matching Claude memories found.</p>{legacyCleanupStatus.error && <p className="import-error">Safety backup failed: {legacyCleanupStatus.error}</p>}<button type="button" disabled={!legacyCleanupStatus.backupPath} onClick={handleLegacyCleanup}>{legacyCleanupStatus.backupPath ? 'Remove legacy junk import' : 'Preparing safety backup…'}</button></section>}
           </section>
         ) : suggestionsOpen ? (
           <section className="suggestions-view">
@@ -428,6 +496,7 @@ function App() {
             <div className="detail-actions">
               <button type="button" onClick={() => graphRef.current?.retrieve(selectedMemory.id)}>Retrieve</button>
               <button type="button" className="danger-button" onClick={() => handleDelete(selectedMemory.id)}>Delete</button>
+              {conversationPartCount >= 2 && / \(part \d+\/\d+\)$/.test(selectedMemory.title || '') && <button type="button" className="danger-button" onClick={handleDeleteConversationParts}>Delete all {conversationPartCount} parts of this chat</button>}
             </div>
             <section className="detail-links">
               <div className="section-heading"><h2>Linked memories</h2><button type="button" onClick={() => { setPickerOpen((open) => !open); setPickerQuery(''); }}>＋ Link to...</button></div>
@@ -504,7 +573,7 @@ function App() {
       <button className="sidebar-toggle" type="button" aria-label={sidebarCollapsed ? 'Expand memories sidebar' : 'Collapse memories sidebar'} aria-expanded={!sidebarCollapsed} onClick={() => setSidebarCollapsed((collapsed) => !collapsed)} style={{ left: sidebarCollapsed ? 32 : 'min(360px, 92vw)' }}>{sidebarCollapsed ? '›' : '‹'}</button>
       {suggestionToast && <button className="suggestion-toast" type="button" onClick={() => { setSuggestionToast(false); setSuggestionsOpen(true); }}>1 possible link found - Review</button>}
 
-      {addOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setAddOpen(false); }}>
+      {addOpen && createPortal(<div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setAddOpen(false); }}>
         <form className="add-modal" onSubmit={handleAdd}>
           <header><h2>{addMode === 'add' ? 'Add memory' : 'Import memories'}</h2><button type="button" aria-label="Close" onClick={() => setAddOpen(false)}>×</button></header>
           <nav className="modal-tabs" aria-label="Memory action">
@@ -517,27 +586,31 @@ function App() {
             <label>Content<textarea required rows="6" value={addContent} onChange={(event) => setAddContent(event.target.value)} /></label>
             <button className="save-button" type="submit" disabled={!databaseStatus.writable || saving || !addContent.trim()}>{saving ? 'Saving...' : 'Save memory'}</button>
           </> : <>
-            <label>Target source<select value={importSource} onChange={(event) => { setImportSource(event.target.value); setImportParsed(null); setImportSummary(''); }}>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label>
-            <label>Conversation file<input type="file" accept=".json,.txt,.md,application/json,text/plain,text/markdown" onChange={(event) => { setImportFile(event.target.files?.[0] || null); setImportText(''); setImportParsed(null); setImportSummary(''); }} /></label>
-            <label className="import-check"><input type="checkbox" checked={includeAssistant} onChange={(event) => { setIncludeAssistant(event.target.checked); setImportParsed(null); }} />Include assistant replies</label>
-            <label>Or paste raw text<textarea rows="4" placeholder="Paste conversation text here..." value={importText} onChange={(event) => { setImportText(event.target.value); if (event.target.value) setImportFile(null); setImportParsed(null); setImportSummary(''); }} /></label>
+            <label>Target source<select value={importSource} onChange={(event) => { setImportSource(event.target.value); setImportParsed(null); setImportSummary(''); setConfirmLargeImport(false); }}>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label>
+            <label>Conversation file<input type="file" accept=".json,.txt,.md,application/json,text/plain,text/markdown" onChange={(event) => { setImportFile(event.target.files?.[0] || null); setImportText(''); setImportParsed(null); setImportSummary(''); setImportError(''); setConfirmLargeImport(false); }} /></label>
+            <label className="import-check"><input type="checkbox" checked={includeAssistant} onChange={(event) => { setIncludeAssistant(event.target.checked); setImportParsed(null); setConfirmLargeImport(false); }} />Include assistant replies</label>
+            <label className="import-check"><input type="checkbox" checked={skipLogText} onChange={(event) => { toggleSkipLogText(event.target.checked); setConfirmLargeImport(false); }} />Skip terminal/log text</label>
+            <label>Or paste raw text<textarea rows="4" placeholder="Paste conversation text here..." value={importText} onChange={(event) => { setImportText(event.target.value); if (event.target.value) setImportFile(null); setImportParsed(null); setImportSummary(''); setConfirmLargeImport(false); }} /></label>
             {importParsed && <section className="import-preview">
               <strong>Preview</strong>
-              <p>{importParsed.total} chunks · {importDuplicateCount} look like duplicates</p>
-              {importParsed.total > 2000 && <p className="import-warning">Large import: the graph may slow down.</p>}
-              {importParsed.total > MAX_IMPORT_ITEMS && <p className="import-warning">Import is capped at {MAX_IMPORT_ITEMS.toLocaleString()} chunks; only the first {MAX_IMPORT_ITEMS.toLocaleString()} will be imported.</p>}
+              {skipLogText && importParsed.logSkipped > 0 && <p>{importParsed.logSkipped} chunks look like logs and will be skipped</p>}
+              <p>{importParsed.total} chunks after skipping · {importDuplicateCount} look like duplicates</p>
+              {importParsed.rawTotal > 1500 && <label className="large-import-check"><input type="checkbox" checked={confirmLargeImport} onChange={(event) => setConfirmLargeImport(event.target.checked)} />I understand this is a large import</label>}
+              {importParsed.capped && <p className="import-warning">Import is capped at {MAX_IMPORT_ITEMS.toLocaleString()} chunks; only the first {MAX_IMPORT_ITEMS.toLocaleString()} will be imported.</p>}
               <ol>{importParsed.items.slice(0, 5).map((item, index) => <li key={`${item.title}-${index}`}><b>{item.title}</b><small>{item.content.replace(/\s+/g, ' ').slice(0, 120)}</small></li>)}</ol>
             </section>}
             {importError && <p className="import-error" role="alert">{importError}</p>}
             {importSummary && <p className="import-summary" role="status">{importSummary}</p>}
+            {lastImport && <button type="button" className="undo-import-button" onClick={() => undoImport(lastImport.id)}>Undo this import</button>}
+            {recentImports.length > 0 && <section className="recent-imports"><strong>Recent imports</strong>{recentImports.map((item) => <div key={item.id}><span>{item.source} · {item.count} memories</span><button type="button" onClick={() => undoImport(item.id)}>Undo</button></div>)}</section>}
             {importing && <div className="import-progress"><progress max="100" value={importProgress} /><span>{importProgress}%</span></div>}
             <div className="import-actions">
               <button type="button" className="cancel-button" onClick={() => setAddOpen(false)} disabled={importing}>Cancel</button>
-              {!importParsed ? <button type="button" className="save-button" onClick={handleImportPreview} disabled={importing}>Preview</button> : <button type="button" className="save-button" onClick={handleImport} disabled={importing || importParsed.items.length === 0}>{importing ? 'Importing...' : 'Import'}</button>}
+              {!importParsed ? <button type="button" className="save-button" onClick={handleImportPreview} disabled={importing}>Preview</button> : <button type="button" className="save-button" onClick={handleImport} disabled={importing || importParsed.items.length === 0 || (importParsed.rawTotal > 1500 && !confirmLargeImport)}>{importing ? 'Importing...' : 'Import'}</button>}
             </div>
           </>}
         </form>
-      </div>}
+      </div>, document.body)}
 
       <style>{`
         html, body, #root { width:100%;height:100%;margin:0;overflow:hidden; }
@@ -629,8 +702,8 @@ function App() {
         .picker input { padding:8px 9px;font-size:11px; }
         .picker-results { max-height:230px;overflow-y:auto; }
         .picker-result { width:100%; }
-        .modal-backdrop { position:fixed;z-index:20;inset:0;display:grid;place-items:center;padding:16px;background:rgba(1,4,10,.72);backdrop-filter:blur(7px); }
-        .add-modal { display:grid;gap:13px;width:min(430px,calc(100vw - 36px));max-height:calc(100vh - 36px);overflow:auto;padding:18px;border:1px solid rgba(175,195,224,.22);border-radius:12px;background:#0c1421;box-shadow:0 20px 70px rgba(0,0,0,.48); }
+        .modal-backdrop { box-sizing:border-box;position:fixed;z-index:20;inset:0;display:grid;place-items:center;overflow:auto;padding:16px;background:rgba(1,4,10,.72);backdrop-filter:blur(7px); }
+        .add-modal { box-sizing:border-box;display:grid;gap:13px;width:min(560px,calc(100vw - 32px));max-height:calc(100vh - 32px);min-width:0;overflow-x:hidden;overflow-y:auto;padding:18px;border:1px solid rgba(175,195,224,.22);border-radius:12px;background:#0c1421;box-shadow:0 20px 70px rgba(0,0,0,.48); }
         .add-modal header { display:flex;align-items:center;justify-content:space-between; }
         .add-modal h2 { margin:0;color:#e9f0fb;font-size:16px; }
         .add-modal header button { border:0;color:#9aa9bc;background:transparent;font:22px system-ui,sans-serif;cursor:pointer; }
@@ -638,27 +711,35 @@ function App() {
         .modal-tabs { display:flex;gap:6px;padding-bottom:8px;border-bottom:1px solid rgba(175,195,224,.14); }
         .modal-tabs button,.cancel-button { border:1px solid rgba(159,181,210,.2);border-radius:6px;padding:6px 11px;color:#aab9cb;background:#111b29;font:11px system-ui,sans-serif;cursor:pointer; }
         .modal-tabs button.selected { color:#d8ebff;border-color:rgba(143,196,255,.42);background:#1b3048; }
-        .add-modal input[type=file] { padding:8px;font-size:11px; }
+        .add-modal input[type=file] { box-sizing:border-box;width:100%;max-width:100%;min-width:0;padding:8px;font-size:11px; }
         .add-modal label.import-check { display:flex;align-items:center;gap:8px; }
         .add-modal label.import-check input { width:14px;height:14px;accent-color:#8dc4ff; }
+        .add-modal label.large-import-check { display:flex;align-items:center;gap:8px;margin:5px 0;color:#f0d69b;font-size:10px; }
+        .add-modal label.large-import-check input { width:14px;height:14px;accent-color:#edc96c; }
         .add-modal label span { color:#8290a4; }
-        .add-modal textarea { resize:vertical;min-height:120px; }
+        .add-modal textarea { box-sizing:border-box;width:100%;max-width:100%;min-width:0;resize:vertical;min-height:120px; }
         .save-button { justify-self:end;padding:9px 14px;color:#08111d;background:#8dc4ff;font-weight:600; }
         .save-button:disabled { opacity:.55;cursor:default; }
         .import-preview { padding:10px;border:1px solid rgba(175,195,224,.14);border-radius:7px;background:rgba(9,15,24,.75); }
         .import-preview > strong { color:#e0eaf7;font-size:12px; }
         .import-preview p { margin:4px 0 8px;color:#9aaac0;font-size:10px; }
         .import-preview .import-warning,.import-error { color:#ff8888;font-size:10px; }
-        .import-preview ol { display:grid;gap:7px;margin:8px 0 0;padding-left:21px; }
+        .import-preview ol { display:grid;gap:7px;min-width:0;margin:8px 0 0;padding-left:21px; }
         .import-preview li { color:#9eb0c7;font-size:10px; }
-        .import-preview li b,.import-preview li small { display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+        .import-preview li b,.import-preview li small { display:-webkit-box;min-width:0;overflow:hidden;overflow-wrap:anywhere;text-overflow:ellipsis;white-space:normal;-webkit-box-orient:vertical; }
+        .import-preview li b { -webkit-line-clamp:1; }
+        .import-preview li small { -webkit-line-clamp:2; }
         .import-preview li b { color:#dce7f4;font-weight:550; }
         .import-preview li small { color:#8393a8;font-size:9px; }
         .import-error { margin:0;color:#ff8888;font-size:10px; }
         .import-summary { margin:0;color:#9be0bd;font-size:11px; }
+        .undo-import-button,.recent-imports button { border:1px solid rgba(143,196,255,.25);border-radius:6px;padding:6px 9px;color:#c7e1ff;background:#182a40;font:10px system-ui,sans-serif;cursor:pointer; }
+        .recent-imports { display:grid;gap:6px;padding:8px;border:1px solid rgba(175,195,224,.13);border-radius:7px;color:#b9c9dc;font-size:10px; }
+        .recent-imports > strong { color:#dce6f2; }
+        .recent-imports > div { display:flex;justify-content:space-between;align-items:center;gap:8px; }
         .import-progress { display:flex;align-items:center;gap:8px;color:#b8c8dd;font-size:10px; }
         .import-progress progress { width:100%;height:8px;accent-color:#8dc4ff; }
-        .import-actions { display:flex;justify-content:flex-end;gap:8px; }
+        .import-actions { position:sticky;bottom:-18px;display:flex;justify-content:flex-end;gap:8px;margin:0 -18px -18px;padding:12px 18px 18px;border-top:1px solid rgba(175,195,224,.12);background:#0c1421; }
         .connect-view h1 { margin:5px 0 6px;color:#edf3fc;font-size:17px; }
         .connect-hint,.config-section p { margin:0 0 10px;color:#8898ad;font-size:10px; }
         .connect-field { display:grid;gap:5px;margin:13px 0;color:#aab9cb;font-size:10px; }
@@ -668,6 +749,11 @@ function App() {
         .config-section { margin-top:16px; }
         .config-section h2 { margin:0 0 5px;color:#dce6f2;font-size:12px; }
         .config-section pre { max-height:155px;overflow:auto;margin:6px 0;padding:9px;border:1px solid rgba(175,195,224,.13);border-radius:6px;color:#c7d4e5;background:#080e18;font:9px/1.45 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text; }
+        .legacy-cleanup-section { margin-top:20px;padding:11px;border:1px solid rgba(255,136,136,.25);border-radius:8px;background:rgba(80,34,36,.16); }
+        .legacy-cleanup-section h2 { margin:0 0 5px;color:#f1c7c7;font-size:12px; }
+        .legacy-cleanup-section p { margin:4px 0 8px;color:#c5a5a5;font-size:10px; }
+        .legacy-cleanup-section button { border:1px solid rgba(255,136,136,.3);border-radius:6px;padding:7px 9px;color:#ffd5d5;background:#48272a;font:10px system-ui,sans-serif;cursor:pointer; }
+        .legacy-cleanup-section button:disabled { opacity:.55;cursor:default; }
       `}</style>
     </main>
   );

@@ -1,6 +1,29 @@
 const MAX_CHUNK_LENGTH = 1200;
 const MIN_CHUNK_LENGTH = 40;
-const MAX_IMPORT_ITEMS = 5000;
+const MAX_IMPORT_ITEMS = 3000;
+const LOG_LINE_RATIO = 0.35;
+
+// Keep detection in one place so the threshold and signatures can be tuned together.
+function isLogLikeChunk(chunk) {
+  const lines = String(chunk || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (!lines.length) return false;
+  const signatures = [
+    /^(?:[\w.-]+@[\w.-]+(?::[^\s]*)?[#$]|\$\s|>\s)/,
+    /^(?:[0-9a-f]{4,8}:\s+)?(?:[0-9a-f]{2,}(?:\s+|$)){4,}/i,
+    /^\[[01]\]\s/,
+    /\b(?:ERROR:|WARN(?:ING)?:|Traceback\b|at .+\(.+:\d+\))/i,
+    /^(?:\.{0,2}\/|\/|~\/|[A-Za-z]:\\|[\w.-]+\/)[^\s]*|^total\s+\d+\s*$/,
+    /^[-dlcbps][rwxStTs-]{9}\s+\d+\s+\S+\s+\S+\s+\d+\s+\S+\s+\d+\s+[\w.-]+/,
+    /^(?:[\[{].*[\]}]|"[^"\n]+"\s*:|\{\s*"?[^\n]*\}\s*,?\s*)$/,
+    /^(?:Changed files:|Saved:)\s*$/i,
+    /^-?\s*\[[^\]]+\]\([^)]*\)\s*$/
+  ];
+  const logLines = lines.filter((line) => signatures.some((pattern) => pattern.test(line)));
+  // Tool/Codex reports need both a report heading and several file-link rows.
+  const report = lines.some((line) => /^(?:Changed files:|Saved:)\s*$/i.test(line)) &&
+    lines.filter((line) => /^-?\s*\[[^\]]+\]\([^)]*\)\s*$/.test(line)).length >= 2;
+  return report || logLines.length / lines.length > LOG_LINE_RATIO;
+}
 
 function flattenText(value) {
   if (typeof value === 'string') return value;
@@ -81,10 +104,15 @@ function chatGptMessages(conversation, includeAssistant) {
 }
 
 function claudeMessages(conversation, includeAssistant) {
-  if (!Array.isArray(conversation?.messages)) return null;
-  return conversation.messages
+  if (!Array.isArray(conversation?.chat_messages)) return null;
+  return conversation.chat_messages
     .filter((message) => isIncludedRole(messageRole(message), includeAssistant))
-    .map((message) => flattenText(message.text ?? message.content).trim())
+    .map((message) => {
+      const textBlocks = Array.isArray(message.content)
+        ? message.content.filter((block) => block?.type === 'text' && typeof block.text === 'string').map((block) => block.text)
+        : [];
+      return (textBlocks.length ? textBlocks.join('\n') : (typeof message.text === 'string' ? message.text : '')).trim();
+    })
     .filter(Boolean);
 }
 
@@ -109,7 +137,8 @@ function parseConversationJson(data, includeAssistant, fallbackTitle) {
     const messages = chatMessages ?? claude;
     if (messages === null) continue;
     recognized = true;
-    const title = String(conversation.title || conversation.name || fallbackTitle || `Conversation ${index + 1}`).trim();
+    const namedTitle = String(conversation.name || conversation.title || '').trim();
+    const title = namedTitle || messages[0]?.trim().slice(0, 40) || fallbackTitle || `Conversation ${index + 1}`;
     const conversationItems = makeConversationItems(title, messages);
     total += conversationItems.length;
     if (items.length < MAX_IMPORT_ITEMS) items.push(...conversationItems.slice(0, MAX_IMPORT_ITEMS - items.length));
@@ -117,24 +146,31 @@ function parseConversationJson(data, includeAssistant, fallbackTitle) {
   return { items, total, recognized, capped: total > MAX_IMPORT_ITEMS };
 }
 
-export function parseImportText(rawText, fileName = 'Imported text', includeAssistant = false) {
+function applyLogFilter(parsed, skipLogText) {
+  const allItems = parsed.items;
+  const logSkipped = allItems.filter((item) => isLogLikeChunk(item.content)).length;
+  const items = skipLogText ? allItems.filter((item) => !isLogLikeChunk(item.content)) : allItems;
+  return { ...parsed, items, allItems, rawTotal: parsed.rawTotal ?? parsed.total, total: items.length, logSkipped };
+}
+
+export function parseImportText(rawText, fileName = 'Imported text', includeAssistant = false, skipLogText = true) {
   const text = String(rawText || '');
   const fallbackTitle = String(fileName).replace(/\\/g, '/').split('/').pop().replace(/\.(json|txt|md)$/i, '').trim() || 'Imported text';
   const isPlainText = /\.(txt|md)$/i.test(fileName);
-  if (!isPlainText) {
+  if (/\.json$/i.test(fileName)) {
     try {
       const parsed = parseConversationJson(JSON.parse(text), includeAssistant, fallbackTitle);
-      if (parsed.recognized) return parsed;
-    } catch {
-      // Invalid or unrecognized JSON is imported as readable plain text below.
-    }
+      if (parsed.recognized) return applyLogFilter(parsed, skipLogText);
+    } catch {}
+    return { items: [], total: 0, recognized: false, capped: false, error: 'Unrecognized JSON format' };
   }
+  if (!isPlainText) return { items: [], total: 0, recognized: false, capped: false, error: 'Choose a .json, .txt, or .md file.' };
   const chunks = chunkText(text);
   const items = chunks.slice(0, MAX_IMPORT_ITEMS).map((content, index) => ({
     title: chunks.length > 1 ? `${fallbackTitle} (part ${index + 1}/${chunks.length})` : fallbackTitle,
     content
   }));
-  return { items, total: chunks.length, recognized: false, capped: chunks.length > MAX_IMPORT_ITEMS };
+  return applyLogFilter({ items, total: chunks.length, recognized: false, capped: chunks.length > MAX_IMPORT_ITEMS }, skipLogText);
 }
 
-export { MAX_IMPORT_ITEMS, MAX_CHUNK_LENGTH, MIN_CHUNK_LENGTH, chunkText };
+export { MAX_IMPORT_ITEMS, MAX_CHUNK_LENGTH, MIN_CHUNK_LENGTH, LOG_LINE_RATIO, isLogLikeChunk, chunkText };

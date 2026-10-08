@@ -2,7 +2,13 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('brain', {
   addMemory: (memory) => ipcRenderer.invoke('memories:add', memory),
-  importMemories: (items) => ipcRenderer.invoke('memories:import', items),
+  createImport: (source) => ipcRenderer.invoke('imports:create', source),
+  importMemories: (items, importId) => ipcRenderer.invoke('memories:import', items, importId),
+  finishImport: (id) => ipcRenderer.invoke('imports:finish', id),
+  listRecentImports: () => ipcRenderer.invoke('imports:list'),
+  undoImport: (id) => ipcRenderer.invoke('imports:undo', id),
+  getLegacyCleanupStatus: () => ipcRenderer.invoke('legacy-cleanup:status'),
+  cleanupLegacyJunk: () => ipcRenderer.invoke('legacy-cleanup:run'),
   listLinks: () => ipcRenderer.invoke('links:list'),
   createLink: (aId, bId) => ipcRenderer.invoke('links:create', aId, bId),
   deleteLink: (id) => ipcRenderer.invoke('links:delete', id),
@@ -13,6 +19,8 @@ contextBridge.exposeInMainWorld('brain', {
   restoreRejected: (id) => ipcRenderer.invoke('suggestions:restore', id),
   dismissSuggestions: () => ipcRenderer.invoke('suggestions:dismiss-all'),
   deleteMemory: (id) => ipcRenderer.invoke('memories:delete', id),
+  countConversationParts: (id) => ipcRenderer.invoke('memories:conversation-parts:count', id),
+  deleteConversationParts: (id) => ipcRenderer.invoke('memories:conversation-parts:delete', id),
   listMemories: () => ipcRenderer.invoke('memories:list'),
   searchMemories: (query, source, limit, offset) => ipcRenderer.invoke('memories:search', query, source, limit, offset),
   countBySource: () => ipcRenderer.invoke('memories:count-by-source'),

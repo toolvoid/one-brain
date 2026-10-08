@@ -1,6 +1,6 @@
 const { app, BrowserWindow, ipcMain, Menu, safeStorage } = require('electron');
 const path = require('path');
-const { initializeDatabase, getDatabaseStatus, addMemory, importMemories, deleteMemory, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
+const { initializeDatabase, getDatabaseStatus, addMemory, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
 const { startMcpServer } = require('./mcp-server');
 const { createEmbedder } = require('./embedder');
 
@@ -18,8 +18,16 @@ function publishEmbeddingStatus(status) {
 }
 
 ipcMain.handle('memories:add', (_event, memory) => addMemory(memory, { handAdded: true }));
-ipcMain.handle('memories:import', (_event, items) => importMemories(items));
+ipcMain.handle('imports:create', (_event, source) => createImport(source));
+ipcMain.handle('memories:import', (_event, items, importId) => importMemories(items, importId));
+ipcMain.handle('imports:finish', (_event, id) => finishImport(id));
+ipcMain.handle('imports:list', () => listRecentImports());
+ipcMain.handle('imports:undo', (_event, id) => undoImport(id));
+ipcMain.handle('legacy-cleanup:status', () => getLegacyCleanupStatus());
+ipcMain.handle('legacy-cleanup:run', () => cleanupLegacyJunk());
 ipcMain.handle('memories:delete', (_event, id) => deleteMemory(id));
+ipcMain.handle('memories:conversation-parts:count', (_event, id) => countConversationParts(id));
+ipcMain.handle('memories:conversation-parts:delete', (_event, id) => deleteConversationParts(id));
 ipcMain.handle('links:list', () => listLinks());
 ipcMain.handle('links:create', (_event, aId, bId) => createLink(aId, bId));
 ipcMain.handle('links:delete', (_event, id) => deleteLink(id));

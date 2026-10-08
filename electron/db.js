@@ -2,9 +2,11 @@ const { app } = require('electron');
 const Database = require('better-sqlite3-multiple-ciphers');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { createHash, randomBytes } = require('crypto');
 
 let database;
+let databaseKey = null;
 let databaseSchemaReady = false;
 const SUGGEST_MIN = 0.40;
 const AUTO_MIN = 0.85;
@@ -21,6 +23,8 @@ let memoryCache = new Map();
 let cachesLoaded = false;
 let databaseWritable = false;
 let databaseStatus = { state: 'initializing', writable: false, message: '' };
+let legacyCleanupStatus = { count: 0, backupPath: null, error: '' };
+const cancelledEmbeddingIds = new Set();
 
 function setDatabaseStatus(state, writable, message = '') {
   databaseWritable = writable;
@@ -65,6 +69,65 @@ function tableCount(db, table) {
 
 function databaseCounts(db) {
   return Object.fromEntries(['memories', 'links', 'embeddings', 'link_suggestions'].map((table) => [table, tableCount(db, table)]));
+}
+
+function legacyJunkCount(db = getDatabase()) {
+  return db.prepare("SELECT count(*) AS count FROM memories WHERE source = 'claude' AND title LIKE 'conversations (part %/%)'").get().count;
+}
+
+async function createPreCleanupBackup() {
+  ensureWritable();
+  if (!databaseKey) throw new Error('The encrypted database key is unavailable.');
+  const folder = path.join(os.homedir(), 'onebrain-backup-pre-cleanup');
+  fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
+  fs.chmodSync(folder, 0o700);
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupPath = path.join(folder, `onebrain-${stamp}-${randomBytes(4).toString('hex')}.db`);
+  const pendingPath = `${backupPath}.pending`;
+  const expected = databaseCounts(getDatabase());
+  try {
+    const serialized = getDatabase().serialize();
+    if (!Buffer.isBuffer(serialized) || serialized.length === 0) throw new Error('Could not snapshot the live database.');
+    const plainSnapshot = new Database(serialized);
+    try {
+      await plainSnapshot.backup(pendingPath);
+    } finally { plainSnapshot.close(); }
+    fs.chmodSync(pendingPath, 0o600);
+    const backup = openPlain(pendingPath);
+    try {
+      backup.pragma("cipher = 'sqlcipher'");
+      backup.pragma('legacy = 4');
+      backup.rekey(databaseKey);
+    } finally { backup.close(); }
+
+    const verified = openEncrypted(pendingPath, databaseKey, { readonly: true, fileMustExist: true });
+    try {
+      if (JSON.stringify(databaseCounts(verified)) !== JSON.stringify(expected)) throw new Error('Backup verification failed: row counts differ.');
+      if (!findFtsResult(verified)) throw new Error('Backup verification failed: FTS search returned no result.');
+    } finally { verified.close(); }
+    fs.renameSync(pendingPath, backupPath);
+    fs.chmodSync(backupPath, 0o600);
+    return backupPath;
+  } catch (error) {
+    try { fs.rmSync(pendingPath, { force: true }); } catch {}
+    try { fs.rmSync(backupPath, { force: true }); } catch {}
+    throw error;
+  }
+}
+
+async function ensureLegacyCleanupBackup() {
+  const db = getDatabase();
+  const count = legacyJunkCount(db);
+  legacyCleanupStatus = { count, backupPath: null, error: '' };
+  const saved = db.prepare("SELECT value FROM brain_meta WHERE key = 'legacy_cleanup_backup'").get()?.value;
+  if (saved && fs.existsSync(saved)) {
+    legacyCleanupStatus.backupPath = saved;
+    return legacyCleanupStatus;
+  }
+  const backupPath = await createPreCleanupBackup();
+  db.prepare("INSERT INTO brain_meta(key, value) VALUES ('legacy_cleanup_backup', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(backupPath);
+  legacyCleanupStatus.backupPath = backupPath;
+  return legacyCleanupStatus;
 }
 
 function findFtsResult(db) {
@@ -179,7 +242,17 @@ async function initializeDatabase(userDataPath = app.getPath('userData'), safeSt
     } else {
       database = openEncrypted(dbPath, key);
     }
+    databaseKey = key;
     setDatabaseStatus('ready', true);
+    getDatabase();
+    try {
+      const cleanupBackup = await ensureLegacyCleanupBackup();
+      if (cleanupBackup.backupPath) console.log(`Encrypted pre-cleanup database backup created at ${cleanupBackup.backupPath}`);
+    }
+    catch (error) {
+      legacyCleanupStatus.error = String(error?.message || error).split('\n')[0];
+      console.error(`Could not create the encrypted pre-cleanup database backup: ${legacyCleanupStatus.error}`);
+    }
     return getDatabaseStatus();
   } catch (error) {
     if (database?.open) { try { database.close(); } catch {} }
@@ -235,6 +308,12 @@ function getDatabase() {
     if (!database) database = new Database(path.join(app.getPath('userData'), 'onebrain.db'));
     database.pragma('foreign_keys = ON');
     database.exec(`
+      CREATE TABLE IF NOT EXISTS imports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        count INTEGER NOT NULL DEFAULT 0
+      );
       CREATE TABLE IF NOT EXISTS memories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         source TEXT NOT NULL,
@@ -333,6 +412,8 @@ function getDatabase() {
 
     const memoryColumns = new Set(database.prepare('PRAGMA table_info(memories)').all().map((column) => column.name));
     if (!memoryColumns.has('content_hash')) database.exec('ALTER TABLE memories ADD COLUMN content_hash TEXT');
+    if (!memoryColumns.has('import_id')) database.exec('ALTER TABLE memories ADD COLUMN import_id INTEGER REFERENCES imports(id) ON DELETE CASCADE');
+    database.exec('CREATE INDEX IF NOT EXISTS memories_import_id_idx ON memories(import_id)');
 
     const backfillHashes = database.transaction(() => {
       const seen = new Set();
@@ -444,9 +525,11 @@ function createSemanticLinks(memoryId, vector) {
 
 async function embedMemory(memoryId) {
   const db = getDatabase();
+  if (cancelledEmbeddingIds.has(Number(memoryId))) return false;
   const memory = db.prepare('SELECT id, source, title, content FROM memories WHERE id = ?').get(memoryId);
   if (!memory || !embeddingProvider) return false;
   const vector = await embeddingProvider(memory.content);
+  if (cancelledEmbeddingIds.has(Number(memoryId)) || !db.prepare('SELECT 1 FROM memories WHERE id = ?').get(memoryId)) return false;
   if (!(vector instanceof Float32Array) || vector.length === 0) throw new Error('The local embedding model returned an invalid vector.');
   db.prepare('INSERT INTO embeddings (memory_id, model, dim, vector) VALUES (?, ?, ?, ?) ON CONFLICT(memory_id) DO UPDATE SET model = excluded.model, dim = excluded.dim, vector = excluded.vector')
     .run(memoryId, embeddingModel, vector.length, vectorBlob(vector));
@@ -468,6 +551,21 @@ function enqueueEmbedding(memoryId) {
   return task.promise;
 }
 
+function cancelEmbeddingJobs(memoryIds) {
+  const ids = new Set([...memoryIds].map(Number));
+  const queued = new Set(embeddingQueue.filter(({ id }) => ids.has(id)).map(({ id }) => id));
+  embeddingQueue = embeddingQueue.filter(({ id, task }) => {
+    if (!ids.has(id)) return true;
+    task.resolve(false);
+    embeddingJobs.delete(id);
+    handAddedMemoryIds.delete(id);
+    return false;
+  });
+  for (const id of ids) {
+    if (embeddingJobs.has(id) && !queued.has(id)) cancelledEmbeddingIds.add(id);
+  }
+}
+
 async function drainEmbeddingQueue() {
   if (embeddingQueueRunning || !embeddingProvider) return;
   embeddingQueueRunning = true;
@@ -478,6 +576,7 @@ async function drainEmbeddingQueue() {
     finally {
       embeddingJobs.delete(id);
       handAddedMemoryIds.delete(id);
+      cancelledEmbeddingIds.delete(id);
     }
   }
   embeddingQueueRunning = false;
@@ -557,10 +656,21 @@ function addMemory({ source, title, content }, { handAdded = false } = {}) {
   return result.memory;
 }
 
-function importMemories(items) {
+function createImport(source) {
+  ensureWritable();
+  const result = getDatabase().prepare('INSERT INTO imports (source, count) VALUES (?, 0)').run(String(source || ''));
+  return Number(result.lastInsertRowid);
+}
+
+function importMemories(items, importId) {
   ensureWritable();
   const db = getDatabase();
-  const insert = db.prepare('INSERT OR IGNORE INTO memories (source, title, content, content_hash) VALUES (?, ?, ?, ?)');
+  const id = Number(importId);
+  if (!Number.isInteger(id) || !db.prepare('SELECT id FROM imports WHERE id = ?').get(id)) throw new Error('Import session was not found.');
+  if (!Array.isArray(items) || items.length > 3000) throw new Error('Imports are limited to 3,000 chunks.');
+  const current = db.prepare('SELECT count FROM imports WHERE id = ?').get(id).count;
+  if (current + items.length > 3000) throw new Error('Imports are limited to 3,000 chunks.');
+  const insert = db.prepare('INSERT OR IGNORE INTO memories (source, title, content, content_hash, import_id) VALUES (?, ?, ?, ?, ?)');
   const importBatch = db.transaction((batch) => {
     let inserted = 0;
     let skipped = 0;
@@ -573,10 +683,11 @@ function importMemories(items) {
         skipped += 1;
         continue;
       }
-      const result = insert.run(source, title, content, contentHash(content));
+      const result = insert.run(source, title, content, contentHash(content), id);
       if (result.changes) { inserted += 1; insertedIds.push(Number(result.lastInsertRowid)); }
       else skipped += 1;
     }
+    db.prepare('UPDATE imports SET count = count + ? WHERE id = ?').run(inserted, id);
     return { inserted, skipped, insertedIds };
   });
   const result = importBatch(items);
@@ -586,6 +697,36 @@ function importMemories(items) {
   }
   for (const id of result.insertedIds) void enqueueEmbedding(id).catch(() => {});
   return { inserted: result.inserted, skipped: result.skipped };
+}
+
+function finishImport(importId) {
+  ensureWritable();
+  const db = getDatabase();
+  const id = Number(importId);
+  const row = db.prepare('SELECT id, source, created_at, count FROM imports WHERE id = ?').get(id);
+  if (!row) return null;
+  if (row.count === 0) { db.prepare('DELETE FROM imports WHERE id = ?').run(id); return null; }
+  return row;
+}
+
+function listRecentImports() {
+  return getDatabase().prepare('SELECT id, source, created_at, count FROM imports WHERE count > 0 ORDER BY id DESC LIMIT 10').all();
+}
+
+function undoImport(importId) {
+  ensureWritable();
+  const db = getDatabase();
+  const id = Number(importId);
+  const memoryIds = db.prepare('SELECT id FROM memories WHERE import_id = ?').all(id).map((row) => Number(row.id));
+  cancelEmbeddingJobs(memoryIds);
+  const undo = db.transaction(() => {
+    db.prepare('DELETE FROM links WHERE a_id IN (SELECT id FROM memories WHERE import_id = ?) OR b_id IN (SELECT id FROM memories WHERE import_id = ?)').run(id, id);
+    const removed = db.prepare('DELETE FROM imports WHERE id = ?').run(id).changes;
+    return removed > 0;
+  });
+  const removed = undo();
+  for (const memoryId of memoryIds) { vectorCache.delete(memoryId); memoryCache.delete(memoryId); }
+  return removed;
 }
 
 function listMemories() {
@@ -674,6 +815,7 @@ async function searchMemories(query, source, limit = 50, offset = 0) {
 function deleteMemory(id) {
   ensureWritable();
   const db = getDatabase();
+  cancelEmbeddingJobs([Number(id)]);
   const remove = db.transaction(() => {
     db.prepare('DELETE FROM links WHERE a_id = ? OR b_id = ?').run(id, id);
     db.prepare('DELETE FROM embeddings WHERE memory_id = ?').run(id);
@@ -682,6 +824,43 @@ function deleteMemory(id) {
   const deleted = remove();
   vectorCache.delete(Number(id));
   memoryCache.delete(Number(id));
+  return deleted;
+}
+
+function conversationPartScope(memoryId) {
+  const row = getDatabase().prepare('SELECT id, source, import_id, title FROM memories WHERE id = ?').get(Number(memoryId));
+  if (!row || row.import_id == null) return null;
+  const title = String(row.title || '');
+  const match = title.match(/^(.*) \(part \d+\/\d+\)$/);
+  if (!match) return null;
+  return { source: row.source, importId: row.import_id, baseTitle: match[1] };
+}
+
+function countConversationParts(memoryId) {
+  const scope = conversationPartScope(memoryId);
+  if (!scope) return 0;
+  return getDatabase().prepare('SELECT title FROM memories WHERE source = ? AND import_id = ?').all(scope.source, scope.importId)
+    .filter((row) => row.title && row.title.replace(/ \(part \d+\/\d+\)$/, '') === scope.baseTitle && / \(part \d+\/\d+\)$/.test(row.title)).length;
+}
+
+function deleteConversationParts(memoryId) {
+  ensureWritable();
+  const db = getDatabase();
+  const scope = conversationPartScope(memoryId);
+  if (!scope) return 0;
+  const rows = db.prepare('SELECT id, title FROM memories WHERE source = ? AND import_id = ?').all(scope.source, scope.importId)
+    .filter((row) => row.title && row.title.replace(/ \(part \d+\/\d+\)$/, '') === scope.baseTitle && / \(part \d+\/\d+\)$/.test(row.title));
+  const ids = rows.map((row) => Number(row.id));
+  if (!ids.length) return 0;
+  cancelEmbeddingJobs(ids);
+  const placeholders = ids.map(() => '?').join(',');
+  const remove = db.transaction(() => {
+    db.prepare(`DELETE FROM links WHERE a_id IN (${placeholders}) OR b_id IN (${placeholders})`).run(...ids, ...ids);
+    db.prepare(`DELETE FROM memories WHERE id IN (${placeholders})`).run(...ids);
+    return ids.length;
+  });
+  const deleted = remove();
+  for (const id of ids) { vectorCache.delete(id); memoryCache.delete(id); }
   return deleted;
 }
 
@@ -784,6 +963,29 @@ function restoreRejected(id) {
   return getDatabase().prepare("DELETE FROM link_suggestions WHERE id = ? AND status = 'rejected'").run(Number(id)).changes > 0;
 }
 
+function getLegacyCleanupStatus() {
+  const count = database ? legacyJunkCount(getDatabase()) : 0;
+  return { ...legacyCleanupStatus, count };
+}
+
+async function cleanupLegacyJunk() {
+  ensureWritable();
+  const status = await ensureLegacyCleanupBackup();
+  if (status.count < 200) return { deleted: 0, backupPath: status.backupPath };
+  if (!status.backupPath || !fs.existsSync(status.backupPath)) throw new Error('The pre-cleanup database backup is not available. No memories were removed.');
+  const db = getDatabase();
+  const ids = db.prepare("SELECT id FROM memories WHERE source = 'claude' AND title LIKE 'conversations (part %/%)'").all().map((row) => Number(row.id));
+  cancelEmbeddingJobs(ids);
+  const remove = db.transaction(() => {
+    db.prepare("DELETE FROM links WHERE a_id IN (SELECT id FROM memories WHERE source = 'claude' AND title LIKE 'conversations (part %/%)') OR b_id IN (SELECT id FROM memories WHERE source = 'claude' AND title LIKE 'conversations (part %/%)')").run();
+    return db.prepare("DELETE FROM memories WHERE source = 'claude' AND title LIKE 'conversations (part %/%)'").run().changes;
+  });
+  const deleted = remove();
+  for (const id of ids) { vectorCache.delete(id); memoryCache.delete(id); }
+  legacyCleanupStatus.count = legacyJunkCount(db);
+  return { deleted, backupPath: status.backupPath };
+}
+
 function countBySource() {
   return getDatabase()
     .prepare('SELECT source, COUNT(*) AS count FROM memories GROUP BY source ORDER BY source')
@@ -794,4 +996,4 @@ function countBySource() {
     }, {});
 }
 
-module.exports = { initializeDatabase, getDatabaseStatus, addMemory, importMemories, deleteMemory, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
+module.exports = { initializeDatabase, getDatabaseStatus, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
