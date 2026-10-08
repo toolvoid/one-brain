@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "one-brain": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/home/chiku/Desktop/one-brain/scripts/mcp-stdio.js"]
+    }
+  }
+}

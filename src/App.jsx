@@ -1,0 +1,673 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import BrainGraph from './components/BrainGraph.jsx';
+import { MAX_IMPORT_ITEMS, parseImportText } from './lib/importers.js';
+
+const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
+const SOURCE_COLORS = {
+  chatgpt: '#42d6c2', claude: '#f29a60', codex: '#70a9ff',
+  gemini: '#b18cff', groq: '#f2d66d', deepseek: '#ff7095'
+};
+const EMPTY_COUNTS = Object.fromEntries(SOURCES.map((source) => [source, 0]));
+const PAGE_SIZE = 50;
+
+function dateLabel(value) {
+  if (!value) return '';
+  return new Date(`${value.replace(' ', 'T')}Z`).toLocaleString();
+}
+
+function normalizeImportedContent(content) {
+  return String(content || '').normalize('NFKC').replace(/\r\n?/g, '\n').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function readFileText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error('Could not read this file.'));
+    reader.readAsText(file);
+  });
+}
+
+function App() {
+  const [memories, setMemories] = useState([]);
+  const [links, setLinks] = useState([]);
+  const [suggestions, setSuggestions] = useState([]);
+  const [rejectedLinks, setRejectedLinks] = useState([]);
+  const [counts, setCounts] = useState(EMPTY_COUNTS);
+  const [dataReady, setDataReady] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [linksVisible, setLinksVisible] = useState(true);
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
+  const [rejectedOpen, setRejectedOpen] = useState(false);
+  const [suggestionToast, setSuggestionToast] = useState(false);
+  const [query, setQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
+  const [sourceFilter, setSourceFilter] = useState('all');
+  const [results, setResults] = useState([]);
+  const [pageOffset, setPageOffset] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [selectedId, setSelectedId] = useState(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerQuery, setPickerQuery] = useState('');
+  const [pickerDebouncedQuery, setPickerDebouncedQuery] = useState('');
+  const [pickerResults, setPickerResults] = useState([]);
+  const [addOpen, setAddOpen] = useState(false);
+  const [addSource, setAddSource] = useState(SOURCES[0]);
+  const [addTitle, setAddTitle] = useState('');
+  const [addContent, setAddContent] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [addMode, setAddMode] = useState('add');
+  const [importSource, setImportSource] = useState('chatgpt');
+  const [importFile, setImportFile] = useState(null);
+  const [importText, setImportText] = useState('');
+  const [includeAssistant, setIncludeAssistant] = useState(false);
+  const [importParsed, setImportParsed] = useState(null);
+  const [importError, setImportError] = useState('');
+  const [importing, setImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState(0);
+  const [importSummary, setImportSummary] = useState('');
+  const [pendingImportPulse, setPendingImportPulse] = useState(null);
+  const [embeddingStatus, setEmbeddingStatus] = useState({ state: 'loading' });
+  const [showSemanticLinks, setShowSemanticLinks] = useState(true);
+  const [connectOpen, setConnectOpen] = useState(false);
+  const [mcpConfig, setMcpConfig] = useState(null);
+  const [copied, setCopied] = useState('');
+  const graphRef = useRef(null);
+  const searchRequest = useRef(0);
+  const pickerRequest = useRef(0);
+  const searchState = useRef({ query: debouncedQuery, sourceFilter });
+  searchState.current = { query: debouncedQuery, sourceFilter };
+
+  const selectedMemory = memories.find((memory) => String(memory.id) === String(selectedId)) || null;
+  const linkedMemories = useMemo(() => {
+    if (!selectedMemory) return [];
+    return links.flatMap((link) => {
+      const aId = String(link.a_id), bId = String(link.b_id), id = String(selectedMemory.id);
+      const otherId = aId === id ? bId : bId === id ? aId : null;
+      if (otherId === null) return [];
+      const memory = memories.find((item) => String(item.id) === otherId);
+      return memory ? [{ link, memory }] : [];
+    });
+  }, [links, memories, selectedMemory]);
+  const relatedMemories = linkedMemories.filter(({ link }) => link.kind === 'semantic');
+  const regularLinkedMemories = linkedMemories.filter(({ link }) => link.kind !== 'semantic');
+  const visibleGraphLinks = useMemo(() => links.filter((link) => link.kind !== 'semantic' || (showSemanticLinks && links.length <= 3000)), [links, showSemanticLinks]);
+  const rejectedPairKeys = useMemo(() => new Set(rejectedLinks.map((row) => `${row.a_id}:${row.b_id}`)), [rejectedLinks]);
+
+  async function refreshData() {
+    const [savedMemories, savedCounts, savedLinks, savedSuggestions, savedRejected] = await Promise.all([
+      window.brain.listMemories(), window.brain.countBySource(), window.brain.listLinks(), window.brain.listSuggestions(), window.brain.listRejected()
+    ]);
+    setMemories(savedMemories);
+    setLinks(savedLinks);
+    setSuggestions(savedSuggestions);
+    setRejectedLinks(savedRejected);
+    setCounts({ ...EMPTY_COUNTS, ...savedCounts });
+    return { savedMemories, savedLinks, savedCounts };
+  }
+
+  async function refreshSearch(searchQuery = debouncedQuery, filter = sourceFilter) {
+    const next = await window.brain.searchMemories(searchQuery, filter, PAGE_SIZE, 0);
+    setResults(next);
+    setPageOffset(0);
+    setHasMore(next.length === PAGE_SIZE);
+  }
+
+  useEffect(() => {
+    let active = true;
+    Promise.all([window.brain.listMemories(), window.brain.countBySource(), window.brain.listLinks(), window.brain.listSuggestions(), window.brain.listRejected()]).then(([savedMemories, savedCounts, savedLinks, savedSuggestions, savedRejected]) => {
+      if (!active) return;
+      setMemories(savedMemories);
+      setCounts({ ...EMPTY_COUNTS, ...savedCounts });
+      setLinks(savedLinks);
+      setSuggestions(savedSuggestions);
+      setRejectedLinks(savedRejected);
+      setDataReady(true);
+    });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    window.brain.getMcpConfig().then((config) => { if (active) setMcpConfig(config); });
+    window.brain.getEmbeddingStatus().then((status) => { if (active) setEmbeddingStatus(status); });
+    const unsubscribeEmbeddingStatus = window.brain.onEmbeddingStatus((status) => setEmbeddingStatus(status));
+    const unsubscribeRetrieved = window.brain.onRetrieved((ids) => {
+      [...new Set((ids || []).map((id) => String(id)))].slice(0, 10).forEach((id, index) => {
+        setTimeout(() => graphRef.current?.retrieve(id), index * 150);
+      });
+    });
+    const unsubscribeChanged = window.brain.onChanged(async (change) => {
+      await refreshData();
+      if (change?.handAdded && change.suggestions > 0) setSuggestionToast(true);
+      const { query: activeQuery, sourceFilter: activeSource } = searchState.current;
+      await refreshSearch(activeQuery, activeSource);
+    });
+    return () => {
+      active = false;
+      unsubscribeEmbeddingStatus();
+      unsubscribeRetrieved();
+      unsubscribeChanged();
+    };
+  }, []);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedQuery(query), 150);
+    return () => clearTimeout(timer);
+  }, [query]);
+
+  useEffect(() => {
+    if (!suggestionToast) return undefined;
+    const timer = setTimeout(() => setSuggestionToast(false), 5000);
+    return () => clearTimeout(timer);
+  }, [suggestionToast]);
+
+  useEffect(() => {
+    if (pendingImportPulse === null) return undefined;
+    const frame = requestAnimationFrame(() => {
+      graphRef.current?.retrieve(pendingImportPulse);
+      setPendingImportPulse(null);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [pendingImportPulse, memories]);
+
+  useEffect(() => {
+    if (!dataReady) return undefined;
+    const requestId = ++searchRequest.current;
+    window.brain.searchMemories(debouncedQuery, sourceFilter, PAGE_SIZE, pageOffset).then((batch) => {
+      if (requestId !== searchRequest.current) return;
+      setResults((current) => pageOffset === 0 ? batch : [...current, ...batch]);
+      setHasMore(batch.length === PAGE_SIZE);
+    });
+    return () => { searchRequest.current += 1; };
+  }, [dataReady, debouncedQuery, sourceFilter, pageOffset]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setPickerDebouncedQuery(pickerQuery), 150);
+    return () => clearTimeout(timer);
+  }, [pickerQuery]);
+
+  useEffect(() => {
+    if (!pickerOpen) return undefined;
+    const requestId = ++pickerRequest.current;
+    window.brain.searchMemories(pickerDebouncedQuery, 'all', PAGE_SIZE, 0).then((batch) => {
+      if (requestId === pickerRequest.current) setPickerResults(batch);
+    });
+    return () => { pickerRequest.current += 1; };
+  }, [pickerOpen, pickerDebouncedQuery]);
+
+  function openDetail(memoryId) {
+    setSelectedId(memoryId);
+    setSuggestionsOpen(false);
+    setPickerOpen(false);
+    graphRef.current?.focus(memoryId);
+  }
+
+  async function handleDelete(memoryId) {
+    await window.brain.deleteMemory(memoryId);
+    if (String(memoryId) === String(selectedId)) setSelectedId(null);
+    setPickerOpen(false);
+    await refreshData();
+    await refreshSearch();
+  }
+
+  async function handleUnlink(linkId) {
+    await window.brain.deleteLink(linkId);
+    await refreshData();
+  }
+
+  async function handleLink(memoryId) {
+    if (!selectedMemory || String(memoryId) === String(selectedMemory.id)) return;
+    await window.brain.createLink(selectedMemory.id, memoryId);
+    await refreshData();
+    setPickerOpen(false);
+    setPickerQuery('');
+  }
+
+  async function handleJoinSuggestion(id) {
+    await window.brain.acceptSuggestion(id);
+    await refreshData();
+  }
+
+  async function handleRejectSuggestion(id) {
+    await window.brain.rejectSuggestion(id);
+    await refreshData();
+  }
+
+  async function handleRestoreRejected(id) {
+    await window.brain.restoreRejected(id);
+    await refreshData();
+  }
+
+  async function handleJoinAboveThreshold() {
+    const ids = suggestions.filter((item) => Number(item.score) > 0.6).map((item) => item.id);
+    for (const id of ids) await window.brain.acceptSuggestion(id);
+    await refreshData();
+  }
+
+  async function handleDismissAllSuggestions() {
+    await window.brain.dismissSuggestions();
+    await refreshData();
+  }
+
+  async function handleAdd(event) {
+    event.preventDefault();
+    if (!addContent.trim() || saving) return;
+    setSaving(true);
+    try {
+      await window.brain.addMemory({ source: addSource, title: addTitle.trim() || null, content: addContent.trim() });
+      setAddTitle('');
+      setAddContent('');
+      setAddOpen(false);
+      await refreshData();
+      await refreshSearch();
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleImportPreview() {
+    setImportError('');
+    setImportSummary('');
+    try {
+      const pasted = importText.trim();
+      if (!pasted && !importFile) throw new Error('Choose a file or paste conversation text first.');
+      const rawText = pasted ? importText : await readFileText(importFile);
+      const fileName = pasted ? 'Pasted text.txt' : importFile.name;
+      const parsed = parseImportText(rawText, fileName, includeAssistant);
+      const items = parsed.items.map((item) => ({ ...item, source: importSource }));
+      setImportParsed({ ...parsed, items });
+      if (!parsed.total) setImportError('No importable chunks found. Chunks shorter than 40 characters are skipped.');
+    } catch (error) {
+      setImportParsed(null);
+      setImportError(error.message || 'Could not preview this import.');
+    }
+  }
+
+  async function handleImport() {
+    if (!importParsed || importing || importParsed.items.length === 0) return;
+    const items = importParsed.items.slice(0, MAX_IMPORT_ITEMS);
+    const known = new Set(memories.filter((memory) => memory.source === importSource).map((memory) => normalizeImportedContent(memory.content)));
+    const candidateContents = [];
+    const seenInFile = new Set();
+    for (const item of items) {
+      const normalized = normalizeImportedContent(item.content);
+      if (!known.has(normalized) && !seenInFile.has(normalized)) candidateContents.push(normalized);
+      seenInFile.add(normalized);
+    }
+    setImporting(true);
+    setImportProgress(0);
+    setImportError('');
+    setImportSummary('');
+    let inserted = 0;
+    let skipped = 0;
+    try {
+      for (let offset = 0; offset < items.length; offset += 200) {
+        const result = await window.brain.importMemories(items.slice(offset, offset + 200));
+        inserted += result.inserted;
+        skipped += result.skipped;
+        setImportProgress(Math.round((Math.min(offset + 200, items.length) / items.length) * 100));
+      }
+      const { savedMemories } = await refreshData();
+      await refreshSearch();
+      if (inserted > 0) {
+        const firstImported = savedMemories.find((memory) => memory.source === importSource && candidateContents.includes(normalizeImportedContent(memory.content)));
+        if (firstImported) setPendingImportPulse(firstImported.id);
+      }
+      setImportSummary(`Imported ${inserted}, skipped ${skipped} duplicates`);
+    } catch (error) {
+      setImportError(error.message || 'Import failed. Some completed batches may already be saved.');
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  const importDuplicateCount = useMemo(() => {
+    if (!importParsed) return 0;
+    const known = new Set(memories.filter((memory) => memory.source === importSource).map((memory) => normalizeImportedContent(memory.content)));
+    const seen = new Set();
+    let duplicates = 0;
+    for (const item of importParsed.items) {
+      const content = normalizeImportedContent(item.content);
+      if (known.has(content) || seen.has(content)) duplicates += 1;
+      seen.add(content);
+    }
+    return duplicates;
+  }, [importParsed, importSource, memories]);
+
+  const resultMemory = (id) => memories.find((memory) => String(memory.id) === String(id));
+  const claudeDesktopConfig = mcpConfig ? JSON.stringify({
+    mcpServers: {
+      'one-brain': {
+        command: 'node',
+        args: [mcpConfig.stdioScript],
+        env: { ONE_BRAIN_USER_DATA: mcpConfig.userDataPath }
+      }
+    }
+  }, null, 2) : '';
+  const claudeCodeCommand = mcpConfig ? `claude mcp add --transport http one-brain ${mcpConfig.endpoint} --header "Authorization: Bearer ${mcpConfig.token}"` : '';
+  const codexConfig = mcpConfig ? `[mcp_servers.one-brain]\ncommand = "node"\nargs = [${JSON.stringify(mcpConfig.stdioScript)}]\nenv = { ONE_BRAIN_USER_DATA = ${JSON.stringify(mcpConfig.userDataPath)} }` : '';
+
+  async function copyText(value, label) {
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch {
+      const field = document.createElement('textarea');
+      field.value = value;
+      field.style.position = 'fixed';
+      field.style.opacity = '0';
+      document.body.appendChild(field);
+      field.select();
+      document.execCommand('copy');
+      field.remove();
+    }
+    setCopied(label);
+    setTimeout(() => setCopied(''), 1600);
+  }
+
+  return (
+    <main className="memory-app">
+      <BrainGraph ref={graphRef} memories={memories} counts={counts} links={visibleGraphLinks} dataReady={dataReady} sidebarCollapsed={sidebarCollapsed} linksVisible={linksVisible} onLinksVisibleChange={setLinksVisible} />
+      <aside className={`memory-panel${sidebarCollapsed ? ' is-collapsed' : ''}`}>
+        {connectOpen ? (
+          <section className="connect-view">
+            <header className="detail-header"><button className="back-button" type="button" onClick={() => setConnectOpen(false)}>‹</button><span>Connect AI</span>{suggestions.length > 0 && <button className="header-suggestions" type="button" onClick={() => { setConnectOpen(false); setSuggestionsOpen(true); }}>Suggestions ({suggestions.length})</button>}</header>
+            {mcpConfig ? <>
+              <h1>One Brain MCP</h1>
+              <p className="connect-hint">Your local MCP server is ready for AI clients on this device.</p>
+              <label className="connect-field">Endpoint<code>{mcpConfig.endpoint}</code></label>
+              <div className="token-row"><span>Bearer token</span><button type="button" onClick={() => copyText(mcpConfig.token, 'token')}>{copied === 'token' ? 'Copied' : 'Copy token'}</button></div>
+              <section className="config-section"><h2>Claude Desktop</h2><p>Add this under <code>mcpServers</code> in Claude Desktop config.</p><pre>{claudeDesktopConfig}</pre><button type="button" onClick={() => copyText(claudeDesktopConfig, 'desktop')}>{copied === 'desktop' ? 'Copied' : 'Copy config'}</button></section>
+              <section className="config-section"><h2>Claude Code</h2><pre>{claudeCodeCommand}</pre><button type="button" onClick={() => copyText(claudeCodeCommand, 'claude')}>{copied === 'claude' ? 'Copied' : 'Copy command'}</button></section>
+              <section className="config-section"><h2>Codex CLI</h2><p>Add this to <code>~/.codex/config.toml</code>.</p><pre>{codexConfig}</pre><button type="button" onClick={() => copyText(codexConfig, 'codex')}>{copied === 'codex' ? 'Copied' : 'Copy config'}</button></section>
+            </> : <p className="empty-note">Starting the local MCP server...</p>}
+          </section>
+        ) : suggestionsOpen ? (
+          <section className="suggestions-view">
+            <header className="detail-header"><button className="back-button" type="button" onClick={() => setSuggestionsOpen(false)}>‹</button><span>Link suggestions</span></header>
+            <div className="suggestion-actions">
+              <button type="button" onClick={handleJoinAboveThreshold}>Join all above 0.6</button>
+              <button type="button" onClick={handleDismissAllSuggestions}>Dismiss all</button>
+            </div>
+            <div className="suggestion-list">
+              {suggestions.map((item) => <article className="suggestion-card" key={item.id}>
+                <div className="suggestion-memory">
+                  <i style={{ background: SOURCE_COLORS[item.a_source] }} />
+                  <span><button type="button" className="suggestion-title" onClick={() => openDetail(item.a_id)}>{item.a_title || 'Untitled memory'}</button><small>{item.a_snippet}</small></span>
+                </div>
+                <div className="suggestion-memory">
+                  <i style={{ background: SOURCE_COLORS[item.b_source] }} />
+                  <span><button type="button" className="suggestion-title" onClick={() => openDetail(item.b_id)}>{item.b_title || 'Untitled memory'}</button><small>{item.b_snippet}</small></span>
+                </div>
+                <footer><span>Similarity {Number(item.score).toFixed(2)}</span><button type="button" onClick={() => handleJoinSuggestion(item.id)}>Join</button><button type="button" className="dismiss-suggestion" onClick={() => handleRejectSuggestion(item.id)}>Not related</button></footer>
+              </article>)}
+              {suggestions.length === 0 && <p className="empty-note">No pending suggestions</p>}
+            </div>
+            <details className="rejected-section" open={rejectedOpen} onToggle={(event) => setRejectedOpen(event.currentTarget.open)}>
+              <summary>Rejected ({rejectedLinks.length})</summary>
+              {rejectedLinks.map((item) => <article className="rejected-card" key={item.id}>
+                <span>{item.a_title || 'Untitled'} ↔ {item.b_title || 'Untitled'}<small>Similarity {Number(item.score).toFixed(2)}</small></span>
+                <button type="button" onClick={() => handleRestoreRejected(item.id)}>Restore</button>
+              </article>)}
+              {rejectedLinks.length === 0 && <p className="empty-note">No rejected pairs</p>}
+            </details>
+          </section>
+        ) : selectedMemory ? (
+          <section className="detail-view">
+            <header className="detail-header">
+              <button className="back-button" type="button" onClick={() => { setSelectedId(null); setPickerOpen(false); }}>‹</button>
+              <span>Memory details</span>
+              {suggestions.length > 0 && <button className="header-suggestions" type="button" onClick={() => { setSelectedId(null); setSuggestionsOpen(true); }}>Suggestions ({suggestions.length})</button>}
+            </header>
+            <div className="detail-source"><i style={{ background: SOURCE_COLORS[selectedMemory.source] }} />{selectedMemory.source}</div>
+            <h1>{selectedMemory.title || 'Untitled memory'}</h1>
+            <p className="detail-content">{selectedMemory.content}</p>
+            <time className="detail-date">{dateLabel(selectedMemory.created_at)}</time>
+            <div className="detail-actions">
+              <button type="button" onClick={() => graphRef.current?.retrieve(selectedMemory.id)}>Retrieve</button>
+              <button type="button" className="danger-button" onClick={() => handleDelete(selectedMemory.id)}>Delete</button>
+            </div>
+            <section className="detail-links">
+              <div className="section-heading"><h2>Linked memories</h2><button type="button" onClick={() => { setPickerOpen((open) => !open); setPickerQuery(''); }}>＋ Link to...</button></div>
+              {pickerOpen && (
+                <div className="picker">
+                  <input autoFocus value={pickerQuery} onChange={(event) => setPickerQuery(event.target.value)} placeholder="Search memories to link..." aria-label="Search memories to link" />
+                  <div className="picker-results">
+                    {pickerResults.filter((item) => String(item.id) !== String(selectedMemory.id) && !linkedMemories.some((linked) => String(linked.memory.id) === String(item.id))).map((item) => {
+                      const memory = resultMemory(item.id);
+                      const [aId, bId] = Number(selectedMemory.id) < Number(item.id) ? [Number(selectedMemory.id), Number(item.id)] : [Number(item.id), Number(selectedMemory.id)];
+                      return <button type="button" className="picker-result" key={item.id} onClick={() => handleLink(item.id)}><i style={{ background: SOURCE_COLORS[item.source] }} /><span>{item.title || memory?.content.slice(0, 40) || 'Untitled'}<small>{item.source}{rejectedPairKeys.has(`${aId}:${bId}`) ? ' · rejected before' : ''}</small></span></button>;
+                    })}
+                    {pickerResults.length === 0 && <p className="empty-note">No memories found</p>}
+                  </div>
+                </div>
+              )}
+              <div className="linked-list">
+                {regularLinkedMemories.map(({ link, memory }) => <div className="linked-item" key={link.id}>
+                  <button type="button" className="linked-open" onClick={() => openDetail(memory.id)}><i style={{ background: SOURCE_COLORS[memory.source] }} /><span>{memory.title || memory.content.slice(0, 40)}<small>{memory.source} · {link.kind}</small></span></button>
+                  <button type="button" className="unlink-button" aria-label={`Unlink ${memory.title || 'memory'}`} onClick={() => handleUnlink(link.id)}>×</button>
+                </div>)}
+                {regularLinkedMemories.length === 0 && !pickerOpen && <p className="empty-note">No linked memories</p>}
+              </div>
+            </section>
+            <section className="related-section">
+              <h2>Related</h2>
+              <div className="linked-list">
+                {relatedMemories.map(({ link, memory }) => <button type="button" className="related-item" key={link.id} onClick={() => openDetail(memory.id)}>
+                  <i style={{ background: SOURCE_COLORS[memory.source] }} /><span>{memory.title || memory.content.slice(0, 40)}<small>{memory.source} · similarity {Number(link.score || 0).toFixed(2)}</small></span>
+                </button>)}
+                {relatedMemories.length === 0 && <p className="empty-note">No semantic matches yet</p>}
+              </div>
+            </section>
+          </section>
+        ) : (
+          <>
+            <div className="search-row">
+              <input value={query} onChange={(event) => { setQuery(event.target.value); setPageOffset(0); }} placeholder="Search memories..." aria-label="Search memories" />
+              {suggestions.length > 0 && <button className="suggestions-button" type="button" onClick={() => setSuggestionsOpen(true)}>Suggestions ({suggestions.length})</button>}
+              <button className="settings-button" type="button" aria-label="Connect AI settings" title="Connect AI" onClick={() => setConnectOpen(true)}>⚙</button>
+              <button className="add-button" type="button" aria-label="Add memory or import" title="Add or import memories" onClick={() => { setAddMode('add'); setAddOpen(true); }}>+</button>
+            </div>
+            <div className="embedding-status" aria-live="polite">
+              {embeddingStatus.state === 'indexing' && <span>Indexing {embeddingStatus.done}/{embeddingStatus.total}</span>}
+              {embeddingStatus.state === 'error' && <span className="embedding-error">{embeddingStatus.message}</span>}
+              {embeddingStatus.fallback && embeddingStatus.state !== 'indexing' && <span className="embedding-error">Using fallback model: Xenova/all-MiniLM-L6-v2</span>}
+            </div>
+            <nav className="source-filters" aria-label="Filter by source">
+              {['all', ...SOURCES].map((source) => <button type="button" key={source} className={`filter-chip${sourceFilter === source ? ' is-selected' : ''}`} onClick={() => { setSourceFilter(source); setPageOffset(0); }}>
+                {source !== 'all' && <i style={{ background: SOURCE_COLORS[source] }} />}{source === 'all' ? 'All' : source}
+              </button>)}
+            </nav>
+            <div className="semantic-toggle-row">
+              <button type="button" className={`semantic-toggle${showSemanticLinks ? ' is-on' : ''}`} aria-pressed={showSemanticLinks} onClick={() => setShowSemanticLinks((value) => !value)}>Semantic links {showSemanticLinks ? 'On' : 'Off'}</button>
+              {links.length > 3000 && <small>Hidden above 3,000 total links</small>}
+            </div>
+            <section className="result-list" aria-label="Search results">
+              {results.map((item) => {
+                const full = resultMemory(item.id);
+                const displayTitle = item.title?.trim() || (full?.content || '').slice(0, 40) || 'Untitled memory';
+                return <button type="button" className="result-item" key={item.id} onClick={() => openDetail(item.id)}>
+                  <i className="result-dot" style={{ background: SOURCE_COLORS[item.source] }} />
+                  <span className="result-copy"><strong>{displayTitle}</strong><small>{item.snippet || full?.content.slice(0, 120) || ''}</small></span>
+                  <span className="result-source">{item.source}</span>
+                </button>;
+              })}
+              {results.length === 0 && dataReady && <p className="empty-note">No memories found</p>}
+              {hasMore && <button className="load-more" type="button" onClick={() => setPageOffset((offset) => offset + PAGE_SIZE)}>Load more</button>}
+            </section>
+          </>
+        )}
+      </aside>
+      <button className="sidebar-toggle" type="button" aria-label={sidebarCollapsed ? 'Expand memories sidebar' : 'Collapse memories sidebar'} aria-expanded={!sidebarCollapsed} onClick={() => setSidebarCollapsed((collapsed) => !collapsed)} style={{ left: sidebarCollapsed ? 32 : 'min(360px, 92vw)' }}>{sidebarCollapsed ? '›' : '‹'}</button>
+      {suggestionToast && <button className="suggestion-toast" type="button" onClick={() => { setSuggestionToast(false); setSuggestionsOpen(true); }}>1 possible link found - Review</button>}
+
+      {addOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setAddOpen(false); }}>
+        <form className="add-modal" onSubmit={handleAdd}>
+          <header><h2>{addMode === 'add' ? 'Add memory' : 'Import memories'}</h2><button type="button" aria-label="Close" onClick={() => setAddOpen(false)}>×</button></header>
+          <nav className="modal-tabs" aria-label="Memory action">
+            <button type="button" className={addMode === 'add' ? 'selected' : ''} onClick={() => setAddMode('add')}>Add</button>
+            <button type="button" className={addMode === 'import' ? 'selected' : ''} onClick={() => setAddMode('import')}>Import</button>
+          </nav>
+          {addMode === 'add' ? <>
+            <label>Source<select value={addSource} onChange={(event) => setAddSource(event.target.value)}>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label>
+            <label>Title <span>(optional)</span><input value={addTitle} onChange={(event) => setAddTitle(event.target.value)} /></label>
+            <label>Content<textarea required rows="6" value={addContent} onChange={(event) => setAddContent(event.target.value)} /></label>
+            <button className="save-button" type="submit" disabled={saving || !addContent.trim()}>{saving ? 'Saving...' : 'Save memory'}</button>
+          </> : <>
+            <label>Target source<select value={importSource} onChange={(event) => { setImportSource(event.target.value); setImportParsed(null); setImportSummary(''); }}>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label>
+            <label>Conversation file<input type="file" accept=".json,.txt,.md,application/json,text/plain,text/markdown" onChange={(event) => { setImportFile(event.target.files?.[0] || null); setImportText(''); setImportParsed(null); setImportSummary(''); }} /></label>
+            <label className="import-check"><input type="checkbox" checked={includeAssistant} onChange={(event) => { setIncludeAssistant(event.target.checked); setImportParsed(null); }} />Include assistant replies</label>
+            <label>Or paste raw text<textarea rows="4" placeholder="Paste conversation text here..." value={importText} onChange={(event) => { setImportText(event.target.value); if (event.target.value) setImportFile(null); setImportParsed(null); setImportSummary(''); }} /></label>
+            {importParsed && <section className="import-preview">
+              <strong>Preview</strong>
+              <p>{importParsed.total} chunks · {importDuplicateCount} look like duplicates</p>
+              {importParsed.total > 2000 && <p className="import-warning">Large import: the graph may slow down.</p>}
+              {importParsed.total > MAX_IMPORT_ITEMS && <p className="import-warning">Import is capped at {MAX_IMPORT_ITEMS.toLocaleString()} chunks; only the first {MAX_IMPORT_ITEMS.toLocaleString()} will be imported.</p>}
+              <ol>{importParsed.items.slice(0, 5).map((item, index) => <li key={`${item.title}-${index}`}><b>{item.title}</b><small>{item.content.replace(/\s+/g, ' ').slice(0, 120)}</small></li>)}</ol>
+            </section>}
+            {importError && <p className="import-error" role="alert">{importError}</p>}
+            {importSummary && <p className="import-summary" role="status">{importSummary}</p>}
+            {importing && <div className="import-progress"><progress max="100" value={importProgress} /><span>{importProgress}%</span></div>}
+            <div className="import-actions">
+              <button type="button" className="cancel-button" onClick={() => setAddOpen(false)} disabled={importing}>Cancel</button>
+              {!importParsed ? <button type="button" className="save-button" onClick={handleImportPreview} disabled={importing}>Preview</button> : <button type="button" className="save-button" onClick={handleImport} disabled={importing || importParsed.items.length === 0}>{importing ? 'Importing...' : 'Import'}</button>}
+            </div>
+          </>}
+        </form>
+      </div>}
+
+      <style>{`
+        html, body, #root { width:100%;height:100%;margin:0;overflow:hidden; }
+        .memory-app { position:relative;width:100vw;height:100vh;background:#05070f;color:#e8edf7;font:13px/1.45 system-ui,sans-serif; }
+        .memory-panel { box-sizing:border-box;position:absolute;z-index:5;inset:0 auto 0 0;width:min(360px,92vw);padding:16px 15px;overflow-y:auto;background:rgba(9,13,22,.96);border-right:1px solid rgba(175,195,224,.17);backdrop-filter:blur(16px);transition:transform 250ms ease; }
+        .memory-panel.is-collapsed { transform:translateX(calc(-100% + 34px)); }
+        .sidebar-toggle { position:absolute;z-index:8;top:50%;transform:translate(-50%,-50%);width:26px;height:54px;padding:0;border:1px solid rgba(175,195,224,.26);border-radius:0 9px 9px 0;color:#c9d9ef;background:rgba(20,29,45,.92);font:23px/1 system-ui,sans-serif;cursor:pointer;transition:left 250ms ease; }
+        .search-row { display:flex;gap:8px; }
+        .suggestions-button { flex:0 0 auto;border:1px solid rgba(85,199,189,.35);border-radius:7px;padding:0 8px;color:#a7e2dc;background:rgba(31,92,88,.24);font:10px system-ui,sans-serif;white-space:nowrap;cursor:pointer; }
+        .suggestions-button:hover { background:rgba(31,92,88,.4); }
+        .suggestions-view { display:flex;flex-direction:column;min-height:100%; }
+        .suggestion-actions { display:flex;justify-content:space-between;gap:8px;margin:12px 0; }
+        .suggestion-actions button,.suggestion-card footer button,.rejected-card button { border:1px solid rgba(143,196,255,.25);border-radius:6px;padding:6px 8px;color:#c8e1ff;background:#18283c;font:10px system-ui,sans-serif;cursor:pointer; }
+        .suggestion-actions button:hover,.suggestion-card footer button:hover,.rejected-card button:hover { background:#233a55; }
+        .suggestion-list { display:grid;gap:9px; }
+        .suggestion-card { padding:9px;border:1px solid rgba(175,195,224,.15);border-radius:9px;background:rgba(20,29,43,.54); }
+        .suggestion-memory { display:grid;grid-template-columns:8px minmax(0,1fr);gap:7px;align-items:start;margin:3px 0 9px; }
+        .suggestion-memory > i { width:7px;height:7px;margin-top:5px;border-radius:50%; }
+        .suggestion-memory > span,.rejected-card > span { display:grid;min-width:0; }
+        .suggestion-title { overflow:hidden;padding:0;border:0;color:#e0e8f4;text-align:left;text-overflow:ellipsis;white-space:nowrap;background:transparent;font:600 11px system-ui,sans-serif;cursor:pointer; }
+        .suggestion-title:hover { color:#a9d5ff; }
+        .suggestion-memory small,.rejected-card small { overflow:hidden;color:#9aa9bc;font-size:9px;text-overflow:ellipsis;white-space:nowrap; }
+        .suggestion-card footer { display:flex;align-items:center;gap:6px;padding-top:7px;border-top:1px solid rgba(175,195,224,.1); }
+        .suggestion-card footer > span { margin-right:auto;color:#aab8ca;font-size:9px; }
+        .suggestion-card footer .dismiss-suggestion { color:#d0bdad;background:rgba(91,62,43,.28); }
+        .rejected-section { margin-top:18px;border-top:1px solid rgba(175,195,224,.15);padding-top:10px; }
+        .rejected-section summary { color:#b8c5d8;font-size:11px;cursor:pointer; }
+        .rejected-card { display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:8px;padding:8px;border:1px solid rgba(175,195,224,.1);border-radius:7px; }
+        .rejected-card > span { overflow:hidden;color:#d8e1ef;font-size:10px; }
+        .picker-result small { color:#91a2b8; }
+        .suggestion-toast { position:absolute;z-index:9;left:50%;bottom:22px;transform:translateX(-50%);padding:9px 13px;border:1px solid rgba(85,199,189,.45);border-radius:999px;color:#c8f1eb;background:rgba(14,48,48,.95);box-shadow:0 5px 22px rgba(0,0,0,.35);font:11px system-ui,sans-serif;cursor:pointer; }
+        .suggestion-toast:hover { background:rgba(24,73,69,.98); }
+        .search-row input,.picker input,.add-modal input,.add-modal select,.add-modal textarea { box-sizing:border-box;width:100%;min-width:0;border:1px solid #354054;border-radius:7px;padding:10px 11px;color:#edf2fb;background:#111827;font:13px system-ui,sans-serif;outline:none; }
+        .search-row input:focus,.picker input:focus,.add-modal input:focus,.add-modal textarea:focus { border-color:#789cc5; }
+        .add-button { flex:0 0 40px;border:1px solid rgba(143,196,255,.35);border-radius:7px;color:#c8e1ff;background:#18283c;font:24px/1 system-ui,sans-serif;cursor:pointer; }
+        .add-button:hover { background:#233a55; }
+        .settings-button { flex:0 0 38px;border:1px solid rgba(159,181,210,.18);border-radius:7px;color:#aabbd0;background:#131c29;font:17px system-ui,sans-serif;cursor:pointer; }
+        .settings-button:hover { color:#e6f1ff;background:#1a293a; }
+        .embedding-status:empty { display:none; }
+        .embedding-status { margin-top:7px;color:#9fb5cc;font-size:9px; }
+        .embedding-error { color:#ff9696; }
+        .source-filters { display:flex;flex-wrap:wrap;gap:6px;margin:12px 0 5px; }
+        .filter-chip { display:inline-flex;align-items:center;gap:5px;border:1px solid rgba(159,181,210,.15);border-radius:999px;padding:5px 8px;color:#aebbd0;background:rgba(20,29,43,.68);font:10px system-ui,sans-serif;text-transform:capitalize;cursor:pointer; }
+        .filter-chip.is-selected { color:#f1f6ff;border-color:rgba(145,190,243,.48);background:rgba(74,109,151,.3); }
+        .semantic-toggle-row { display:flex;align-items:center;gap:7px;margin:8px 0 4px; }
+        .semantic-toggle { border:1px solid rgba(85,199,189,.25);border-radius:999px;padding:4px 8px;color:#8f9db0;background:rgba(20,29,43,.68);font:9px system-ui,sans-serif;cursor:pointer; }
+        .semantic-toggle.is-on { color:#a7e2dc;border-color:rgba(85,199,189,.52);background:rgba(31,92,88,.24); }
+        .semantic-toggle-row small { color:#ffabab;font-size:9px; }
+        .filter-chip i,.result-dot,.detail-source i,.linked-open i,.picker-result i { display:inline-block;flex:0 0 auto;width:7px;height:7px;border-radius:50%; }
+        .result-list { display:grid;gap:2px;margin-top:8px; }
+        .result-item { display:flex;align-items:center;gap:9px;width:100%;min-width:0;padding:10px 4px;border:0;border-bottom:1px solid rgba(175,195,224,.1);color:#e0e8f4;text-align:left;background:transparent;cursor:pointer; }
+        .result-item:hover,.picker-result:hover,.linked-item:hover { background:rgba(115,151,197,.1); }
+        .result-dot { width:8px;height:8px;box-shadow:0 0 8px currentColor; }
+        .result-copy { display:grid;gap:2px;min-width:0;flex:1; }
+        .result-copy strong { overflow:hidden;color:#e5edf8;font-size:12px;font-weight:560;text-overflow:ellipsis;white-space:nowrap; }
+        .result-copy small { overflow:hidden;color:#8e9db2;font-size:10px;text-overflow:ellipsis;white-space:nowrap; }
+        .result-source { flex:0 0 auto;color:#78879b;font-size:9px;text-transform:capitalize; }
+        .load-more { justify-self:center;margin:10px 0 16px;border:1px solid #34455c;border-radius:6px;padding:7px 12px;color:#b9c9dd;background:#111b29;font:11px system-ui,sans-serif;cursor:pointer; }
+        .empty-note { margin:12px 2px;color:#8391a5;font-size:11px; }
+        .detail-header { display:flex;align-items:center;gap:7px;margin:-5px 0 18px;color:#acbbcf;font-size:12px; }
+        .header-suggestions { margin-left:auto;border:1px solid rgba(85,199,189,.3);border-radius:999px;padding:5px 7px;color:#a7e2dc;background:rgba(31,92,88,.2);font:9px system-ui,sans-serif;white-space:nowrap;cursor:pointer; }
+        .back-button { width:28px;height:28px;border:1px solid rgba(175,195,224,.18);border-radius:6px;color:#d8e5f5;background:#131e2c;font:22px/1 system-ui,sans-serif;cursor:pointer; }
+        .detail-source { display:flex;align-items:center;gap:7px;color:#9dadc3;font-size:11px;text-transform:capitalize; }
+        .detail-view h1 { margin:8px 0 13px;color:#f0f4fb;font-size:17px;line-height:1.3;overflow-wrap:anywhere; }
+        .detail-content { margin:0;color:#d0d9e6;font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere; }
+        .detail-date { display:block;margin-top:12px;color:#77869a;font-size:10px; }
+        .detail-actions { display:flex;gap:8px;margin:16px 0 20px; }
+        .detail-actions button,.section-heading button,.save-button { border:1px solid rgba(143,196,255,.25);border-radius:6px;padding:7px 11px;color:#c7e1ff;background:#182a40;font:11px system-ui,sans-serif;cursor:pointer; }
+        .detail-actions .danger-button { color:#ffb0aa;border-color:rgba(255,135,125,.22);background:rgba(74,28,32,.42); }
+        .detail-links { border-top:1px solid rgba(175,195,224,.15);padding-top:13px; }
+        .section-heading { display:flex;align-items:center;justify-content:space-between;gap:8px; }
+        .section-heading h2 { margin:0;color:#dce6f2;font-size:12px;font-weight:600; }
+        .section-heading button { padding:6px 8px; }
+        .linked-list,.picker-results { display:grid;gap:2px;margin-top:8px; }
+        .linked-item { display:flex;align-items:center;gap:4px;border-bottom:1px solid rgba(175,195,224,.08); }
+        .linked-open,.picker-result { display:flex;align-items:center;gap:8px;flex:1;min-width:0;padding:8px 4px;border:0;color:#d8e2ef;text-align:left;background:transparent;cursor:pointer; }
+        .linked-open span,.picker-result span { display:grid;gap:2px;min-width:0;overflow:hidden;font-size:11px;text-overflow:ellipsis;white-space:nowrap; }
+        .linked-open small,.picker-result small { color:#8493a7;font-size:9px;text-transform:capitalize; }
+        .unlink-button { flex:0 0 auto;border:0;padding:2px 5px;color:#8795a8;background:transparent;font:16px system-ui,sans-serif;cursor:pointer; }
+        .unlink-button:hover { color:#ff9a9a; }
+        .related-section { margin-top:18px;border-top:1px solid rgba(85,199,189,.18);padding-top:12px; }
+        .related-section h2 { margin:0;color:#a7e2dc;font-size:12px;font-weight:600; }
+        .related-item { display:flex;align-items:center;gap:8px;width:100%;min-width:0;padding:8px 4px;border:0;border-bottom:1px solid rgba(85,199,189,.1);color:#d8e2ef;text-align:left;background:transparent;cursor:pointer; }
+        .related-item:hover { background:rgba(85,199,189,.08); }
+        .related-item > i { flex:0 0 auto;width:7px;height:7px;border-radius:50%; }
+        .related-item > span { display:grid;gap:2px;min-width:0;overflow:hidden;font-size:11px;text-overflow:ellipsis;white-space:nowrap; }
+        .related-item small { color:#83bcb5;font-size:9px; }
+        .picker { margin-top:11px;padding:9px;border:1px solid rgba(175,195,224,.14);border-radius:8px;background:rgba(15,23,35,.88); }
+        .picker input { padding:8px 9px;font-size:11px; }
+        .picker-results { max-height:230px;overflow-y:auto; }
+        .picker-result { width:100%; }
+        .modal-backdrop { position:fixed;z-index:20;inset:0;display:grid;place-items:center;padding:16px;background:rgba(1,4,10,.72);backdrop-filter:blur(7px); }
+        .add-modal { display:grid;gap:13px;width:min(430px,calc(100vw - 36px));max-height:calc(100vh - 36px);overflow:auto;padding:18px;border:1px solid rgba(175,195,224,.22);border-radius:12px;background:#0c1421;box-shadow:0 20px 70px rgba(0,0,0,.48); }
+        .add-modal header { display:flex;align-items:center;justify-content:space-between; }
+        .add-modal h2 { margin:0;color:#e9f0fb;font-size:16px; }
+        .add-modal header button { border:0;color:#9aa9bc;background:transparent;font:22px system-ui,sans-serif;cursor:pointer; }
+        .add-modal label { display:grid;gap:5px;color:#bbc8d9;font-size:11px; }
+        .modal-tabs { display:flex;gap:6px;padding-bottom:8px;border-bottom:1px solid rgba(175,195,224,.14); }
+        .modal-tabs button,.cancel-button { border:1px solid rgba(159,181,210,.2);border-radius:6px;padding:6px 11px;color:#aab9cb;background:#111b29;font:11px system-ui,sans-serif;cursor:pointer; }
+        .modal-tabs button.selected { color:#d8ebff;border-color:rgba(143,196,255,.42);background:#1b3048; }
+        .add-modal input[type=file] { padding:8px;font-size:11px; }
+        .add-modal label.import-check { display:flex;align-items:center;gap:8px; }
+        .add-modal label.import-check input { width:14px;height:14px;accent-color:#8dc4ff; }
+        .add-modal label span { color:#8290a4; }
+        .add-modal textarea { resize:vertical;min-height:120px; }
+        .save-button { justify-self:end;padding:9px 14px;color:#08111d;background:#8dc4ff;font-weight:600; }
+        .save-button:disabled { opacity:.55;cursor:default; }
+        .import-preview { padding:10px;border:1px solid rgba(175,195,224,.14);border-radius:7px;background:rgba(9,15,24,.75); }
+        .import-preview > strong { color:#e0eaf7;font-size:12px; }
+        .import-preview p { margin:4px 0 8px;color:#9aaac0;font-size:10px; }
+        .import-preview .import-warning,.import-error { color:#ff8888;font-size:10px; }
+        .import-preview ol { display:grid;gap:7px;margin:8px 0 0;padding-left:21px; }
+        .import-preview li { color:#9eb0c7;font-size:10px; }
+        .import-preview li b,.import-preview li small { display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+        .import-preview li b { color:#dce7f4;font-weight:550; }
+        .import-preview li small { color:#8393a8;font-size:9px; }
+        .import-error { margin:0;color:#ff8888;font-size:10px; }
+        .import-summary { margin:0;color:#9be0bd;font-size:11px; }
+        .import-progress { display:flex;align-items:center;gap:8px;color:#b8c8dd;font-size:10px; }
+        .import-progress progress { width:100%;height:8px;accent-color:#8dc4ff; }
+        .import-actions { display:flex;justify-content:flex-end;gap:8px; }
+        .connect-view h1 { margin:5px 0 6px;color:#edf3fc;font-size:17px; }
+        .connect-hint,.config-section p { margin:0 0 10px;color:#8898ad;font-size:10px; }
+        .connect-field { display:grid;gap:5px;margin:13px 0;color:#aab9cb;font-size:10px; }
+        .connect-field code { overflow-wrap:anywhere;color:#cfe3fa;font:11px ui-monospace,monospace; }
+        .token-row { display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 0;border-top:1px solid rgba(175,195,224,.12);border-bottom:1px solid rgba(175,195,224,.12);color:#bac7d8;font-size:11px; }
+        .token-row button,.config-section button { border:1px solid rgba(143,196,255,.25);border-radius:6px;padding:6px 9px;color:#c7e1ff;background:#182a40;font:10px system-ui,sans-serif;cursor:pointer; }
+        .config-section { margin-top:16px; }
+        .config-section h2 { margin:0 0 5px;color:#dce6f2;font-size:12px; }
+        .config-section pre { max-height:155px;overflow:auto;margin:6px 0;padding:9px;border:1px solid rgba(175,195,224,.13);border-radius:6px;color:#c7d4e5;background:#080e18;font:9px/1.45 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text; }
+      `}</style>
+    </main>
+  );
+}
+
+export default App;
