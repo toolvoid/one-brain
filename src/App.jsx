@@ -68,6 +68,7 @@ function App() {
   const [importSummary, setImportSummary] = useState('');
   const [pendingImportPulse, setPendingImportPulse] = useState(null);
   const [embeddingStatus, setEmbeddingStatus] = useState({ state: 'loading' });
+  const [databaseStatus, setDatabaseStatus] = useState({ writable: true, message: '' });
   const [showSemanticLinks, setShowSemanticLinks] = useState(true);
   const [connectOpen, setConnectOpen] = useState(false);
   const [mcpConfig, setMcpConfig] = useState(null);
@@ -115,6 +116,7 @@ function App() {
 
   useEffect(() => {
     let active = true;
+    window.brain.getDatabaseStatus().then((status) => { if (active) setDatabaseStatus(status); }).catch(() => {});
     Promise.all([window.brain.listMemories(), window.brain.countBySource(), window.brain.listLinks(), window.brain.listSuggestions(), window.brain.listRejected()]).then(([savedMemories, savedCounts, savedLinks, savedSuggestions, savedRejected]) => {
       if (!active) return;
       setMemories(savedMemories);
@@ -466,9 +468,10 @@ function App() {
               <input value={query} onChange={(event) => { setQuery(event.target.value); setPageOffset(0); }} placeholder="Search memories..." aria-label="Search memories" />
               {suggestions.length > 0 && <button className="suggestions-button" type="button" onClick={() => setSuggestionsOpen(true)}>Suggestions ({suggestions.length})</button>}
               <button className="settings-button" type="button" aria-label="Connect AI settings" title="Connect AI" onClick={() => setConnectOpen(true)}>⚙</button>
-              <button className="add-button" type="button" aria-label="Add memory or import" title="Add or import memories" onClick={() => { setAddMode('add'); setAddOpen(true); }}>+</button>
+              <button className="add-button" type="button" aria-label="Add memory or import" title={databaseStatus.writable ? 'Add or import memories' : 'Memory writes are disabled'} disabled={!databaseStatus.writable} onClick={() => { setAddMode('add'); setAddOpen(true); }}>+</button>
             </div>
             <div className="embedding-status" aria-live="polite">
+              {!databaseStatus.writable && <span className="embedding-error">{databaseStatus.message || 'Database is read-only; memory writes are disabled.'}</span>}
               {embeddingStatus.state === 'indexing' && <span>Indexing {embeddingStatus.done}/{embeddingStatus.total}</span>}
               {embeddingStatus.state === 'error' && <span className="embedding-error">{embeddingStatus.message}</span>}
               {embeddingStatus.fallback && embeddingStatus.state !== 'indexing' && <span className="embedding-error">Using fallback model: Xenova/all-MiniLM-L6-v2</span>}
@@ -512,7 +515,7 @@ function App() {
             <label>Source<select value={addSource} onChange={(event) => setAddSource(event.target.value)}>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label>
             <label>Title <span>(optional)</span><input value={addTitle} onChange={(event) => setAddTitle(event.target.value)} /></label>
             <label>Content<textarea required rows="6" value={addContent} onChange={(event) => setAddContent(event.target.value)} /></label>
-            <button className="save-button" type="submit" disabled={saving || !addContent.trim()}>{saving ? 'Saving...' : 'Save memory'}</button>
+            <button className="save-button" type="submit" disabled={!databaseStatus.writable || saving || !addContent.trim()}>{saving ? 'Saving...' : 'Save memory'}</button>
           </> : <>
             <label>Target source<select value={importSource} onChange={(event) => { setImportSource(event.target.value); setImportParsed(null); setImportSummary(''); }}>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label>
             <label>Conversation file<input type="file" accept=".json,.txt,.md,application/json,text/plain,text/markdown" onChange={(event) => { setImportFile(event.target.files?.[0] || null); setImportText(''); setImportParsed(null); setImportSummary(''); }} /></label>

@@ -1,9 +1,11 @@
 const { app } = require('electron');
-const Database = require('better-sqlite3');
+const Database = require('better-sqlite3-multiple-ciphers');
 const path = require('path');
-const { createHash } = require('crypto');
+const fs = require('fs');
+const { createHash, randomBytes } = require('crypto');
 
 let database;
+let databaseSchemaReady = false;
 const SUGGEST_MIN = 0.40;
 const AUTO_MIN = 0.85;
 let embeddingProvider = null;
@@ -17,6 +19,175 @@ let handAddedMemoryIds = new Set();
 let vectorCache = new Map();
 let memoryCache = new Map();
 let cachesLoaded = false;
+let databaseWritable = false;
+let databaseStatus = { state: 'initializing', writable: false, message: '' };
+
+function setDatabaseStatus(state, writable, message = '') {
+  databaseWritable = writable;
+  databaseStatus = { state, writable, message };
+}
+
+function getDatabaseStatus() { return { ...databaseStatus }; }
+
+function ensureWritable() {
+  if (!databaseWritable) throw new Error(databaseStatus.message || 'Database is read-only; memory writes are disabled.');
+}
+
+function openEncrypted(filePath, key, options = {}) {
+  const db = new Database(filePath, options);
+  try {
+    db.pragma("cipher = 'sqlcipher'");
+    db.pragma('legacy = 4');
+    db.key(key);
+    db.prepare('SELECT count(*) FROM sqlite_master').get();
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
+
+function openPlain(filePath, options = {}) {
+  const db = new Database(filePath, options);
+  try {
+    db.prepare('SELECT count(*) FROM sqlite_master').get();
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
+
+function tableCount(db, table) {
+  const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?").get(table);
+  return exists ? db.prepare(`SELECT count(*) AS count FROM "${table}"`).get().count : 0;
+}
+
+function databaseCounts(db) {
+  return Object.fromEntries(['memories', 'links', 'embeddings', 'link_suggestions'].map((table) => [table, tableCount(db, table)]));
+}
+
+function findFtsResult(db) {
+  const row = db.prepare('SELECT title, content FROM memories ORDER BY id LIMIT 1').get();
+  if (!row) return true;
+  const word = `${row.title || ''} ${row.content || ''}`.match(/[\p{L}\p{N}_]+/u)?.[0];
+  if (!word) return false;
+  return Boolean(db.prepare('SELECT rowid FROM memories_fts WHERE memories_fts MATCH ? LIMIT 1').get(`"${word.replace(/"/g, '')}"*`));
+}
+
+function saveEncryptedKey(safeStorage, keyPath, key) {
+  const encrypted = safeStorage.encryptString(key.toString('base64'));
+  const temporary = `${keyPath}.tmp-${process.pid}`;
+  const fd = fs.openSync(temporary, 'wx', 0o600);
+  try { fs.writeFileSync(fd, encrypted); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  fs.renameSync(temporary, keyPath);
+  fs.chmodSync(keyPath, 0o600);
+}
+
+function readEncryptedKey(safeStorage, keyPath) {
+  const key = Buffer.from(safeStorage.decryptString(fs.readFileSync(keyPath)), 'base64');
+  if (key.length !== 32) throw new Error('Stored database key is invalid.');
+  return key;
+}
+
+async function encryptPlainDatabase(dbPath, key) {
+  const backupPath = `${dbPath}.pre-encryption.bak`;
+  const temporaryPath = path.join(path.dirname(dbPath), 'onebrain.enc.db');
+  if (fs.existsSync(backupPath)) throw new Error(`Preserved backup already exists at ${backupPath}; migration stopped.`);
+  if (fs.existsSync(temporaryPath)) throw new Error(`Migration file already exists at ${temporaryPath}; migration stopped.`);
+
+  try {
+    const source = openPlain(dbPath);
+    const expected = databaseCounts(source);
+    try {
+      const copy = await source.backup(temporaryPath);
+      if (copy.remainingPages !== 0) throw new Error('Database backup did not finish.');
+    } finally { source.close(); }
+
+    const copy = openPlain(temporaryPath);
+    try {
+      if (copy.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories_fts'").get()) {
+        copy.exec("INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')");
+      }
+      copy.pragma("cipher = 'sqlcipher'");
+      copy.pragma('legacy = 4');
+      copy.rekey(key);
+    } finally { copy.close(); }
+
+    const verified = openEncrypted(temporaryPath, key, { readonly: true, fileMustExist: true });
+    try {
+      const actual = databaseCounts(verified);
+      if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error('Encrypted database verification failed: row counts differ.');
+      if (!findFtsResult(verified)) throw new Error('Encrypted database verification failed: FTS search returned no result.');
+    } finally { verified.close(); }
+
+    fs.renameSync(dbPath, backupPath);
+    try { fs.renameSync(temporaryPath, dbPath); }
+    catch (error) { fs.renameSync(backupPath, dbPath); throw error; }
+    return backupPath;
+  } catch (error) {
+    try { fs.rmSync(temporaryPath, { force: true }); } catch {}
+    throw error;
+  }
+}
+
+async function initializeDatabase(userDataPath = app.getPath('userData'), safeStorage = require('electron').safeStorage) {
+  const dbPath = path.join(userDataPath, 'onebrain.db');
+  const keyPath = path.join(userDataPath, 'db.key');
+  fs.mkdirSync(userDataPath, { recursive: true });
+  let available = false;
+  let backend = 'unavailable';
+  try {
+    available = safeStorage.isEncryptionAvailable();
+    backend = safeStorage.getSelectedStorageBackend();
+  } catch {}
+
+  if (!available || backend === 'basic_text') {
+    const message = !available
+      ? 'Database encryption unavailable; memory writes are disabled.'
+      : 'Database encryption backend is basic_text; memory writes are disabled.';
+    try {
+      if (fs.existsSync(dbPath)) database = openPlain(dbPath, { readonly: true, fileMustExist: true });
+      setDatabaseStatus('read-only', false, message);
+    } catch {
+      setDatabaseStatus('unavailable', false, message);
+    }
+    return getDatabaseStatus();
+  }
+
+  let key;
+  try {
+    if (fs.existsSync(keyPath)) key = readEncryptedKey(safeStorage, keyPath);
+    else {
+      key = randomBytes(32);
+      saveEncryptedKey(safeStorage, keyPath, key);
+    }
+
+    if (fs.existsSync(dbPath)) {
+      try {
+        database = openEncrypted(dbPath, key);
+      } catch {
+        try {
+          openPlain(dbPath, { readonly: true, fileMustExist: true }).close();
+          const backupPath = await encryptPlainDatabase(dbPath, key);
+          console.log(`Plaintext database backup preserved at ${backupPath}`);
+          database = openEncrypted(dbPath, key);
+        } catch (error) {
+          throw new Error(`Database could not be opened or encrypted: ${String(error?.message || error).split('\n')[0]}`);
+        }
+      }
+    } else {
+      database = openEncrypted(dbPath, key);
+    }
+    setDatabaseStatus('ready', true);
+    return getDatabaseStatus();
+  } catch (error) {
+    if (database?.open) { try { database.close(); } catch {} }
+    database = null;
+    setDatabaseStatus('error', false, `${String(error?.message || error).split('\n')[0]} Memory writes are disabled.`);
+    return getDatabaseStatus();
+  }
+}
 
 function normalizeContent(content) {
   return String(content || '').normalize('NFKC').replace(/\r\n?/g, '\n').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -55,8 +226,13 @@ function loadCaches(db) {
 }
 
 function getDatabase() {
-  if (!database) {
-    database = new Database(path.join(app.getPath('userData'), 'onebrain.db'));
+  if (!database && !databaseWritable) throw new Error(databaseStatus.message || 'Database is unavailable.');
+  if (database && !databaseWritable) {
+    if (!cachesLoaded) loadCaches(database);
+    return database;
+  }
+  if (!database || !databaseSchemaReady) {
+    if (!database) database = new Database(path.join(app.getPath('userData'), 'onebrain.db'));
     database.pragma('foreign_keys = ON');
     database.exec(`
       CREATE TABLE IF NOT EXISTS memories (
@@ -186,6 +362,7 @@ function getDatabase() {
       backfill();
     }
     loadCaches(database);
+    databaseSchemaReady = true;
   }
 
   return database;
@@ -313,6 +490,10 @@ function configureEmbeddingProvider(provider, model, { onProgress = () => {}, on
   semanticLinksListener = onLinksChanged;
   const db = getDatabase();
   loadCaches(db);
+  if (!databaseWritable) {
+    onProgress({ done: 0, total: 0 });
+    return;
+  }
   const pending = db.prepare(`
     SELECT memories.id
     FROM memories LEFT JOIN embeddings ON embeddings.memory_id = memories.id
@@ -343,6 +524,7 @@ function configureEmbeddingProvider(provider, model, { onProgress = () => {}, on
 }
 
 function addMemory({ source, title, content }, { handAdded = false } = {}) {
+  ensureWritable();
   const db = getDatabase();
   const add = db.transaction(() => {
     const result = db
@@ -376,6 +558,7 @@ function addMemory({ source, title, content }, { handAdded = false } = {}) {
 }
 
 function importMemories(items) {
+  ensureWritable();
   const db = getDatabase();
   const insert = db.prepare('INSERT OR IGNORE INTO memories (source, title, content, content_hash) VALUES (?, ?, ?, ?)');
   const importBatch = db.transaction((batch) => {
@@ -489,6 +672,7 @@ async function searchMemories(query, source, limit = 50, offset = 0) {
 }
 
 function deleteMemory(id) {
+  ensureWritable();
   const db = getDatabase();
   const remove = db.transaction(() => {
     db.prepare('DELETE FROM links WHERE a_id = ? OR b_id = ?').run(id, id);
@@ -514,6 +698,7 @@ function listLinks() {
 }
 
 function createLink(aId, bId) {
+  ensureWritable();
   const a = Number(aId);
   const b = Number(bId);
   if (!Number.isInteger(a) || !Number.isInteger(b)) throw new TypeError('Memory IDs must be integers');
@@ -533,6 +718,7 @@ function createLink(aId, bId) {
 }
 
 function deleteLink(id) {
+  ensureWritable();
   const db = getDatabase();
   const remove = db.transaction(() => {
     const link = db.prepare('SELECT a_id, b_id, kind, score FROM links WHERE id = ?').get(id);
@@ -570,6 +756,7 @@ function listRejected() {
 }
 
 function acceptSuggestion(id) {
+  ensureWritable();
   const db = getDatabase();
   const accept = db.transaction(() => {
     const suggestion = db.prepare("SELECT a_id, b_id, score FROM link_suggestions WHERE id = ? AND status = 'pending'").get(Number(id));
@@ -583,14 +770,17 @@ function acceptSuggestion(id) {
 }
 
 function rejectSuggestion(id) {
+  ensureWritable();
   return getDatabase().prepare("UPDATE link_suggestions SET status = 'rejected' WHERE id = ? AND status = 'pending'").run(Number(id)).changes > 0;
 }
 
 function dismissSuggestions() {
+  ensureWritable();
   return getDatabase().prepare("DELETE FROM link_suggestions WHERE status = 'pending'").run().changes;
 }
 
 function restoreRejected(id) {
+  ensureWritable();
   return getDatabase().prepare("DELETE FROM link_suggestions WHERE id = ? AND status = 'rejected'").run(Number(id)).changes > 0;
 }
 
@@ -604,4 +794,4 @@ function countBySource() {
     }, {});
 }
 
-module.exports = { addMemory, importMemories, deleteMemory, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
+module.exports = { initializeDatabase, getDatabaseStatus, addMemory, importMemories, deleteMemory, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };

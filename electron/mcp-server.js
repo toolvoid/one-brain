@@ -171,8 +171,8 @@ async function startMcpServer(userDataPath, appPath) {
   if (!/^[a-f\d]{64}$/i.test(token || '')) {
     token = randomBytes(32).toString('hex');
     fs.writeFileSync(tokenPath, `${token}\n`, { mode: 0o600 });
-    try { fs.chmodSync(tokenPath, 0o600); } catch {}
   }
+  try { fs.chmodSync(tokenPath, 0o600); } catch {}
 
   const portPath = path.join(userDataPath, 'mcp-port');
   let savedPort = Number(fs.existsSync(portPath) ? fs.readFileSync(portPath, 'utf8').trim() : 0);

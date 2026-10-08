@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld('brain', {
   countBySource: () => ipcRenderer.invoke('memories:count-by-source'),
   getMcpConfig: () => ipcRenderer.invoke('mcp:config'),
   getEmbeddingStatus: () => ipcRenderer.invoke('embeddings:status'),
+  getDatabaseStatus: () => ipcRenderer.invoke('database:status'),
   onEmbeddingStatus: (callback) => {
     const listener = (_event, status) => callback(status);
     ipcRenderer.on('brain:embedding-status', listener);

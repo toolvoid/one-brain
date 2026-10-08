@@ -1,6 +1,6 @@
-const { app, BrowserWindow, ipcMain, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, safeStorage } = require('electron');
 const path = require('path');
-const { addMemory, importMemories, deleteMemory, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
+const { initializeDatabase, getDatabaseStatus, addMemory, importMemories, deleteMemory, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
 const { startMcpServer } = require('./mcp-server');
 const { createEmbedder } = require('./embedder');
 
@@ -34,6 +34,7 @@ ipcMain.handle('memories:search', (_event, query, source, limit, offset) => sear
 ipcMain.handle('memories:count-by-source', () => countBySource());
 ipcMain.handle('mcp:config', () => mcpConnection?.config || null);
 ipcMain.handle('embeddings:status', () => embeddingStatus);
+ipcMain.handle('database:status', () => getDatabaseStatus());
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -68,7 +69,10 @@ function createWindow() {
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  const databaseStatus = await initializeDatabase(app.getPath('userData'), safeStorage);
+  if (databaseStatus.message) console.error(databaseStatus.message);
+
   embedder = createEmbedder(app.getPath('userData'), (status) => {
     if (status.state === 'ready') {
       configureEmbeddingProvider(embedder.embed, status.model, {
