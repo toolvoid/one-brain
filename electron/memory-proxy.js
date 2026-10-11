@@ -68,7 +68,11 @@ function appendMemoryMessage(body, memories, maxTokens) {
     if (text.length >= maxTokens * 4) break;
   }
   const tokens = Math.ceil(text.length / 4);
-  return { ...body, messages: [{ role: 'system', content: text }, ...body.messages], tokens, memoryCount: added };
+  return {
+    body: { ...body, messages: [{ role: 'system', content: text }, ...body.messages] },
+    tokens,
+    memoryCount: added
+  };
 }
 
 function parseSseContent(text) {
@@ -217,7 +221,7 @@ function createMemoryProxy(options) {
           const preview = appendMemoryMessage(body, memories, 1500);
           memories = memories.slice(0, preview.memoryCount);
           tokensAdded = preview.tokens;
-          if (!dryRun) actualBody = preview;
+          if (!dryRun) actualBody = preview.body;
         }
       } catch (error) { injectionError = error?.message === 'search_timeout' ? 'search_timeout' : 'search_failed'; memories = []; actualBody = body; tokensAdded = 0; }
     }
