@@ -1,6 +1,6 @@
 const { app, BrowserWindow, ipcMain, Menu, safeStorage } = require('electron');
 const path = require('path');
-const { initializeDatabase, getDatabaseStatus, addMemory, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
+const { initializeDatabase, getDatabaseStatus, getInsights, runAnalyticsSql, addMemory, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
 const { startMcpServer } = require('./mcp-server');
 const { createEmbedder } = require('./embedder');
 
@@ -38,11 +38,13 @@ ipcMain.handle('suggestions:list-rejected', () => listRejected());
 ipcMain.handle('suggestions:restore', (_event, id) => restoreRejected(id));
 ipcMain.handle('suggestions:dismiss-all', () => dismissSuggestions());
 ipcMain.handle('memories:list', () => listMemories());
-ipcMain.handle('memories:search', (_event, query, source, limit, offset) => searchMemories(query, source, limit, offset));
+ipcMain.handle('memories:search', (_event, query, source, limit, offset) => searchMemories(query, source, limit, offset, { kind: 'search', tool: 'ui_search' }));
 ipcMain.handle('memories:count-by-source', () => countBySource());
 ipcMain.handle('mcp:config', () => mcpConnection?.config || null);
 ipcMain.handle('embeddings:status', () => embeddingStatus);
 ipcMain.handle('database:status', () => getDatabaseStatus());
+ipcMain.handle('analytics:insights', () => getInsights());
+ipcMain.handle('analytics:run-sql', (_event, sql) => runAnalyticsSql(sql));
 
 function createWindow() {
   const win = new BrowserWindow({

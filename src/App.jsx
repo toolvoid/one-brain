@@ -11,6 +11,37 @@ const SOURCE_COLORS = {
 const EMPTY_COUNTS = Object.fromEntries(SOURCES.map((source) => [source, 0]));
 const PAGE_SIZE = 50;
 
+function SqlPanel({ title, children, sql }) {
+  const [showSql, setShowSql] = useState(false);
+  return <section className="insight-card"><header><h2>{title}</h2><button type="button" className="sql-toggle" onClick={() => setShowSql((value) => !value)}>{showSql ? 'Hide SQL' : 'Show SQL'}</button></header>{children}{showSql && <pre className="insight-sql">{sql}</pre>}</section>;
+}
+
+function InsightBars({ rows, valueKey, labelKey, groupKey, colors }) {
+  const maximum = Math.max(1, ...rows.map((row) => Number(row[valueKey]) || 0));
+  return <div className="insight-bars">{rows.map((row, index) => <div className="insight-bar-row" key={`${row[labelKey]}-${row[groupKey] || index}`}><span>{row[labelKey]}{groupKey ? ` · ${row[groupKey]}` : ''}</span><div className="insight-bar-track"><i style={{ width: `${Math.max(1, (Number(row[valueKey]) || 0) / maximum * 100)}%`, background: colors?.[row[groupKey]] || '#83b9f4' }} /></div><b>{row[valueKey]}</b></div>)}{rows.length === 0 && <p className="empty-note">No data yet</p>}</div>;
+}
+
+function InsightsView({ data, onBack, sql, setSql, runSql, sqlResult, sqlRunning }) {
+  const view = (key) => data?.[key] || { rows: [], sql: '' };
+  const table = (rows, keys, empty = 'No data yet') => rows.length ? <div className="insight-table-wrap"><table className="insight-table"><thead><tr>{keys.map(([key, label]) => <th key={key}>{label}</th>)}</tr></thead><tbody>{rows.map((row, index) => <tr key={row.id ?? row.ts ?? `${index}`} >{keys.map(([key]) => <td key={key}>{row[key] == null ? '—' : String(row[key])}</td>)}</tr>)}</tbody></table></div> : <p className="empty-note">{empty}</p>;
+  const memories = view('memoriesByDay'), links = view('linksAndSuggestions'), calls = view('mcpCallsByDay'), latency = view('searchLatency');
+  const retrievals = view('retrievals'), never = view('neverRetrieved'), embedding = view('embeddingStatus'), clients = view('connectedClients');
+  const linkRows = links.rows;
+  return <section className="insights-view"><header className="insights-header"><button className="back-button" type="button" onClick={onBack}>‹</button><div><h1>Insights</h1><p>Local SQLite activity and retrieval analytics</p></div></header>
+    <div className="insights-grid">
+      <SqlPanel title="Memories added per day, per source" sql={memories.sql}><InsightBars rows={memories.rows.slice(0, 60)} valueKey="memories" labelKey="day" groupKey="source" colors={SOURCE_COLORS} /></SqlPanel>
+      <SqlPanel title="Links and suggestions" sql={links.sql}>{table(linkRows, [['category','Type'],['label','Kind or status'],['total','Count']])}</SqlPanel>
+      <SqlPanel title="MCP calls per day per client" sql={calls.sql}><InsightBars rows={calls.rows.slice(0, 60)} valueKey="calls" labelKey="day" groupKey="client" /></SqlPanel>
+      <SqlPanel title="Search latency by day" sql={latency.sql}>{table(latency.rows, [['day','Day'],['average_ms','Average ms'],['p95_ms','p95 ms'],['samples','Searches']])}</SqlPanel>
+      <SqlPanel title="Searches with zero results" sql={view('zeroResultSearches').sql}>{table(view('zeroResultSearches').rows, [['ts','Time'],['client','Client'],['source','Source'],['query','Query']], 'No zero result searches')}</SqlPanel>
+      <SqlPanel title="Most retrieved memories" sql={retrievals.sql}>{table(retrievals.rows, [['id','ID'],['title','Title'],['source','Source'],['retrieved','Retrieved']])}<p className="insight-note">Never retrieved: <b>{never.rows[0]?.total ?? 0}</b></p></SqlPanel>
+      <SqlPanel title="Embedding index status" sql={embedding.sql}><div className="insight-stat"><strong>{embedding.rows[0]?.indexed ?? 0}</strong><span>indexed of {embedding.rows[0]?.total ?? 0} memories</span></div></SqlPanel>
+      <SqlPanel title="Connected MCP clients" sql={clients.sql}>{table(clients.rows, [['client','Client'],['first_seen','First seen'],['last_seen','Last seen'],['total_calls','Total calls'],['calls_last_7_days','Last 7 days']])}</SqlPanel>
+    </div>
+    <section className="insight-card run-sql-card"><header><h2>Run SQL</h2><small>Read only · SELECT only · 200 rows · 3 second timeout</small></header><textarea aria-label="SQL query" spellCheck="false" value={sql} onChange={(event) => setSql(event.target.value)} /><button className="run-sql-button" type="button" onClick={runSql} disabled={sqlRunning}>{sqlRunning ? 'Running…' : 'Run SQL'}</button>{sqlResult?.error && <p className="sql-error" role="alert">{sqlResult.error}</p>}{sqlResult?.rows && table(sqlResult.rows, sqlResult.columns.map((column) => [column, column]), 'Query returned no rows')}</section>
+  </section>;
+}
+
 function dateLabel(value) {
   if (!value) return '';
   return new Date(`${value.replace(' ', 'T')}Z`).toLocaleString();
@@ -78,6 +109,11 @@ function App() {
   const [databaseStatus, setDatabaseStatus] = useState({ writable: true, message: '' });
   const [showSemanticLinks, setShowSemanticLinks] = useState(true);
   const [connectOpen, setConnectOpen] = useState(false);
+  const [insightsOpen, setInsightsOpen] = useState(false);
+  const [insightsData, setInsightsData] = useState(null);
+  const [sql, setSql] = useState('SELECT date(ts) AS day, count(*) AS calls FROM events GROUP BY date(ts) ORDER BY day DESC;');
+  const [sqlResult, setSqlResult] = useState(null);
+  const [sqlRunning, setSqlRunning] = useState(false);
   const [mcpConfig, setMcpConfig] = useState(null);
   const [copied, setCopied] = useState('');
   const graphRef = useRef(null);
@@ -128,6 +164,20 @@ function App() {
     setResults(next);
     setPageOffset(0);
     setHasMore(next.length === PAGE_SIZE);
+  }
+
+  async function openInsights() {
+    setInsightsOpen(true);
+    try { setInsightsData(await window.brain.getInsights()); }
+    catch (error) { setInsightsData({}); setSqlResult({ error: error.message || 'Could not load insights.' }); }
+  }
+
+  async function runAnalyticsQuery() {
+    setSqlRunning(true);
+    setSqlResult(null);
+    try { setSqlResult(await window.brain.runAnalyticsSql(sql)); }
+    catch (error) { setSqlResult({ error: error.message || 'Query failed.' }); }
+    finally { setSqlRunning(false); }
   }
 
   useEffect(() => {
@@ -437,7 +487,9 @@ function App() {
   return (
     <main className="memory-app">
       <BrainGraph ref={graphRef} memories={memories} counts={counts} links={visibleGraphLinks} dataReady={dataReady} sidebarCollapsed={sidebarCollapsed} linksVisible={linksVisible} onLinksVisibleChange={setLinksVisible} />
-      <aside className={`memory-panel${sidebarCollapsed ? ' is-collapsed' : ''}`}>
+      {insightsOpen && <InsightsView data={insightsData} onBack={() => setInsightsOpen(false)} sql={sql} setSql={setSql} runSql={runAnalyticsQuery} sqlResult={sqlResult} sqlRunning={sqlRunning} />}
+      <aside className={`memory-panel${sidebarCollapsed ? ' is-collapsed' : ''}`} style={insightsOpen ? { display: 'none' } : undefined}>
+        <header className="sidebar-header"><strong>One Brain</strong><button type="button" onClick={openInsights}>Insights</button></header>
         {connectOpen ? (
           <section className="connect-view">
             <header className="detail-header"><button className="back-button" type="button" onClick={() => setConnectOpen(false)}>‹</button><span>Connect AI</span>{suggestions.length > 0 && <button className="header-suggestions" type="button" onClick={() => { setConnectOpen(false); setSuggestionsOpen(true); }}>Suggestions ({suggestions.length})</button>}</header>
@@ -570,7 +622,7 @@ function App() {
           </>
         )}
       </aside>
-      <button className="sidebar-toggle" type="button" aria-label={sidebarCollapsed ? 'Expand memories sidebar' : 'Collapse memories sidebar'} aria-expanded={!sidebarCollapsed} onClick={() => setSidebarCollapsed((collapsed) => !collapsed)} style={{ left: sidebarCollapsed ? 32 : 'min(360px, 92vw)' }}>{sidebarCollapsed ? '›' : '‹'}</button>
+      {!insightsOpen && <button className="sidebar-toggle" type="button" aria-label={sidebarCollapsed ? 'Expand memories sidebar' : 'Collapse memories sidebar'} aria-expanded={!sidebarCollapsed} onClick={() => setSidebarCollapsed((collapsed) => !collapsed)} style={{ left: sidebarCollapsed ? 32 : 'min(360px, 92vw)' }}>{sidebarCollapsed ? '›' : '‹'}</button>}
       {suggestionToast && <button className="suggestion-toast" type="button" onClick={() => { setSuggestionToast(false); setSuggestionsOpen(true); }}>1 possible link found - Review</button>}
 
       {addOpen && createPortal(<div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setAddOpen(false); }}>
@@ -616,6 +668,42 @@ function App() {
         html, body, #root { width:100%;height:100%;margin:0;overflow:hidden; }
         .memory-app { position:relative;width:100vw;height:100vh;background:#05070f;color:#e8edf7;font:13px/1.45 system-ui,sans-serif; }
         .memory-panel { box-sizing:border-box;position:absolute;z-index:5;inset:0 auto 0 0;width:min(360px,92vw);padding:16px 15px;overflow-y:auto;background:rgba(9,13,22,.96);border-right:1px solid rgba(175,195,224,.17);backdrop-filter:blur(16px);transition:transform 250ms ease; }
+        .sidebar-header { display:flex;align-items:center;justify-content:space-between;margin:0 0 13px;padding:0 1px;color:#edf3fc;font-size:14px; }
+        .sidebar-header button,.sql-toggle,.run-sql-button { border:1px solid rgba(143,196,255,.25);border-radius:6px;padding:6px 10px;color:#c7e1ff;background:#182a40;font:11px system-ui,sans-serif;cursor:pointer; }
+        .insights-view { box-sizing:border-box;position:absolute;z-index:10;inset:0;overflow:auto;padding:24px clamp(18px,4vw,56px) 48px;color:#e8edf7;background:#080d17;font:13px/1.45 system-ui,sans-serif; }
+        .insights-header { display:flex;align-items:center;gap:14px;margin:0 auto 22px;max-width:1500px; }
+        .insights-header h1 { margin:0;color:#edf3fc;font-size:22px; }
+        .insights-header p { margin:3px 0 0;color:#8494aa;font-size:11px; }
+        .insights-header .back-button { flex:none; }
+        .insights-grid { display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:14px;max-width:1500px;margin:0 auto; }
+        .insight-card { min-width:0;padding:14px;border:1px solid rgba(175,195,224,.15);border-radius:10px;background:rgba(17,25,39,.9); }
+        .insight-card > header { display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 12px; }
+        .insight-card h2 { margin:0;color:#dfe9f7;font-size:13px;font-weight:600; }
+        .insight-card .sql-toggle { flex:none;padding:5px 8px;font-size:10px; }
+        .insight-bars { display:grid;gap:7px;max-height:310px;overflow:auto; }
+        .insight-bar-row { display:grid;grid-template-columns:minmax(100px,140px) 1fr 30px;align-items:center;gap:8px;color:#aab9ca;font-size:10px; }
+        .insight-bar-row > span { overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+        .insight-bar-row > b { text-align:right;color:#d9e6f5;font-size:10px; }
+        .insight-bar-track { height:7px;overflow:hidden;border-radius:10px;background:#09111d; }
+        .insight-bar-track i { display:block;height:100%;border-radius:inherit; }
+        .insight-table-wrap { max-width:100%;overflow:auto; }
+        .insight-table { width:100%;border-collapse:collapse;color:#aebed1;font-size:10px; }
+        .insight-table th,.insight-table td { padding:7px 8px;border-bottom:1px solid rgba(175,195,224,.1);text-align:left;vertical-align:top; }
+        .insight-table th { color:#d7e3f1;font-weight:600;white-space:nowrap; }
+        .insight-table td { max-width:300px;overflow-wrap:anywhere; }
+        .insight-sql { max-height:180px;overflow:auto;margin:12px 0 0;padding:10px;border:1px solid rgba(175,195,224,.12);border-radius:6px;color:#bcd3ed;background:#080e18;font:10px/1.5 ui-monospace,monospace;white-space:pre-wrap; }
+        .insight-note { margin:10px 0 0;color:#aab9ca;font-size:11px; }
+        .insight-note b { color:#eaf2fc; }
+        .insight-stat { display:flex;align-items:baseline;gap:9px;padding:8px 0;color:#9aabc0; }
+        .insight-stat strong { color:#eaf2fc;font-size:28px; }
+        .run-sql-card { max-width:1500px;margin:14px auto 0; }
+        .run-sql-card > header small { color:#8192a9;font-size:10px; }
+        .run-sql-card textarea { box-sizing:border-box;width:100%;min-height:82px;resize:vertical;padding:10px;border:1px solid rgba(175,195,224,.17);border-radius:6px;outline:none;color:#cfe0f4;background:#080e18;font:11px/1.5 ui-monospace,monospace; }
+        .run-sql-button { display:block;margin:9px 0 0; }
+        .run-sql-button:disabled { opacity:.6;cursor:wait; }
+        .sql-error { margin:10px 0 0;color:#ff9292;font-size:11px; }
+        .run-sql-card .insight-table-wrap { margin-top:12px; }
+        @media(max-width:620px) { .insights-view { padding:16px 12px 30px; }.insights-grid { grid-template-columns:1fr; }.insight-card { padding:11px; }.insight-bar-row { grid-template-columns:95px 1fr 24px;gap:5px; } }
         .memory-panel.is-collapsed { transform:translateX(calc(-100% + 34px)); }
         .sidebar-toggle { position:absolute;z-index:8;top:50%;transform:translate(-50%,-50%);width:26px;height:54px;padding:0;border:1px solid rgba(175,195,224,.26);border-radius:0 9px 9px 0;color:#c9d9ef;background:rgba(20,29,45,.92);font:23px/1 system-ui,sans-serif;cursor:pointer;transition:left 250ms ease; }
         .search-row { display:flex;gap:8px; }

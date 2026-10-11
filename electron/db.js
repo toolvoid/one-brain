@@ -4,6 +4,8 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { createHash, randomBytes } = require('crypto');
+const { Worker } = require('node:worker_threads');
+const { INSIGHT_QUERIES } = require('./analytics-queries');
 
 let database;
 let databaseKey = null;
@@ -23,6 +25,7 @@ let memoryCache = new Map();
 let cachesLoaded = false;
 let databaseWritable = false;
 let databaseStatus = { state: 'initializing', writable: false, message: '' };
+let databasePath = null;
 let legacyCleanupStatus = { count: 0, backupPath: null, error: '' };
 const cancelledEmbeddingIds = new Set();
 
@@ -32,6 +35,45 @@ function setDatabaseStatus(state, writable, message = '') {
 }
 
 function getDatabaseStatus() { return { ...databaseStatus }; }
+
+function openAnalyticsDatabase() {
+  if (!databasePath || !fs.existsSync(databasePath)) throw new Error('Database is unavailable.');
+  const analyticsDb = databaseKey
+    ? openEncrypted(databasePath, databaseKey, { readonly: true, fileMustExist: true })
+    : openPlain(databasePath, { readonly: true, fileMustExist: true });
+  analyticsDb.pragma('query_only = ON');
+  return analyticsDb;
+}
+
+function getInsights() {
+  const db = openAnalyticsDatabase();
+  try {
+    return Object.fromEntries(Object.entries(INSIGHT_QUERIES).map(([name, sql]) => [name, { sql, rows: db.prepare(sql).all() }]));
+  } finally { db.close(); }
+}
+
+function runAnalyticsSql(sql) {
+  if (!databasePath) return Promise.resolve({ error: 'Database is unavailable.' });
+  return new Promise((resolve) => {
+    const worker = new Worker(path.join(__dirname, 'sql-worker.js'), {
+      workerData: { path: databasePath, key: databaseKey?.toString('base64') || null, sql: String(sql || '') }
+    });
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      void worker.terminate();
+      finish({ error: 'Query timed out after 3 seconds.' });
+    }, 3000);
+    worker.once('message', finish);
+    worker.once('error', (error) => finish({ error: String(error?.message || error).split('\n')[0] }));
+    worker.once('exit', (code) => { if (code !== 0) finish({ error: `Query worker stopped (${code}).` }); });
+  });
+}
 
 function ensureWritable() {
   if (!databaseWritable) throw new Error(databaseStatus.message || 'Database is read-only; memory writes are disabled.');
@@ -196,6 +238,7 @@ async function encryptPlainDatabase(dbPath, key) {
 
 async function initializeDatabase(userDataPath = app.getPath('userData'), safeStorage = require('electron').safeStorage) {
   const dbPath = path.join(userDataPath, 'onebrain.db');
+  databasePath = dbPath;
   const keyPath = path.join(userDataPath, 'db.key');
   fs.mkdirSync(userDataPath, { recursive: true });
   let available = false;
@@ -353,6 +396,41 @@ function getDatabase() {
         title, content, content='memories', content_rowid='id', tokenize='unicode61 remove_diacritics 2'
       );
       CREATE TABLE IF NOT EXISTS brain_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        kind TEXT NOT NULL,
+        tool TEXT,
+        client TEXT,
+        source TEXT,
+        query TEXT,
+        result_count INTEGER,
+        top_score REAL,
+        latency_ms INTEGER,
+        ok INTEGER,
+        error TEXT
+      );
+      CREATE INDEX IF NOT EXISTS events_ts_idx ON events(ts);
+      CREATE INDEX IF NOT EXISTS events_kind_idx ON events(kind, ts);
+      CREATE TABLE IF NOT EXISTS event_memory_retrievals (
+        event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+        memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+        PRIMARY KEY(event_id, memory_id)
+      );
+      CREATE TABLE IF NOT EXISTS memory_retrieval_stats (
+        memory_id INTEGER PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+        retrieval_count INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS mcp_client_stats (
+        client TEXT PRIMARY KEY,
+        first_seen TEXT NOT NULL,
+        last_seen TEXT NOT NULL,
+        total_calls INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS suggestion_decision_stats (
+        status TEXT PRIMARY KEY CHECK(status IN ('accepted', 'rejected')),
+        total INTEGER NOT NULL DEFAULT 0
+      );
       CREATE TRIGGER IF NOT EXISTS memories_fts_insert AFTER INSERT ON memories BEGIN
         INSERT INTO memories_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
       END;
@@ -433,6 +511,8 @@ function getDatabase() {
     });
     backfillHashes();
     database.exec('CREATE UNIQUE INDEX IF NOT EXISTS memories_source_content_hash_idx ON memories(source, content_hash)');
+
+    database.prepare("DELETE FROM events WHERE ts < datetime('now', '-90 days')").run();
 
     const migrated = database.prepare('SELECT value FROM brain_meta WHERE key = ?').get('memories_fts_backfilled');
     if (!migrated) {
@@ -622,7 +702,34 @@ function configureEmbeddingProvider(provider, model, { onProgress = () => {}, on
   void backfill().catch((error) => onError(`Local semantic indexing failed: ${String(error?.message || error).split('\n')[0]}`));
 }
 
-function addMemory({ source, title, content }, { handAdded = false } = {}) {
+function recordEvent(event = {}, memoryIds = []) {
+  try {
+    const db = getDatabase();
+    const result = db.prepare(`INSERT INTO events
+      (kind, tool, client, source, query, result_count, top_score, latency_ms, ok, error)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(String(event.kind || 'unknown').slice(0, 80), event.tool ? String(event.tool).slice(0, 80) : null,
+        event.client ? String(event.client).slice(0, 120) : null, event.source ? String(event.source).slice(0, 80) : null,
+        event.query == null ? null : String(event.query).slice(0, 200), Number.isFinite(event.result_count) ? event.result_count : null,
+        Number.isFinite(event.top_score) ? event.top_score : null, Number.isFinite(event.latency_ms) ? Math.max(0, Math.round(event.latency_ms)) : null,
+        event.ok === undefined ? 1 : (event.ok ? 1 : 0), event.error ? String(event.error).split('\n')[0].slice(0, 250) : null);
+    const id = Number(result.lastInsertRowid);
+    const insertRetrieval = db.prepare('INSERT OR IGNORE INTO event_memory_retrievals (event_id, memory_id) SELECT ?, id FROM memories WHERE id = ?');
+    for (const memoryId of [...new Set(memoryIds.map(Number).filter(Number.isInteger))]) {
+      if (insertRetrieval.run(id, memoryId).changes) db.prepare(`INSERT INTO memory_retrieval_stats (memory_id, retrieval_count) VALUES (?, 1)
+        ON CONFLICT(memory_id) DO UPDATE SET retrieval_count = retrieval_count + 1`).run(memoryId);
+    }
+    if (event.kind === 'mcp_call' && event.client) {
+      const ts = db.prepare('SELECT ts FROM events WHERE id = ?').get(id)?.ts;
+      if (ts) db.prepare(`INSERT INTO mcp_client_stats (client, first_seen, last_seen, total_calls) VALUES (?, ?, ?, 1)
+        ON CONFLICT(client) DO UPDATE SET first_seen = min(first_seen, excluded.first_seen),
+          last_seen = max(last_seen, excluded.last_seen), total_calls = total_calls + 1`).run(String(event.client).slice(0, 120), ts, ts);
+    }
+    return id;
+  } catch { return null; }
+}
+
+function addMemory({ source, title, content }, { handAdded = false, event = null } = {}) {
   ensureWritable();
   const db = getDatabase();
   const add = db.transaction(() => {
@@ -653,6 +760,7 @@ function addMemory({ source, title, content }, { handAdded = false } = {}) {
     if (handAdded && embeddingProvider) handAddedMemoryIds.add(Number(result.memory.id));
     void enqueueEmbedding(result.memory.id).catch(() => {});
   }
+  if (event !== false) recordEvent(event || { kind: 'add', tool: 'add_memory', source, result_count: result.inserted ? 1 : 0 });
   return result.memory;
 }
 
@@ -691,6 +799,7 @@ function importMemories(items, importId) {
     return { inserted, skipped, insertedIds };
   });
   const result = importBatch(items);
+  recordEvent({ kind: 'import', tool: 'import_memories', source: id ? db.prepare('SELECT source FROM imports WHERE id = ?').get(id)?.source : null, result_count: result.inserted });
   if (cachesLoaded && result.insertedIds.length) {
     const get = db.prepare('SELECT id, source, title, content FROM memories WHERE id = ?');
     for (const id of result.insertedIds) memoryCache.set(id, get.get(id));
@@ -726,6 +835,7 @@ function undoImport(importId) {
   });
   const removed = undo();
   for (const memoryId of memoryIds) { vectorCache.delete(memoryId); memoryCache.delete(memoryId); }
+  if (removed) recordEvent({ kind: 'delete', tool: 'undo_import', result_count: memoryIds.length });
   return removed;
 }
 
@@ -790,17 +900,31 @@ async function semanticSearch(query, source, limit = 50) {
   return results.slice(0, safeLimit);
 }
 
-async function searchMemories(query, source, limit = 50, offset = 0) {
+async function searchMemories(query, source, limit = 50, offset = 0, event = null) {
+  const startedAt = Date.now();
   const safeLimit = Math.max(1, Math.min(50, Math.floor(Number(limit) || 50)));
   const safeOffset = Math.max(0, Math.floor(Number(offset) || 0));
   const terms = String(query || '').replace(/"/g, '').match(/[\p{L}\p{N}_]+/gu) || [];
   const poolSize = Math.min(500, Math.max(100, safeLimit + safeOffset));
-  const fts = searchFts(query, source, terms.length ? poolSize : safeLimit, terms.length ? 0 : safeOffset);
-  if (!terms.length || !embeddingReady || !embeddingProvider) return fts.slice(0, safeLimit);
+  let fts;
+  try { fts = searchFts(query, source, terms.length ? poolSize : safeLimit, terms.length ? 0 : safeOffset); }
+  catch (error) {
+    if (event) recordEvent({ ...event, source: source === 'all' ? null : source, query, result_count: 0, latency_ms: Date.now() - startedAt, ok: false, error: error?.name || 'Search failed' });
+    throw error;
+  }
+  if (!terms.length || !embeddingReady || !embeddingProvider) {
+    const results = fts.slice(0, safeLimit);
+    if (event) recordEvent({ ...event, source: source === 'all' ? null : source, query, result_count: results.length, top_score: results[0]?.score ?? null, latency_ms: Date.now() - startedAt }, results.map((row) => row.id));
+    return results;
+  }
 
   let semantic = [];
   try { semantic = await semanticSearch(query, source, poolSize); }
-  catch { return fts.slice(0, safeLimit).map((row, index) => ({ ...row, score: 1 / (60 + index + 1) })); }
+  catch (error) {
+    const results = fts.slice(0, safeLimit).map((row, index) => ({ ...row, score: 1 / (60 + index + 1) }));
+    if (event) recordEvent({ ...event, source: source === 'all' ? null : source, query, result_count: results.length, top_score: results[0]?.score ?? null, latency_ms: Date.now() - startedAt, ok: false, error: error?.name || 'Search failed' }, results.map((row) => row.id));
+    return results;
+  }
 
   const combined = new Map();
   fts.forEach((row, index) => combined.set(row.id, { ...row, score: 1 / (60 + index + 1) }));
@@ -809,10 +933,12 @@ async function searchMemories(query, source, limit = 50, offset = 0) {
     if (existing) existing.score += 1 / (60 + index + 1);
     else combined.set(row.id, { ...row, score: 1 / (60 + index + 1) });
   });
-  return [...combined.values()].sort((a, b) => b.score - a.score).slice(safeOffset, safeOffset + safeLimit);
+  const results = [...combined.values()].sort((a, b) => b.score - a.score).slice(safeOffset, safeOffset + safeLimit);
+  if (event) recordEvent({ ...event, source: source === 'all' ? null : source, query, result_count: results.length, top_score: results[0]?.score ?? null, latency_ms: Date.now() - startedAt }, results.map((row) => row.id));
+  return results;
 }
 
-function deleteMemory(id) {
+function deleteMemory(id, event = null) {
   ensureWritable();
   const db = getDatabase();
   cancelEmbeddingJobs([Number(id)]);
@@ -824,6 +950,7 @@ function deleteMemory(id) {
   const deleted = remove();
   vectorCache.delete(Number(id));
   memoryCache.delete(Number(id));
+  if (deleted) recordEvent(event || { kind: 'delete', tool: 'delete_memory', result_count: 1 });
   return deleted;
 }
 
@@ -861,6 +988,7 @@ function deleteConversationParts(memoryId) {
   });
   const deleted = remove();
   for (const id of ids) { vectorCache.delete(id); memoryCache.delete(id); }
+  if (deleted) recordEvent({ kind: 'delete', tool: 'delete_conversation_parts', result_count: deleted });
   return deleted;
 }
 
@@ -945,12 +1073,22 @@ function acceptSuggestion(id) {
       .run(suggestion.a_id, suggestion.b_id, suggestion.score, `similar meaning (${Number(suggestion.score).toFixed(2)})`);
     return true;
   });
-  return accept();
+  const accepted = accept();
+  if (accepted) {
+    getDatabase().prepare("INSERT INTO suggestion_decision_stats(status, total) VALUES ('accepted', 1) ON CONFLICT(status) DO UPDATE SET total = total + 1").run();
+    recordEvent({ kind: 'suggestion_accepted', tool: 'accept_suggestion', result_count: 1 });
+  }
+  return accepted;
 }
 
 function rejectSuggestion(id) {
   ensureWritable();
-  return getDatabase().prepare("UPDATE link_suggestions SET status = 'rejected' WHERE id = ? AND status = 'pending'").run(Number(id)).changes > 0;
+  const rejected = getDatabase().prepare("UPDATE link_suggestions SET status = 'rejected' WHERE id = ? AND status = 'pending'").run(Number(id)).changes > 0;
+  if (rejected) {
+    getDatabase().prepare("INSERT INTO suggestion_decision_stats(status, total) VALUES ('rejected', 1) ON CONFLICT(status) DO UPDATE SET total = total + 1").run();
+    recordEvent({ kind: 'suggestion_rejected', tool: 'reject_suggestion', result_count: 1 });
+  }
+  return rejected;
 }
 
 function dismissSuggestions() {
@@ -982,6 +1120,7 @@ async function cleanupLegacyJunk() {
   });
   const deleted = remove();
   for (const id of ids) { vectorCache.delete(id); memoryCache.delete(id); }
+  if (deleted) recordEvent({ kind: 'delete', tool: 'legacy_cleanup', result_count: deleted });
   legacyCleanupStatus.count = legacyJunkCount(db);
   return { deleted, backupPath: status.backupPath };
 }
@@ -996,4 +1135,4 @@ function countBySource() {
     }, {});
 }
 
-module.exports = { initializeDatabase, getDatabaseStatus, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
+module.exports = { initializeDatabase, getDatabaseStatus, getInsights, runAnalyticsSql, recordEvent, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };

@@ -27,6 +27,8 @@ contextBridge.exposeInMainWorld('brain', {
   getMcpConfig: () => ipcRenderer.invoke('mcp:config'),
   getEmbeddingStatus: () => ipcRenderer.invoke('embeddings:status'),
   getDatabaseStatus: () => ipcRenderer.invoke('database:status'),
+  getInsights: () => ipcRenderer.invoke('analytics:insights'),
+  runAnalyticsSql: (sql) => ipcRenderer.invoke('analytics:run-sql', sql),
   onEmbeddingStatus: (callback) => {
     const listener = (_event, status) => callback(status);
     ipcRenderer.on('brain:embedding-status', listener);

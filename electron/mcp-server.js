@@ -5,7 +5,7 @@ const { randomBytes, timingSafeEqual } = require('node:crypto');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { z } = require('zod/v4');
-const { addMemory, getMemory, searchMemories, countBySource } = require('./db');
+const { addMemory, getMemory, searchMemories, countBySource, recordEvent } = require('./db');
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -17,10 +17,27 @@ function notifyRenderer(channel, payload) {
   }
 }
 
-function createMcpServer() {
+function createMcpServer(clientName = null) {
   const server = new McpServer({ name: 'one-brain', version: '1.0.0' });
+  const registerTrackedTool = (name, definition, handler) => server.registerTool(name, definition, async (args) => {
+    const startedAt = Date.now();
+    const client = server.server.getClientVersion?.()?.name || clientName || null;
+    try {
+      const outcome = await handler(args);
+      recordEvent({ kind: 'mcp_call', tool: name, client, source: outcome.source || args.source || null,
+        query: name === 'search_memories' ? args.query : null, result_count: outcome.count ?? 0,
+        top_score: outcome.topScore ?? null, latency_ms: Date.now() - startedAt,
+        ok: !outcome.result?.isError, error: outcome.result?.isError ? 'Tool returned an error.' : null }, outcome.ids || []);
+      return outcome.result;
+    } catch (error) {
+      recordEvent({ kind: 'mcp_call', tool: name, client, source: args.source || null,
+        query: name === 'search_memories' ? args.query : null, result_count: 0, latency_ms: Date.now() - startedAt,
+        ok: false, error: error?.name || 'Tool failed.' });
+      throw error;
+    }
+  });
 
-  server.registerTool('search_memories', {
+  registerTrackedTool('search_memories', {
     description: 'Search One Brain memories by title and content.',
     inputSchema: {
       query: z.string().describe('Words to search for. Prefixes are matched.'),
@@ -30,20 +47,20 @@ function createMcpServer() {
   }, async ({ query, source, limit }) => {
     const memories = await searchMemories(query, source, limit || 50);
     notifyRenderer('brain:retrieved', memories.map((memory) => memory.id));
-    return { content: [{ type: 'text', text: JSON.stringify(memories) }] };
+    return { result: { content: [{ type: 'text', text: JSON.stringify(memories) }] }, count: memories.length, topScore: memories[0]?.score, source, ids: memories.map((memory) => memory.id) };
   });
 
-  server.registerTool('get_memory', {
+  registerTrackedTool('get_memory', {
     description: 'Get a memory with its full content and linked memory IDs.',
     inputSchema: { id: z.number().int().positive().describe('Memory ID.') }
   }, async ({ id }) => {
     const memory = getMemory(id);
-    if (!memory) return { isError: true, content: [{ type: 'text', text: `Memory ${id} was not found.` }] };
+    if (!memory) return { result: { isError: true, content: [{ type: 'text', text: `Memory ${id} was not found.` }] }, count: 0 };
     notifyRenderer('brain:retrieved', [memory.id, ...memory.linked_memory_ids]);
-    return { content: [{ type: 'text', text: JSON.stringify(memory) }] };
+    return { result: { content: [{ type: 'text', text: JSON.stringify(memory) }] }, count: 1, ids: [memory.id, ...memory.linked_memory_ids], source: memory.source };
   });
 
-  server.registerTool('add_memory', {
+  registerTrackedTool('add_memory', {
     description: 'Add a memory to One Brain. Matching titles are auto-linked.',
     inputSchema: {
       source: z.enum(SOURCES).describe('AI source that created the memory.'),
@@ -51,18 +68,18 @@ function createMcpServer() {
       content: z.string().min(1).describe('Memory content.')
     }
   }, async ({ source, title, content }) => {
-    const memory = addMemory({ source, title, content });
+    const memory = addMemory({ source, title, content }, { event: false });
     notifyRenderer('brain:changed', { type: 'add', id: memory.id });
-    return { content: [{ type: 'text', text: JSON.stringify(memory) }] };
+    return { result: { content: [{ type: 'text', text: JSON.stringify(memory) }] }, count: 1, source, ids: [memory.id] };
   });
 
-  server.registerTool('list_sources', {
+  registerTrackedTool('list_sources', {
     description: 'List the six AI memory sources with their memory counts.',
     inputSchema: {}
   }, async () => {
     const counts = countBySource();
     const sources = SOURCES.map((source) => ({ source, count: counts[source] || 0 }));
-    return { content: [{ type: 'text', text: JSON.stringify(sources) }] };
+    return { result: { content: [{ type: 'text', text: JSON.stringify(sources) }] }, count: sources.length };
   });
 
   return server;
@@ -135,7 +152,10 @@ async function handleRequest(request, response, token) {
     }
 
     const body = await readBody(request);
-    const mcpServer = createMcpServer();
+    const initializeRequest = (Array.isArray(body) ? body : [body]).find((item) => item?.method === 'initialize');
+    const clientName = initializeRequest?.params?.clientInfo?.name || null;
+    if (clientName) handleRequest.lastClientName = String(clientName).slice(0, 120);
+    const mcpServer = createMcpServer(clientName || handleRequest.lastClientName || null);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true
@@ -204,4 +224,4 @@ async function startMcpServer(userDataPath, appPath) {
   };
 }
 
-module.exports = { startMcpServer };
+module.exports = { createMcpServer, startMcpServer };
