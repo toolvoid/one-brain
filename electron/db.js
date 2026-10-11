@@ -6,6 +6,7 @@ const os = require('os');
 const { createHash, randomBytes, timingSafeEqual } = require('crypto');
 const { Worker } = require('node:worker_threads');
 const { INSIGHT_QUERIES } = require('./analytics-queries');
+const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
 const { JOIN_ALL_MIN } = require('../src/lib/link-constants.json');
 const MEMORY_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 
@@ -185,8 +186,8 @@ function getChatGrant(provider) {
 function saveChatGrant(provider, readSources, writeSource = '') {
   ensureWritable();
   const client = `chat:${String(provider || '')}`;
-  const mappedSource = ({ openai: 'chatgpt', gemini: 'gemini', groq: 'groq', deepseek: 'deepseek', claude: 'claude' })[provider];
-  const selectedWriteSource = mappedSource || (MEMORY_SOURCES.includes(writeSource) ? writeSource : 'chatgpt');
+  const mappedSource = PROVIDER_SOURCES[provider];
+  const selectedWriteSource = mappedSource || (MEMORY_SOURCES.includes(writeSource) ? writeSource : null);
   const allowed = new Set((Array.isArray(readSources) ? readSources : []).filter((source) => MEMORY_SOURCES.includes(source)));
   const db = getDatabase();
   const save = db.transaction(() => {
@@ -221,6 +222,10 @@ function updateChat(id, patch = {}) {
   if (patch.provider !== undefined) getDatabase().prepare('UPDATE chats SET provider = ? WHERE id = ?').run(String(patch.provider), Number(id));
   if (patch.use_memory !== undefined) getDatabase().prepare('UPDATE chats SET use_memory = ? WHERE id = ?').run(patch.use_memory ? 1 : 0, Number(id));
   if (patch.suggest_memories !== undefined) getDatabase().prepare('UPDATE chats SET suggest_memories = ? WHERE id = ?').run(patch.suggest_memories ? 1 : 0, Number(id));
+  if (patch.memory_source !== undefined) {
+    if (patch.memory_source !== null && !MEMORY_SOURCES.includes(patch.memory_source)) throw new Error('Choose a valid memory source.');
+    getDatabase().prepare('UPDATE chats SET memory_source = ? WHERE id = ?').run(patch.memory_source, Number(id));
+  }
   return true;
 }
 
@@ -264,10 +269,10 @@ function recordMemoryViews(memoryIds = []) {
 }
 
 function getPendingMemories() {
-  return getDatabase().prepare('SELECT id, title, text AS content, client, created_at FROM pending_memories ORDER BY id DESC').all();
+  return getDatabase().prepare('SELECT id, title, text AS content, client, source, chat_id, created_at FROM pending_memories ORDER BY id DESC').all();
 }
 
-async function addPendingMemory({ title, content, client }) {
+async function addPendingMemory({ title, content, client, source = null, chatId = null }) {
   ensureWritable();
   const text = String(content || '').trim();
   if (!text) return { added: false, reason: 'empty' };
@@ -278,18 +283,39 @@ async function addPendingMemory({ title, content, client }) {
     } catch {}
   }
   const safeTitle = String(title || '').trim().slice(0, 160) || text.slice(0, 80);
-  const result = getDatabase().prepare('INSERT INTO pending_memories(title, text, client) VALUES (?, ?, ?)')
-    .run(safeTitle, text.slice(0, 4000), String(client || '').slice(0, 120));
+  const clientName = String(client || '');
+  const providerSource = clientName.startsWith('chat:') ? PROVIDER_SOURCES[clientName.slice(5)] : null;
+  const resolvedSource = MEMORY_SOURCES.includes(source) ? source : (providerSource || null);
+  const result = getDatabase().prepare('INSERT INTO pending_memories(title, text, client, source, chat_id) VALUES (?, ?, ?, ?, ?)')
+    .run(safeTitle, text.slice(0, 4000), clientName.slice(0, 120), resolvedSource, chatId != null && Number.isInteger(Number(chatId)) ? Number(chatId) : null);
   return { added: true, id: Number(result.lastInsertRowid) };
+}
+
+function setPendingMemorySource(id, source) {
+  ensureWritable();
+  if (!MEMORY_SOURCES.includes(source)) throw new Error('Choose a valid memory source.');
+  const db = getDatabase();
+  const save = db.transaction(() => {
+    const item = db.prepare('SELECT chat_id FROM pending_memories WHERE id = ?').get(Number(id));
+    if (!item) throw new Error('Pending memory not found.');
+    db.prepare('UPDATE pending_memories SET source = ? WHERE id = ?').run(source, Number(id));
+    if (item.chat_id != null) {
+      db.prepare('UPDATE pending_memories SET source = ? WHERE chat_id = ?').run(source, item.chat_id);
+      db.prepare('UPDATE chats SET memory_source = ? WHERE id = ?').run(source, item.chat_id);
+    }
+  });
+  save();
+  return true;
 }
 
 function approvePendingMemory(id, title, content) {
   ensureWritable();
-  const item = getDatabase().prepare('SELECT id, title, text AS content, client FROM pending_memories WHERE id = ?').get(Number(id));
+  const item = getDatabase().prepare('SELECT id, title, text AS content, client, source FROM pending_memories WHERE id = ?').get(Number(id));
   if (!item) throw new Error('Pending memory not found.');
   const profile = getProxyClientProfile(item.client);
-  if (!profile?.write_source || profile.status !== 'approved') throw new Error('This client has no approved write source.');
-  const memory = addMemory({ source: profile.write_source, title: String(title || item.title).slice(0, 160), content: String(content || item.content).slice(0, 4000) }, { event: false });
+  const source = item.source || (String(item.client).startsWith('chat:') ? null : profile?.write_source);
+  if (!source || (!String(item.client).startsWith('chat:') && profile?.status !== 'approved')) throw new Error('Choose an approved memory source before saving this candidate.');
+  const memory = addMemory({ source, title: String(title || item.title).slice(0, 160), content: String(content || item.content).slice(0, 4000) }, { event: false });
   getDatabase().prepare('DELETE FROM pending_memories WHERE id = ?').run(item.id);
   return memory.id;
 }
@@ -763,6 +789,8 @@ function getDatabase() {
         title TEXT NOT NULL,
         text TEXT NOT NULL,
         client TEXT NOT NULL,
+        source TEXT,
+        chat_id INTEGER,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE INDEX IF NOT EXISTS events_ts_idx ON events(ts);
@@ -812,7 +840,8 @@ function getDatabase() {
         title TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         use_memory INTEGER NOT NULL DEFAULT 1,
-        suggest_memories INTEGER NOT NULL DEFAULT 0
+        suggest_memories INTEGER NOT NULL DEFAULT 0,
+        memory_source TEXT
       );
       CREATE TABLE IF NOT EXISTS chat_messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -840,6 +869,13 @@ function getDatabase() {
       fn();
       database.prepare('INSERT INTO schema_migrations(id) VALUES (?)').run(id);
     })();
+    migrate('chat-save-source-v1', () => {
+      const chatColumns = new Set(database.prepare('PRAGMA table_info(chats)').all().map((column) => column.name));
+      if (!chatColumns.has('memory_source')) database.exec('ALTER TABLE chats ADD COLUMN memory_source TEXT');
+      const pendingColumns = new Set(database.prepare('PRAGMA table_info(pending_memories)').all().map((column) => column.name));
+      if (!pendingColumns.has('source')) database.exec('ALTER TABLE pending_memories ADD COLUMN source TEXT');
+      if (!pendingColumns.has('chat_id')) database.exec('ALTER TABLE pending_memories ADD COLUMN chat_id INTEGER');
+    });
     migrate('event-profile-columns-v1', () => {
       const eventColumns = new Set(database.prepare('PRAGMA table_info(events)').all().map((column) => column.name));
       if (!eventColumns.has('verified')) database.exec('ALTER TABLE events ADD COLUMN verified INTEGER');
@@ -1246,6 +1282,25 @@ function setMemoryPrivate(memoryId, isPrivate) {
   const memory = db.prepare('SELECT id, source, title, content, private FROM memories WHERE id = ?').get(id);
   memoryCache.set(id, memory);
   recordEvent({ kind: 'privacy_change', tool: 'memory_privacy', source: memory.source, result_count: 1, ok: 1, error: memory.private ? 'private' : 'public' });
+  return true;
+}
+
+function setMemorySource(memoryId, source) {
+  ensureWritable();
+  if (!MEMORY_SOURCES.includes(source)) throw new Error('Choose a valid memory source.');
+  const db = getDatabase();
+  const id = Number(memoryId);
+  const move = db.transaction(() => {
+    const memory = db.prepare('SELECT id, source FROM memories WHERE id = ?').get(id);
+    if (!memory) throw new Error('Memory not found.');
+    if (memory.source === source) return false;
+    db.prepare('UPDATE memories SET source = ? WHERE id = ?').run(source, id);
+    return true;
+  });
+  if (!move()) return false;
+  const memory = db.prepare('SELECT id, source, title, content, private FROM memories WHERE id = ?').get(id);
+  memoryCache.set(id, memory);
+  recordEvent({ kind: 'source_change', tool: 'memory_source', source, result_count: 1, ok: 1 });
   return true;
 }
 
@@ -1702,4 +1757,4 @@ function countBySource() {
     }, {});
 }
 
-module.exports = { initializeDatabase, closeDatabaseForTest, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, recordProxyEvent, getPendingMemories, addPendingMemory, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, JOIN_ALL_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
+module.exports = { initializeDatabase, closeDatabaseForTest, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemorySource, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, JOIN_ALL_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };

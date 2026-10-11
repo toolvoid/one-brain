@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
+const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
 
 const PROVIDERS = ['openai', 'groq', 'deepseek', 'gemini', 'openrouter', 'claude'];
 const PROVIDER_URLS = {
@@ -112,7 +113,7 @@ function candidateSafe(item) {
 function createMemoryProxy(options) {
   const { userDataPath, safeStorage, authenticateClientToken, getClientProfile, searchMemoriesForClient,
     getMemoryForClient, recordProxyEvent, addPendingMemory, fetchImpl = globalThis.fetch,
-    providerUrls = PROVIDER_URLS, searchTimeoutMs = 800, listenPort = null } = options;
+    providerUrls = PROVIDER_URLS, searchTimeoutMs = 800, titleTimeoutMs = 3000, listenPort = null } = options;
   const settingsPath = path.join(userDataPath, 'memory-proxy-settings.json');
   const keysPath = path.join(userDataPath, 'provider-keys.enc');
   const readSettings = () => ({ ...DEFAULT_SETTINGS, ...safeReadJson(settingsPath, {}) });
@@ -181,7 +182,43 @@ function createMemoryProxy(options) {
     return selections;
   }
 
-  async function saveBack(provider, key, client, messages, answer, model) {
+  async function generateMemoryTitle(provider, model, text) {
+    const { heuristicMemoryTitle, fallbackMemoryTitle } = await import('../src/lib/chat-models.mjs');
+    const heuristic = heuristicMemoryTitle(text);
+    if (heuristic) return heuristic;
+    const fallback = fallbackMemoryTitle(text);
+    const key = savedKey(provider);
+    if (!key || !model || !PROVIDERS.includes(provider)) return fallback;
+    const controller = new AbortController();
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => { controller.abort(); reject(new Error('title_timeout')); }, titleTimeoutMs);
+    });
+    const request = (async () => {
+      const messages = [
+        { role: 'system', content: 'Reply with only a title of at most 8 words in the same language as the text. Do not add quotes or explanation.' },
+        { role: 'user', content: String(text || '').slice(0, 8000) }
+      ];
+      const response = await fetchImpl(provider === 'claude' ? `${providerUrls[provider]}/messages` : `${providerUrls[provider]}/chat/completions`, {
+        method: 'POST', signal: controller.signal, headers: providerHeaders(provider, key, true),
+        body: JSON.stringify(provider === 'claude'
+          ? { model, max_tokens: 20, ...claudeMessages(messages), stream: false }
+          : { model, messages, max_tokens: 20, stream: false })
+      });
+      if (!response.ok) return fallback;
+      const data = await response.json();
+      const raw = provider === 'claude'
+        ? (data.content || []).filter((item) => item?.type === 'text').map((item) => item.text).join(' ')
+        : data.choices?.[0]?.message?.content;
+      const title = String(raw || '').replaceAll(key, '').replace(/^\s*["'`]+|["'`]+\s*$/g, '').replace(/\s+/g, ' ').trim().split(' ').slice(0, 8).join(' ');
+      return title || fallback;
+    })();
+    try { return await Promise.race([request, timeout]); }
+    catch { return fallback; }
+    finally { clearTimeout(timer); }
+  }
+
+  async function saveBack(provider, key, client, messages, answer, model, { titleModel = model, source = PROVIDER_SOURCES[provider] || null, chatId = null } = {}) {
     if (!answer || !client || !model) return;
     const system = 'Extract only durable facts explicitly stated by the user: decisions, setup, fixes, and preferences. Never include secrets, API keys, tokens, logs, UI tweaks, personality descriptions, guesses, or inferred personal details. Return only a JSON array of objects with short title and content. Return [] if nothing qualifies.';
     const conversation = messages.filter((item) => item?.role === 'user' || item?.role === 'assistant')
@@ -202,7 +239,10 @@ function createMemoryProxy(options) {
         : data.choices?.[0]?.message?.content;
       const decoded = JSON.parse(String(raw || '[]').replace(/^```(?:json)?\s*|\s*```$/g, ''));
       if (!Array.isArray(decoded)) return;
-      for (const item of decoded.slice(0, 5)) if (candidateSafe(item)) await addPendingMemory({ title: item.title, content: item.content, client });
+      for (const item of decoded.slice(0, 5)) if (candidateSafe(item)) {
+        const title = await generateMemoryTitle(provider, titleModel, item.content);
+        await addPendingMemory({ title, content: item.content, client, source, chatId });
+      }
     } catch {}
   }
 
@@ -264,11 +304,11 @@ function createMemoryProxy(options) {
           if (!res.write(Buffer.from(value))) await new Promise((resolve) => res.once('drain', resolve));
         }
         res.end();
-        if (saveBackOn && upstream.ok && savedSize <= 1024 * 1024) void saveBack(provider, key, identity.client, body.messages, parseSseContent(Buffer.concat(saved).toString('utf8')), cfg.saveBackModel);
+        if (saveBackOn && upstream.ok && savedSize <= 1024 * 1024) void saveBack(provider, key, identity.client, body.messages, parseSseContent(Buffer.concat(saved).toString('utf8')), cfg.saveBackModel, { titleModel: body.model, source: PROVIDER_SOURCES[provider] || null });
       } else {
         const output = Buffer.from(await upstream.arrayBuffer()); res.end(output);
         if (saveBackOn && upstream.ok) {
-          try { const data = JSON.parse(output.toString('utf8')); const answer = data.choices?.[0]?.message?.content; if (typeof answer === 'string') void saveBack(provider, key, identity.client, body.messages, answer, cfg.saveBackModel); } catch {}
+          try { const data = JSON.parse(output.toString('utf8')); const answer = data.choices?.[0]?.message?.content; if (typeof answer === 'string') void saveBack(provider, key, identity.client, body.messages, answer, cfg.saveBackModel, { titleModel: body.model, source: PROVIDER_SOURCES[provider] || null }); } catch {}
         }
       }
     } catch { errorCode = 'upstream_unreachable'; if (!res.headersSent) sendJson(res, 502, { error: 'Provider request failed.' }); else res.destroy(); }
@@ -301,7 +341,7 @@ function createMemoryProxy(options) {
     return { ...entry, cached: false };
   }
 
-  async function chatCompletion({ provider, model, messages, useMemory = true, profile, signal, onChunk, suggestMemories = false }) {
+  async function chatCompletion({ provider, model, messages, useMemory = true, profile, signal, onChunk, suggestMemories = false, chatId = null, saveBackSource = null }) {
     const started = Date.now();
     const key = savedKey(provider);
     if (!key) throw new Error(`No ${provider} provider key is saved.`);
@@ -361,7 +401,9 @@ function createMemoryProxy(options) {
       answer += tail;
       if (tail) onChunk?.(tail);
       ok = true;
-      if (suggestMemories && answer) void saveBack(provider, key, `chat:${provider}`, messages, answer, model);
+      if (suggestMemories && answer) void saveBack(provider, key, `chat:${provider}`, messages, answer, model, {
+        titleModel: model, source: saveBackSource || PROVIDER_SOURCES[provider] || null, chatId
+      });
       return { answer, memoryIds: selected.map((memory) => memory.id), memories: selected.map(({ id, title }) => ({ id, title })), status };
     } catch (cause) {
       error = cause?.name === 'AbortError' ? 'Stopped.' : cleanProviderError(cause?.message || 'Provider request failed.', key);
@@ -394,7 +436,7 @@ function createMemoryProxy(options) {
     return { server, port, endpoint: `http://127.0.0.1:${port}` };
   }
 
-  return { start, publicSettings, saveKey, deleteKey, updateSettings, handle, listModels, chatCompletion };
+  return { start, publicSettings, saveKey, deleteKey, updateSettings, handle, listModels, generateMemoryTitle, chatCompletion };
 }
 
 module.exports = { PROVIDERS, PROVIDER_URLS, MEMORY_HEADER, requestQuery, appendMemoryMessage, createMemoryProxy };

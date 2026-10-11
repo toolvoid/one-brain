@@ -1,0 +1,7 @@
+{
+  "openai": "chatgpt",
+  "gemini": "gemini",
+  "groq": "groq",
+  "deepseek": "deepseek",
+  "claude": "claude"
+}

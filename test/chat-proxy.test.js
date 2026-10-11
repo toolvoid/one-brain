@@ -11,7 +11,7 @@ const { createMemoryProxy } = require('../electron/memory-proxy');
 const localKey = 'synthetic-local-mock-key';
 const allowedMessageKeys = new Set(['role', 'content', 'name', 'tool_calls', 'tool_call_id']);
 
-async function withMock(run, { failModels = false, echoKey = false } = {}) {
+async function withMock(run, { failModels = false, echoKey = false, titleFailure = false, neverTitle = false, titleTimeoutMs = 3000 } = {}) {
   let calls = [];
   const pendingCandidates = [];
   const server = http.createServer((req, res) => {
@@ -45,8 +45,12 @@ async function withMock(run, { failModels = false, echoKey = false } = {}) {
         assert.notEqual(key, 'tokens');
         assert.notEqual(key, 'memoryCount');
       }
-      for (const key of Object.keys(body)) assert.ok((req.url === '/v1/messages' ? ['model', 'messages', 'stream', 'system', 'max_tokens'] : ['model', 'messages', 'stream']).includes(key), `unknown top-level key ${key}`);
+      for (const key of Object.keys(body)) assert.ok((req.url === '/v1/messages' ? ['model', 'messages', 'stream', 'system', 'max_tokens'] : ['model', 'messages', 'stream', 'max_tokens']).includes(key), `unknown top-level key ${key}`);
       if (body.stream === false) {
+        const isTitle = body.messages?.[0]?.content?.includes('title of at most 8 words');
+        if (isTitle && neverTitle) return;
+        if (isTitle && titleFailure) { res.writeHead(503); res.end(); return; }
+        if (isTitle) { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ choices: [{ message: { content: 'Generated synthetic title' } }] })); return; }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify([{ title: 'Gemini setup', content: 'Synthetic durable fact from Gemini.' }]) } }] }));
         return;
@@ -70,9 +74,9 @@ async function withMock(run, { failModels = false, echoKey = false } = {}) {
     userDataPath: root,
     safeStorage: { isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'test', encryptString: (text) => Buffer.from(text), decryptString: (buffer) => buffer.toString() },
     providerUrls: { openai: `http://127.0.0.1:${server.address().port}/v1`, gemini: `http://127.0.0.1:${server.address().port}/v1`, claude: `http://127.0.0.1:${server.address().port}/v1` },
-    listenPort: 0,
+    listenPort: 0, titleTimeoutMs,
     fetchImpl: globalThis.fetch,
-    getClientProfile: () => ({ client: 'chat:openai', status: 'approved', allowedSources: ['codex'] }),
+    getClientProfile: () => ({ client: 'chat:openai', status: 'approved', allowedSources: ['codex'], write_source: 'claude' }),
     searchMemoriesForClient: async () => ({ memories: [{ id: 1, score: 1 }, { id: 2, score: 0.9 }, { id: 3, score: 0.8 }] }),
     getMemoryForClient: (id, profile) => {
       const rows = {
@@ -182,6 +186,22 @@ test('Gemini save-back uses its active model and queues a review candidate', asy
     for (let i = 0; i < 20 && pendingCandidates.length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(pendingCandidates.length, 1);
     assert.equal(pendingCandidates[0].client, 'chat:gemini');
-    assert.equal(pendingCandidates[0].title, 'Gemini setup');
+    assert.equal(pendingCandidates[0].source, 'gemini');
+    assert.equal(pendingCandidates[0].title, 'Synthetic durable fact from Gemini.');
   });
+});
+
+
+test('memory title uses the 40-character fallback when the title call fails or times out', async () => {
+  const longText = 'This synthetic text has no short sentence and continues beyond sixty characters without punctuation';
+  const expected = longText.slice(0, 40);
+  await withMock(async ({ proxy, calls }) => {
+    assert.equal(await proxy.generateMemoryTitle('gemini', 'gemini-chat-model', longText), expected);
+    const titleCall = calls.find((call) => call.method === 'POST' && call.body.messages?.[0]?.content?.includes('title of at most 8 words'));
+    assert.equal(titleCall.body.model, 'gemini-chat-model');
+    assert.equal(titleCall.body.max_tokens, 20);
+  }, { titleFailure: true });
+  await withMock(async ({ proxy }) => {
+    assert.equal(await proxy.generateMemoryTitle('gemini', 'gemini-chat-model', longText), expected);
+  }, { neverTitle: true, titleTimeoutMs: 20 });
 });

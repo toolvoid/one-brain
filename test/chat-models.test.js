@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 test('default model filter hides non-chat families and source mapping is provider-specific', async () => {
-  const { isChatModel, memorySourceForProvider } = await import('../src/lib/chat-models.mjs');
+  const { isChatModel, memorySourceForProvider, heuristicMemoryTitle, fallbackMemoryTitle } = await import('../src/lib/chat-models.mjs');
   const models = ['chat-mini', 'embedding-3', 'tts-1', 'whisper-large', 'audio-live', 'image-gen',
     'moderation-latest', 'rerank-v2', 'imagen-3', 'veo-preview', 'gemini-vision-preview'];
   assert.deepEqual(models.filter(isChatModel), ['chat-mini']);
@@ -14,6 +14,11 @@ test('default model filter hides non-chat families and source mapping is provide
   assert.equal(memorySourceForProvider('deepseek'), 'deepseek');
   assert.equal(memorySourceForProvider('claude'), 'claude');
   assert.equal(memorySourceForProvider('openrouter'), '');
+  assert.equal(heuristicMemoryTitle('# Synthetic heading\nMore text.'), 'Synthetic heading');
+  assert.equal(heuristicMemoryTitle('Short synthetic first sentence. More text follows.'), 'Short synthetic first sentence.');
+  const longText = 'This synthetic text has no short sentence and continues beyond sixty characters without punctuation';
+  assert.equal(heuristicMemoryTitle(longText), '');
+  assert.equal(fallbackMemoryTitle(longText), longText.slice(0, 40));
 });
 
 test('semantic link switch filters semantic edges while the general link switch can still show other links', async () => {

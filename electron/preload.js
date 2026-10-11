@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld('brain', {
   dismissSuggestions: () => ipcRenderer.invoke('suggestions:dismiss-all'),
   deleteMemory: (id) => ipcRenderer.invoke('memories:delete', id),
   setMemoryPrivate: (id, isPrivate) => ipcRenderer.invoke('memories:set-private', id, isPrivate),
+  moveMemoryToSource: (id, source) => ipcRenderer.invoke('memories:move-source', id, source),
   countConversationParts: (id) => ipcRenderer.invoke('memories:conversation-parts:count', id),
   deleteConversationParts: (id) => ipcRenderer.invoke('memories:conversation-parts:delete', id),
   listMemories: () => ipcRenderer.invoke('memories:list'),
@@ -59,6 +60,7 @@ contextBridge.exposeInMainWorld('brain', {
   saveProviderKey: (provider, key) => ipcRenderer.invoke('memory-proxy:save-key', provider, key),
   deleteProviderKey: (provider) => ipcRenderer.invoke('memory-proxy:delete-key', provider),
   listChatModels: (provider, refresh = false) => ipcRenderer.invoke('chat:models', provider, refresh),
+  generateMemoryTitle: (provider, model, text) => ipcRenderer.invoke('chat:generate-title', provider, model, text),
   getChatGrant: (provider) => ipcRenderer.invoke('chat:grant', provider),
   saveChatGrant: (provider, sources, writeSource) => ipcRenderer.invoke('chat:grant-save', provider, sources, writeSource),
   listChats: () => ipcRenderer.invoke('chat:list'),
@@ -75,6 +77,7 @@ contextBridge.exposeInMainWorld('brain', {
   },
   listPendingMemories: () => ipcRenderer.invoke('pending-memories:list'),
   approvePendingMemory: (id, title, content) => ipcRenderer.invoke('pending-memories:approve', id, title, content),
+  setPendingMemorySource: (id, source) => ipcRenderer.invoke('pending-memories:set-source', id, source),
   rejectPendingMemory: (id) => ipcRenderer.invoke('pending-memories:reject', id),
   onEmbeddingStatus: (callback) => {
     const listener = (_event, status) => callback(status);
