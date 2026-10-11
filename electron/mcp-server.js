@@ -5,7 +5,7 @@ const { randomBytes, randomUUID, timingSafeEqual } = require('node:crypto');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { z } = require('zod/v4');
-const { addMemory, getMcpClientProfile, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, recordEvent } = require('./db');
+const { addMemory, getMcpClientProfile, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, recordEvent, authenticateClientToken } = require('./db');
 const { INSTRUCTIONS } = require('./connectors');
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
@@ -19,27 +19,28 @@ function notifyRenderer(channel, payload) {
   }
 }
 
-function createMcpServer(clientName = null) {
+function createMcpServer(identity) {
   const server = new McpServer({ name: 'one-brain', version: '1.0.0', instructions: INSTRUCTIONS });
   const registerTrackedTool = (name, definition, handler) => server.registerTool(name, definition, async (args) => {
     const startedAt = Date.now();
-    const client = server.server.getClientVersion?.()?.name || clientName || null;
+    const client = identity.eventClient;
+    const eventIdentity = { verified: identity.verified, reported_name: identity.reportedName };
     try {
-      const profile = getMcpClientProfile(client);
-      if (profile.created) notifyRenderer('brain:client-pending', { client: profile.client });
+      const profile = getMcpClientProfile(identity.profileClient, { ...eventIdentity, eventClient: client });
+      if (profile.created) notifyRenderer('brain:client-pending', { client: profile.client, verified: identity.verified, reported_name: identity.reportedName });
       let outcome;
       if (profile.status === 'blocked') outcome = { denied: true, result: { isError: true, content: [{ type: 'text', text: 'This client is blocked in the One Brain app.' }] }, count: 0 };
       else if (profile.status !== 'approved') outcome = { denied: true, result: { isError: true, content: [{ type: 'text', text: 'Waiting for approval in the One Brain app' }] }, count: 0 };
       else outcome = await handler(args, profile);
-      if (outcome.denied) recordEvent({ kind: 'permission_denied', tool: name, client: profile.client, source: outcome.source || args.source || null,
+      if (outcome.denied) recordEvent({ kind: 'permission_denied', tool: name, client, ...eventIdentity, source: outcome.source || args.source || null,
         query: name === 'search_memories' ? args.query : null, ok: 0, error: outcome.reason || 'permission_denied' });
-      recordEvent({ kind: 'mcp_call', tool: name, client, source: outcome.source || args.source || null,
+      recordEvent({ kind: 'mcp_call', tool: name, client, ...eventIdentity, source: outcome.source || args.source || null,
         query: name === 'search_memories' ? args.query : null, result_count: outcome.count ?? 0,
         top_score: outcome.topScore ?? null, latency_ms: Date.now() - startedAt,
         ok: !outcome.result?.isError, error: outcome.result?.isError ? 'Tool returned an error.' : null }, outcome.ids || []);
       return outcome.result;
     } catch (error) {
-      recordEvent({ kind: 'mcp_call', tool: name, client, source: args.source || null,
+      recordEvent({ kind: 'mcp_call', tool: name, client, ...eventIdentity, source: args.source || null,
         query: name === 'search_memories' ? args.query : null, result_count: 0, latency_ms: Date.now() - startedAt,
         ok: false, error: error?.name || 'Tool failed.' });
       throw error;
@@ -139,6 +140,31 @@ function hasValidToken(request, token) {
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 
+function readBearer(request) {
+  const match = /^Bearer ([a-f\d]{64})$/i.exec(request.headers.authorization || '');
+  return match ? match[1] : null;
+}
+
+function authenticateRequest(request, legacyToken) {
+  const supplied = readBearer(request);
+  if (!supplied) return null;
+  const client = authenticateClientToken(supplied);
+  if (client) return { kind: 'client', client: client.client };
+  if (hasValidToken(request, legacyToken)) return { kind: 'legacy' };
+  return null;
+}
+
+function safeReportedName(name, bearer = '') {
+  let reported = String(name || '').trim().slice(0, 120) || 'Unknown MCP client';
+  reported = reported.replace(/Bearer\s+[a-f\d]{64}/gi, '[redacted token]').replace(/[a-f\d]{64}/gi, '[redacted token]');
+  if (bearer) reported = reported.split(bearer).join('[redacted token]');
+  return reported.slice(0, 120);
+}
+
+function sameSessionIdentity(auth, session) {
+  return auth.kind === session.identity.kind && (auth.kind === 'legacy' || auth.client === session.identity.client);
+}
+
 async function handleRequest(request, response, token) {
   if (!isLocalHost(request.headers.host)) {
     sendJson(response, 403, { error: 'Host must be localhost.' });
@@ -148,7 +174,8 @@ async function handleRequest(request, response, token) {
     sendJson(response, 403, { error: 'Origin headers are not accepted.' });
     return;
   }
-  if (!hasValidToken(request, token)) {
+  const auth = authenticateRequest(request, token);
+  if (!auth) {
     sendJson(response, 401, { error: 'A valid bearer token is required.' });
     return;
   }
@@ -164,6 +191,7 @@ async function handleRequest(request, response, token) {
     if (request.method === 'DELETE') {
       const session = mcpSessions.get(sessionId);
       if (!session) { sendJson(response, 404, { error: 'MCP session not found.' }); return; }
+      if (!sameSessionIdentity(auth, session)) { sendJson(response, 401, { error: 'Session identity mismatch.' }); return; }
       await session.transport.handleRequest(request, response);
       return;
     }
@@ -176,13 +204,16 @@ async function handleRequest(request, response, token) {
     const body = await readBody(request);
     const initializeRequest = (Array.isArray(body) ? body : [body]).find((item) => item?.method === 'initialize');
     if (initializeRequest) {
-      const clientName = String(initializeRequest.params?.clientInfo?.name || '').trim().slice(0, 120) || 'Unknown MCP client';
-      const profile = getMcpClientProfile(clientName);
-      if (profile.created) notifyRenderer('brain:client-pending', { client: profile.client });
-      const mcpServer = createMcpServer(clientName);
+      const reportedName = safeReportedName(initializeRequest.params?.clientInfo?.name, readBearer(request) || '');
+      const identity = auth.kind === 'client'
+        ? { kind: 'client', client: auth.client, profileClient: auth.client, eventClient: auth.client, verified: true, reportedName }
+        : { kind: 'legacy', profileClient: reportedName, eventClient: 'legacy-unverified', verified: false, reportedName };
+      const profile = getMcpClientProfile(identity.profileClient, { verified: identity.verified, reported_name: identity.reportedName, eventClient: identity.eventClient });
+      if (profile.created) notifyRenderer('brain:client-pending', { client: profile.client, verified: identity.verified, reported_name: identity.reportedName });
+      const mcpServer = createMcpServer(identity);
       let transport;
       transport = new StreamableHTTPServerTransport({ sessionIdGenerator: randomUUID, enableJsonResponse: true,
-        onsessioninitialized: (id) => mcpSessions.set(id, { transport, mcpServer, clientName }) });
+        onsessioninitialized: (id) => mcpSessions.set(id, { transport, mcpServer, identity }) });
       transport.onclose = () => {
         if (transport.sessionId) mcpSessions.delete(transport.sessionId);
         void mcpServer.close().catch(() => {});
@@ -194,6 +225,7 @@ async function handleRequest(request, response, token) {
 
     const session = mcpSessions.get(sessionId);
     if (!session) { sendJson(response, 404, { error: 'Initialize an MCP session before calling tools.' }); return; }
+    if (!sameSessionIdentity(auth, session)) { sendJson(response, 401, { error: 'Session identity mismatch.' }); return; }
     await session.transport.handleRequest(request, response, body);
   } catch (error) {
     if (!response.headersSent) sendJson(response, 500, { jsonrpc: '2.0', error: { code: -32603, message: error.message }, id: null });

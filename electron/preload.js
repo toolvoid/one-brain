@@ -32,6 +32,8 @@ contextBridge.exposeInMainWorld('brain', {
   previewDisconnectConnector: (client) => ipcRenderer.invoke('connectors:disconnect-preview', client),
   disconnectConnector: (client) => ipcRenderer.invoke('connectors:disconnect', client),
   getConnectorSnippet: (client) => ipcRenderer.invoke('connectors:snippet', client),
+  rotateConnectorToken: (client) => ipcRenderer.invoke('connectors:rotate-token', client),
+  revokeConnectorToken: (client) => ipcRenderer.invoke('connectors:revoke-token', client),
   getEmbeddingStatus: () => ipcRenderer.invoke('embeddings:status'),
   getDatabaseStatus: () => ipcRenderer.invoke('database:status'),
   listClients: () => ipcRenderer.invoke('clients:list'),
@@ -49,6 +51,13 @@ contextBridge.exposeInMainWorld('brain', {
   updateEvaluationNote: (id, note) => ipcRenderer.invoke('evaluation:update-note', id, note),
   runRetrievalEvaluation: () => ipcRenderer.invoke('evaluation:run'),
   getEvaluationRunResults: (runId) => ipcRenderer.invoke('evaluation:run-results', runId),
+  getMemoryProxySettings: () => ipcRenderer.invoke('memory-proxy:settings'),
+  updateMemoryProxySettings: (values) => ipcRenderer.invoke('memory-proxy:update-settings', values),
+  saveProviderKey: (provider, key) => ipcRenderer.invoke('memory-proxy:save-key', provider, key),
+  deleteProviderKey: (provider) => ipcRenderer.invoke('memory-proxy:delete-key', provider),
+  listPendingMemories: () => ipcRenderer.invoke('pending-memories:list'),
+  approvePendingMemory: (id, title, content) => ipcRenderer.invoke('pending-memories:approve', id, title, content),
+  rejectPendingMemory: (id) => ipcRenderer.invoke('pending-memories:reject', id),
   onEmbeddingStatus: (callback) => {
     const listener = (_event, status) => callback(status);
     ipcRenderer.on('brain:embedding-status', listener);
@@ -68,5 +77,10 @@ contextBridge.exposeInMainWorld('brain', {
     const listener = (_event, profile) => callback(profile);
     ipcRenderer.on('brain:client-pending', listener);
     return () => ipcRenderer.removeListener('brain:client-pending', listener);
+  },
+  onPendingMemoriesChanged: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on('brain:pending-memories-changed', listener);
+    return () => ipcRenderer.removeListener('brain:pending-memories-changed', listener);
   }
 });

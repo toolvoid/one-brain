@@ -45,7 +45,8 @@ function clientPaths(homeDir, appPath) {
   };
 }
 
-function discoverClients(homeDir, appPath, profiles = [], env = process.env) {
+function discoverClients(homeDir, appPath, profiles = [], tokenStates = [], env = process.env) {
+  if (!Array.isArray(tokenStates)) { env = tokenStates; tokenStates = []; }
   const paths = clientPaths(homeDir, appPath);
   const have = (file) => { try { return fs.existsSync(file); } catch { return false; } };
   const checks = {
@@ -60,20 +61,24 @@ function discoverClients(homeDir, appPath, profiles = [], env = process.env) {
     'claude-code': ['claudecode'], 'claude-desktop': ['claudedesktop']
   };
   return CLIENTS.map((client) => {
-    const profile = profiles.find((item) => aliases[client.id].some((needle) => String(item.client || '').toLowerCase().replace(/[^a-z0-9]/g, '').includes(needle)));
+    const profile = profiles.find((item) => item.verified && aliases[client.id].some((needle) => String(item.client || '').toLowerCase().replace(/[^a-z0-9]/g, '').includes(needle)));
+    const token = tokenStates.find((item) => item.client === client.id);
     const found = checks[client.id];
     return { ...client, status: profile ? 'connected' : found ? 'found' : 'not found', lastSeen: profile?.last_seen || null,
-      paths: paths[client.id] || {}, ...((client.kind === 'managed') ? { previewFiles: previewClient(client.id, homeDir, appPath, env) } : {}) };
+      tokenStatus: token ? (token.revoked ? 'revoked' : 'active') : 'none', paths: paths[client.id] || {},
+      ...((client.kind === 'managed') ? { previewFiles: previewClient(client.id, homeDir, appPath, env) } : {}) };
   });
 }
 
-function serverJson(appPath, env) {
-  return { command: resolveNode(env), args: [path.resolve(appPath, 'scripts', 'mcp-stdio.js')] };
+function serverJson(appPath, env, clientId) {
+  return { command: resolveNode(env), args: [path.resolve(appPath, 'scripts', 'mcp-stdio.js'), '--client', clientId] };
 }
 
 function tomlString(value) { return JSON.stringify(value); }
 
-function mergeTomlServer(input, command, script) {
+function mergeTomlServer(input, command, args) {
+  const argumentList = Array.isArray(args) ? args : [args];
+  const tomlArgs = `[${argumentList.map((arg) => tomlString(arg)).join(', ')}]`;
   const section = '[mcp_servers.one-brain]';
   const lines = input.split(/(?<=\n)/);
   let start = -1, end = lines.length;
@@ -94,16 +99,16 @@ function mergeTomlServer(input, command, script) {
       if (argsMatch) {
         if (sawArgs) return [];
         sawArgs = true;
-        return [`${argsMatch[1]}args = [${tomlString(script)}]${argsMatch[2] || ''}${argsMatch[3] || '\n'}`];
+        return [`${argsMatch[1]}args = ${tomlArgs}${argsMatch[2] || ''}${argsMatch[3] || '\n'}`];
       }
       return [line];
     });
     if (!sawCommand) merged.push(`command = ${tomlString(command)}\n`);
-    if (!sawArgs) merged.push(`args = [${tomlString(script)}]\n`);
+    if (!sawArgs) merged.push(`args = ${tomlArgs}\n`);
     lines.splice(start, end - start, `${section}\n`, ...merged);
   }
   else {
-    const block = `${section}\ncommand = ${tomlString(command)}\nargs = [${tomlString(script)}]\n`;
+    const block = `${section}\ncommand = ${tomlString(command)}\nargs = ${tomlArgs}\n`;
     lines.push(`${input && !input.endsWith('\n') ? '\n' : ''}${block}`);
   }
   return lines.join('');
@@ -156,10 +161,12 @@ function instructionPreview(file, enabled) {
 }
 
 function previewClient(clientId, homeDir, appPath, env = process.env) {
-  const paths = clientPaths(homeDir, appPath); const server = serverJson(appPath, env); const edits = [];
+  const client = CLIENTS.find((item) => item.id === clientId);
+  if (!client) throw new Error(`Unsupported client: ${clientId}`);
+  const paths = clientPaths(homeDir, appPath); const server = serverJson(appPath, env, clientId); const edits = [];
   if (clientId === 'codex') {
     const file = paths.codex.config; const before = readIfExists(file);
-    const after = mergeTomlServer(before, server.command, server.args[0]); edits.push({ path: file, before, after, changed: before !== after });
+    const after = mergeTomlServer(before, server.command, server.args); edits.push({ path: file, before, after, changed: before !== after });
     edits.push(instructionPreview(paths.codex.instructions, true));
   } else if (clientId === 'vscode') {
     const file = paths.vscode.config; const before = readIfExists(file);
@@ -168,6 +175,11 @@ function previewClient(clientId, homeDir, appPath, env = process.env) {
     const file = paths.gemini.config; const before = readIfExists(file);
     const after = mergeJsonServer(before, 'mcpServers', server); edits.push({ path: file, before, after, changed: before !== after });
     edits.push(instructionPreview(paths.gemini.instructions, true));
+  } else if (client.kind === 'snippet') {
+    return [
+      { path: `Local token for ${client.name}`, before: '', after: `Create a private token file at userData/tokens/${clientId}.token and write this client's SHA-256 hash to the local database. The token value is never shown.`, changed: true },
+      { path: `Copyable setup for ${client.name}`, before: '', after: snippetFor(clientId, appPath, env), changed: true }
+    ];
   } else throw new Error(`Unsupported managed client: ${clientId}`);
   return edits;
 }
@@ -191,8 +203,8 @@ function applyEdits(edits) {
 function disconnectPreview(clientId, homeDir, appPath = process.cwd(), env = process.env) {
   const paths = clientPaths(homeDir, ''); const edits = [];
   const connectTransform = (file, input) => {
-    const server = serverJson(appPath, env);
-    if (clientId === 'codex' && file === paths.codex.config) return mergeTomlServer(input, server.command, server.args[0]);
+    const server = serverJson(appPath, env, clientId);
+    if (clientId === 'codex' && file === paths.codex.config) return mergeTomlServer(input, server.command, server.args);
     if (clientId === 'vscode' && file === paths.vscode.config) return mergeJsonServer(input, 'servers', server);
     if (clientId === 'gemini' && file === paths.gemini.config) return mergeJsonServer(input, 'mcpServers', server);
     if (file === paths.codex.instructions || file === paths.gemini.instructions) return replaceInstructionBlock(input, true);
@@ -222,7 +234,7 @@ function disconnectPreview(clientId, homeDir, appPath = process.cwd(), env = pro
 }
 
 function snippetFor(clientId, appPath, env = process.env) {
-  const server = serverJson(appPath, env);
+  const server = serverJson(appPath, env, clientId);
   if (clientId === 'claude-code') return `claude mcp add one-brain -- ${server.command} ${server.args.map((arg) => JSON.stringify(arg)).join(' ')}`;
   if (clientId === 'claude-desktop') return JSON.stringify({ mcpServers: { 'one-brain': server } }, null, 2);
   throw new Error(`Unsupported snippet client: ${clientId}`);

@@ -11,9 +11,9 @@ FROM link_suggestions WHERE status = 'pending'
 UNION ALL
 SELECT 'suggestion' AS category, status AS label, total
 FROM suggestion_decision_stats`,
-  mcpCallsByDay: `SELECT date(ts) AS day, coalesce(client, 'Unknown client') AS client, count(*) AS calls
+  mcpCallsByDay: `SELECT date(ts) AS day, coalesce(client, 'Unknown client') || CASE WHEN verified = 0 THEN ' · unverified' WHEN verified = 1 THEN ' · verified' ELSE '' END AS client, count(*) AS calls
 FROM events WHERE kind = 'mcp_call'
-GROUP BY date(ts), client ORDER BY day DESC, client`,
+GROUP BY date(ts), client, verified ORDER BY day DESC, client`,
   searchLatency: `WITH ranked AS (
   SELECT date(ts) AS day, latency_ms,
     row_number() OVER (PARTITION BY date(ts) ORDER BY latency_ms) AS position,
@@ -35,10 +35,13 @@ ORDER BY retrieved DESC, m.id DESC LIMIT 10`,
 WHERE NOT EXISTS (SELECT 1 FROM memory_retrieval_stats s WHERE s.memory_id = m.id)`,
   embeddingStatus: `SELECT (SELECT count(*) FROM embeddings) AS indexed,
   (SELECT count(*) FROM memories) AS total`,
-  connectedClients: `SELECT c.client, c.first_seen, c.last_seen, c.total_calls,
+connectedClients: `SELECT c.client, CASE WHEN c.client = 'legacy-unverified' THEN 'unverified' ELSE 'verified' END AS identity,
+  c.first_seen, c.last_seen, c.total_calls,
   (SELECT count(*) FROM events e WHERE e.kind = 'mcp_call' AND e.client = c.client
     AND e.ts >= datetime('now', '-7 days')) AS calls_last_7_days
-FROM mcp_client_stats c ORDER BY c.last_seen DESC`
+FROM mcp_client_stats c ORDER BY c.last_seen DESC`,
+  proxyCalls: `SELECT client, provider, count(*) AS calls, round(avg(memories_injected), 2) AS average_memories_injected
+FROM events WHERE kind = 'proxy_call' GROUP BY client, provider ORDER BY calls DESC, client, provider`
 };
 
 module.exports = { INSIGHT_QUERIES };

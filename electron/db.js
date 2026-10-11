@@ -3,7 +3,7 @@ const Database = require('better-sqlite3-multiple-ciphers');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { createHash, randomBytes } = require('crypto');
+const { createHash, randomBytes, timingSafeEqual } = require('crypto');
 const { Worker } = require('node:worker_threads');
 const { INSIGHT_QUERIES } = require('./analytics-queries');
 const MEMORY_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
@@ -107,6 +107,97 @@ function deleteEvaluationCase(id) {
     db.prepare('DELETE FROM eval_results WHERE case_id = ?').run(caseId);
     db.prepare('DELETE FROM eval_cases WHERE id = ?').run(caseId);
   })();
+}
+
+function storeClientTokenHash(clientName, tokenHash) {
+  ensureWritable();
+  const client = String(clientName || '').trim();
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(client) || !/^[a-f\d]{64}$/i.test(String(tokenHash || ''))) throw new Error('Invalid client token record.');
+  getDatabase().prepare(`INSERT INTO client_tokens(client, token_hash, created_at, last_used, revoked)
+    VALUES (?, ?, CURRENT_TIMESTAMP, NULL, 0)
+    ON CONFLICT(client) DO UPDATE SET token_hash = excluded.token_hash, created_at = CURRENT_TIMESTAMP, last_used = NULL, revoked = 0`)
+    .run(client, tokenHash.toLowerCase());
+}
+
+function revokeClientToken(clientName) {
+  ensureWritable();
+  const client = String(clientName || '').trim();
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(client)) throw new Error('Invalid client name.');
+  getDatabase().prepare('UPDATE client_tokens SET revoked = 1 WHERE client = ?').run(client);
+}
+
+function listClientTokenStates() {
+  return getDatabase().prepare('SELECT client, created_at, last_used, revoked FROM client_tokens ORDER BY client').all();
+}
+
+function authenticateClientToken(token) {
+  const raw = String(token || '');
+  if (!/^[a-f\d]{64}$/i.test(raw)) return null;
+  const candidate = createHash('sha256').update(raw, 'utf8').digest();
+  const rows = getDatabase().prepare('SELECT client, token_hash, revoked FROM client_tokens').all();
+  let match = null;
+  for (const row of rows) {
+    if (!/^[a-f\d]{64}$/i.test(row.token_hash || '')) continue;
+    const expected = Buffer.from(row.token_hash, 'hex');
+    const equal = candidate.length === expected.length && timingSafeEqual(candidate, expected);
+    if (equal) match = row;
+  }
+  if (!match || match.revoked) return null;
+  getDatabase().prepare('UPDATE client_tokens SET last_used = CURRENT_TIMESTAMP WHERE client = ? AND revoked = 0').run(match.client);
+  return { client: match.client };
+}
+
+function getProxyClientProfile(client) {
+  const name = String(client || '').trim();
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) return null;
+  const profile = getDatabase().prepare('SELECT client, write_source, status, verified FROM client_profiles WHERE client = ?').get(name);
+  if (!profile) return null;
+  profile.allowedSources = getDatabase().prepare("SELECT read_source FROM client_grants WHERE client = ? AND status = 'allow'").all(name).map((row) => row.read_source);
+  return profile;
+}
+
+function recordProxyEvent(event = {}) {
+  try {
+    getDatabase().prepare(`INSERT INTO events (kind, tool, client, provider, query, result_count, memories_injected, estimated_tokens_added, latency_ms, upstream_status, ok, error, verified)
+      VALUES ('proxy_call', 'memory_proxy', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 1)`)
+      .run(String(event.client || '').slice(0, 120), String(event.provider || '').slice(0, 32),
+        Math.max(0, Number(event.memories_injected) || 0), Math.max(0, Number(event.memories_injected) || 0),
+        Math.max(0, Number(event.estimated_tokens_added) || 0), Math.max(0, Math.round(event.latency_ms || 0)),
+        Number.isInteger(event.upstream_status) ? event.upstream_status : null, event.ok ? 1 : 0,
+        event.error ? String(event.error).slice(0, 80) : null);
+  } catch {}
+}
+
+function getPendingMemories() {
+  return getDatabase().prepare('SELECT id, title, text AS content, client, created_at FROM pending_memories ORDER BY id DESC').all();
+}
+
+async function addPendingMemory({ title, content, client }) {
+  ensureWritable();
+  const text = String(content || '').trim();
+  if (!text || !embeddingReady || !embeddingProvider) return { added: false, reason: 'embedding_unavailable' };
+  const candidates = await semanticSearch(text, 'all', 500);
+  if (candidates.some((row) => Number(row.score) >= 0.9)) return { added: false, reason: 'duplicate' };
+  const safeTitle = String(title || '').trim().slice(0, 160) || text.slice(0, 80);
+  const result = getDatabase().prepare('INSERT INTO pending_memories(title, text, client) VALUES (?, ?, ?)')
+    .run(safeTitle, text.slice(0, 4000), String(client || '').slice(0, 120));
+  return { added: true, id: Number(result.lastInsertRowid) };
+}
+
+function approvePendingMemory(id, title, content) {
+  ensureWritable();
+  const item = getDatabase().prepare('SELECT id, title, text AS content, client FROM pending_memories WHERE id = ?').get(Number(id));
+  if (!item) throw new Error('Pending memory not found.');
+  const profile = getProxyClientProfile(item.client);
+  if (!profile?.write_source || profile.status !== 'approved') throw new Error('This client has no approved write source.');
+  const memory = addMemory({ source: profile.write_source, title: String(title || item.title).slice(0, 160), content: String(content || item.content).slice(0, 4000) }, { event: false });
+  getDatabase().prepare('DELETE FROM pending_memories WHERE id = ?').run(item.id);
+  return memory.id;
+}
+
+function rejectPendingMemory(id) {
+  ensureWritable();
+  return getDatabase().prepare('DELETE FROM pending_memories WHERE id = ?').run(Number(id)).changes > 0;
 }
 
 function listRecentEvaluationQueries(limit = 30) {
@@ -524,7 +615,11 @@ function getDatabase() {
         top_score REAL,
         latency_ms INTEGER,
         ok INTEGER,
-        error TEXT
+        error TEXT,
+        provider TEXT,
+        memories_injected INTEGER,
+        estimated_tokens_added INTEGER,
+        upstream_status INTEGER
       );
       CREATE TABLE IF NOT EXISTS eval_cases (
         id INTEGER PRIMARY KEY,
@@ -550,6 +645,20 @@ function getDatabase() {
         rank INTEGER,
         top_score REAL,
         PRIMARY KEY(run_id, case_id)
+      );
+      CREATE TABLE IF NOT EXISTS client_tokens (
+        client TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        last_used TEXT,
+        revoked INTEGER DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS pending_memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        text TEXT NOT NULL,
+        client TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE INDEX IF NOT EXISTS events_ts_idx ON events(ts);
       CREATE INDEX IF NOT EXISTS events_kind_idx ON events(kind, ts);
@@ -583,7 +692,9 @@ function getDatabase() {
         write_source TEXT,
         status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'blocked')),
         first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        verified INTEGER NOT NULL DEFAULT 0,
+        reported_name TEXT
       );
       CREATE TRIGGER IF NOT EXISTS memories_fts_insert AFTER INSERT ON memories BEGIN
         INSERT INTO memories_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
@@ -596,6 +707,17 @@ function getDatabase() {
         INSERT INTO memories_fts(memories_fts, rowid, title, content) VALUES ('delete', old.id, old.title, old.content);
       END;
     `);
+
+    const eventColumns = new Set(database.prepare('PRAGMA table_info(events)').all().map((column) => column.name));
+    if (!eventColumns.has('verified')) database.exec('ALTER TABLE events ADD COLUMN verified INTEGER');
+    if (!eventColumns.has('reported_name')) database.exec('ALTER TABLE events ADD COLUMN reported_name TEXT');
+    if (!eventColumns.has('provider')) database.exec('ALTER TABLE events ADD COLUMN provider TEXT');
+    if (!eventColumns.has('memories_injected')) database.exec('ALTER TABLE events ADD COLUMN memories_injected INTEGER');
+    if (!eventColumns.has('estimated_tokens_added')) database.exec('ALTER TABLE events ADD COLUMN estimated_tokens_added INTEGER');
+    if (!eventColumns.has('upstream_status')) database.exec('ALTER TABLE events ADD COLUMN upstream_status INTEGER');
+    const profileColumns = new Set(database.prepare('PRAGMA table_info(client_profiles)').all().map((column) => column.name));
+    if (!profileColumns.has('verified')) database.exec('ALTER TABLE client_profiles ADD COLUMN verified INTEGER NOT NULL DEFAULT 0');
+    if (!profileColumns.has('reported_name')) database.exec('ALTER TABLE client_profiles ADD COLUMN reported_name TEXT');
 
     const linkColumns = new Set(database.prepare('PRAGMA table_info(links)').all().map((column) => column.name));
     const linkSql = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'links'").get()?.sql || '';
@@ -857,17 +979,22 @@ function configureEmbeddingProvider(provider, model, { onProgress = () => {}, on
   void backfill().catch((error) => onError(`Local semantic indexing failed: ${String(error?.message || error).split('\n')[0]}`));
 }
 
+function redactTokenText(value) {
+  return String(value).replace(/Bearer\s+[a-f\d]{64}/gi, '[redacted token]').replace(/[a-f\d]{64}/gi, '[redacted token]');
+}
+
 function recordEvent(event = {}, memoryIds = []) {
   try {
     const db = getDatabase();
     const result = db.prepare(`INSERT INTO events
-      (kind, tool, client, source, query, result_count, top_score, latency_ms, ok, error)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(String(event.kind || 'unknown').slice(0, 80), event.tool ? String(event.tool).slice(0, 80) : null,
-        event.client ? String(event.client).slice(0, 120) : null, event.source ? String(event.source).slice(0, 80) : null,
-        event.query == null ? null : String(event.query).slice(0, 200), Number.isFinite(event.result_count) ? event.result_count : null,
+      (kind, tool, client, source, query, result_count, top_score, latency_ms, ok, error, verified, reported_name)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(redactTokenText(event.kind || 'unknown').slice(0, 80), event.tool ? redactTokenText(event.tool).slice(0, 80) : null,
+        event.client ? redactTokenText(event.client).slice(0, 120) : null, event.source ? redactTokenText(event.source).slice(0, 80) : null,
+        event.query == null ? null : redactTokenText(event.query).slice(0, 200), Number.isFinite(event.result_count) ? event.result_count : null,
         Number.isFinite(event.top_score) ? event.top_score : null, Number.isFinite(event.latency_ms) ? Math.max(0, Math.round(event.latency_ms)) : null,
-        event.ok === undefined ? 1 : (event.ok ? 1 : 0), event.error ? String(event.error).split('\n')[0].slice(0, 250) : null);
+        event.ok === undefined ? 1 : (event.ok ? 1 : 0), event.error ? redactTokenText(String(event.error).split('\n')[0]).slice(0, 250) : null,
+        event.verified === undefined ? null : (event.verified ? 1 : 0), event.reported_name ? redactTokenText(event.reported_name).slice(0, 120) : null);
     const id = Number(result.lastInsertRowid);
     const insertRetrieval = db.prepare('INSERT OR IGNORE INTO event_memory_retrievals (event_id, memory_id) SELECT ?, id FROM memories WHERE id = ?');
     for (const memoryId of [...new Set(memoryIds.map(Number).filter(Number.isInteger))]) {
@@ -888,21 +1015,23 @@ function normalizeClientName(client) {
   return String(client || '').trim().slice(0, 120) || 'Unknown MCP client';
 }
 
-function getMcpClientProfile(clientName) {
+function getMcpClientProfile(clientName, identity = {}) {
   const db = getDatabase();
   const client = normalizeClientName(clientName);
   const created = db.prepare(`INSERT OR IGNORE INTO client_profiles (client, write_source, status, first_seen, last_seen)
     VALUES (?, NULL, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`).run(client).changes > 0;
-  db.prepare('UPDATE client_profiles SET last_seen = CURRENT_TIMESTAMP WHERE client = ?').run(client);
-  const profile = db.prepare('SELECT client, write_source, status, first_seen, last_seen FROM client_profiles WHERE client = ?').get(client);
-  if (created) recordEvent({ kind: 'client_pending', tool: 'client_profile', client, ok: 1 });
+  db.prepare('UPDATE client_profiles SET last_seen = CURRENT_TIMESTAMP, verified = ?, reported_name = ? WHERE client = ?')
+    .run(identity.verified ? 1 : 0, identity.reported_name || null, client);
+  const profile = db.prepare('SELECT client, write_source, status, first_seen, last_seen, verified, reported_name FROM client_profiles WHERE client = ?').get(client);
+  if (created) recordEvent({ kind: 'client_pending', tool: 'client_profile', client: identity.eventClient || client,
+    verified: identity.verified, reported_name: identity.reported_name, ok: 1 });
   const allowedSources = db.prepare("SELECT read_source FROM client_grants WHERE client = ? AND status = 'allow'").all(client).map((row) => row.read_source);
   return { ...profile, allowedSources, created };
 }
 
 function listClients() {
   const db = getDatabase();
-  return db.prepare('SELECT client, write_source, status, first_seen, last_seen FROM client_profiles ORDER BY last_seen DESC, client').all().map((profile) => ({
+  return db.prepare('SELECT client, write_source, status, first_seen, last_seen, verified, reported_name FROM client_profiles ORDER BY last_seen DESC, client').all().map((profile) => ({
     ...profile,
     grants: Object.fromEntries(MEMORY_SOURCES.map((source) => [source, db.prepare('SELECT status FROM client_grants WHERE client = ? AND read_source = ?').get(profile.client, source)?.status || 'deny']))
   }));
@@ -1407,4 +1536,4 @@ function countBySource() {
     }, {});
 }
 
-module.exports = { initializeDatabase, getDatabaseStatus, getInsights, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
+module.exports = { initializeDatabase, getDatabaseStatus, getInsights, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, recordProxyEvent, getPendingMemories, addPendingMemory, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };

@@ -114,11 +114,58 @@ function EvaluationPanel() {
   </section>;
 }
 
+const PROXY_PROVIDERS = ['openai', 'groq', 'deepseek', 'gemini', 'openrouter'];
+
+function ProviderKeysPanel({ clients }) {
+  const [settings, setSettings] = useState(null);
+  const [keys, setKeys] = useState({});
+  const [notice, setNotice] = useState('');
+  useEffect(() => { window.brain.getMemoryProxySettings().then(setSettings).catch(() => setNotice('Proxy settings are unavailable.')); }, []);
+  async function update(patch) { const next = await window.brain.updateMemoryProxySettings(patch); setSettings(next); }
+  async function save(provider) {
+    try {
+      await window.brain.saveProviderKey(provider, keys[provider] || '');
+      setKeys((current) => ({ ...current, [provider]: '' }));
+      setNotice(`${provider} key saved securely.`);
+      setSettings(await window.brain.getMemoryProxySettings());
+    } catch (error) { setNotice(error.message || 'Could not save provider key.'); }
+  }
+  if (!settings) return <section className="clients-settings"><h2>Provider keys</h2><p className="empty-note">Loading proxy settings…</p></section>;
+  return <section className="clients-settings proxy-settings">
+    <header><h2>Provider keys</h2><small>Keys are encrypted locally and never read back into the UI.</small></header>
+    <p className="connect-hint">Use <code>{settings.endpoint || 'http://127.0.0.1:3738'}/v1/&lt;provider&gt;</code> as base_url and this client’s One Brain token as api_key.</p>
+    {PROXY_PROVIDERS.map((provider) => <article className="proxy-key-row" key={provider}><label>{provider}<input type="password" autoComplete="new-password" value={keys[provider] || ''} onChange={(event) => setKeys((current) => ({ ...current, [provider]: event.target.value }))} placeholder={settings.providerKeyStatus?.[provider] ? 'Key saved' : 'Paste provider key'} /></label><button type="button" onClick={() => void save(provider)} disabled={!keys[provider]}>Save</button>{settings.providerKeyStatus?.[provider] && <button type="button" onClick={async () => { await window.brain.deleteProviderKey(provider); setSettings(await window.brain.getMemoryProxySettings()); }}>Remove</button>}</article>)}
+    <h3>Memory injection</h3>
+    <label className="proxy-setting"><input type="checkbox" checked={settings.enabled} onChange={(event) => void update({ enabled: event.target.checked })} />Enabled</label>
+    <label className="proxy-setting"><input type="checkbox" checked={settings.dryRun} onChange={(event) => void update({ dryRun: event.target.checked })} />Dry run (measure retrieval, send unchanged request)</label>
+    <label className="proxy-setting">Maximum memories<input type="number" min="1" max="10" value={settings.count} onChange={(event) => void update({ count: event.target.value })} /></label>
+    <label className="proxy-setting">Minimum score<input type="number" min="0" max="1" step="0.05" value={settings.minScore} onChange={(event) => void update({ minScore: event.target.value })} /></label>
+    <h3>Save-back review (off by default)</h3>
+    <label className="proxy-setting">Cheap model<input value={settings.saveBackModel || ''} onChange={(event) => setSettings((value) => ({ ...value, saveBackModel: event.target.value }))} onBlur={() => void update({ saveBackModel: settings.saveBackModel })} /></label>
+    {clients.filter((client) => client.verified).map((client) => <label className="proxy-setting" key={client.client}><input type="checkbox" checked={Boolean(settings.saveBackClients?.[client.client])} onChange={(event) => void update({ saveBackClients: { [client.client]: event.target.checked } })} />Allow save-back candidates for {client.client}</label>)}
+    {notice && <p className="empty-note" role="status">{notice}</p>}
+  </section>;
+}
+
+function PendingMemoryInbox({ items, onRefresh }) {
+  const [editing, setEditing] = useState(null);
+  const [title, setTitle] = useState('');
+  const [content, setContent] = useState('');
+  async function edit(item) { setEditing(item.id); setTitle(item.title); setContent(item.content); }
+  async function approve(id = editing, nextTitle = title, nextContent = content) { await window.brain.approvePendingMemory(id, nextTitle, nextContent); setEditing(null); await onRefresh(); }
+  async function reject(id) { await window.brain.rejectPendingMemory(id); await onRefresh(); }
+  return <section className="pending-memory-inbox"><header><h2>Pending ({items.length})</h2><button type="button" onClick={() => void onRefresh()}>Refresh</button></header>
+    {items.map((item) => <article key={item.id}><strong>{item.title}</strong><small>{item.client} · {dateLabel(item.created_at)}</small><p>{item.content}</p><footer><button type="button" onClick={() => void approve(item.id, item.title, item.content)}>Approve</button><button type="button" onClick={() => void edit(item)}>Edit</button><button type="button" onClick={() => void reject(item.id)}>Reject</button></footer></article>)}
+    {items.length === 0 && <p className="empty-note">No pending memory candidates.</p>}
+    {editing && createPortal(<div className="modal-backdrop"><form className="add-modal" onSubmit={(event) => { event.preventDefault(); void approve(); }}><header><h2>Edit pending memory</h2><button type="button" onClick={() => setEditing(null)}>×</button></header><label>Title<input value={title} onChange={(event) => setTitle(event.target.value)} /></label><label>Content<textarea rows="6" value={content} onChange={(event) => setContent(event.target.value)} /></label><button className="save-button" type="submit">Approve edited memory</button></form></div>, document.body)}
+  </section>;
+}
+
 function InsightsView({ data, onBack, sql, setSql, runSql, sqlResult, sqlRunning }) {
   const view = (key) => data?.[key] || { rows: [], sql: '' };
   const table = (rows, keys, empty = 'No data yet') => rows.length ? <div className="insight-table-wrap"><table className="insight-table"><thead><tr>{keys.map(([key, label]) => <th key={key}>{label}</th>)}</tr></thead><tbody>{rows.map((row, index) => <tr key={row.id ?? row.ts ?? `${index}`} >{keys.map(([key]) => <td key={key}>{row[key] == null ? '—' : String(row[key])}</td>)}</tr>)}</tbody></table></div> : <p className="empty-note">{empty}</p>;
   const memories = view('memoriesByDay'), links = view('linksAndSuggestions'), calls = view('mcpCallsByDay'), latency = view('searchLatency');
-  const retrievals = view('retrievals'), never = view('neverRetrieved'), embedding = view('embeddingStatus'), clients = view('connectedClients');
+  const retrievals = view('retrievals'), never = view('neverRetrieved'), embedding = view('embeddingStatus'), clients = view('connectedClients'), proxyCalls = view('proxyCalls');
   const linkRows = links.rows;
   return <section className="insights-view"><header className="insights-header"><button className="back-button" type="button" onClick={onBack}>‹</button><div><h1>Insights</h1><p>Local SQLite activity and retrieval analytics</p></div></header>
     <div className="insights-grid">
@@ -129,7 +176,8 @@ function InsightsView({ data, onBack, sql, setSql, runSql, sqlResult, sqlRunning
       <SqlPanel title="Searches with zero results" sql={view('zeroResultSearches').sql}>{table(view('zeroResultSearches').rows, [['ts','Time'],['client','Client'],['source','Source'],['query','Query']], 'No zero result searches')}</SqlPanel>
       <SqlPanel title="Most retrieved memories" sql={retrievals.sql}>{table(retrievals.rows, [['id','ID'],['title','Title'],['source','Source'],['retrieved','Retrieved']])}<p className="insight-note">Never retrieved: <b>{never.rows[0]?.total ?? 0}</b></p></SqlPanel>
       <SqlPanel title="Embedding index status" sql={embedding.sql}><div className="insight-stat"><strong>{embedding.rows[0]?.indexed ?? 0}</strong><span>indexed of {embedding.rows[0]?.total ?? 0} memories</span></div></SqlPanel>
-      <SqlPanel title="Connected MCP clients" sql={clients.sql}>{table(clients.rows, [['client','Client'],['first_seen','First seen'],['last_seen','Last seen'],['total_calls','Total calls'],['calls_last_7_days','Last 7 days']])}</SqlPanel>
+      <SqlPanel title="Connected MCP clients" sql={clients.sql}>{table(clients.rows, [['client','Client'],['identity','Identity'],['first_seen','First seen'],['last_seen','Last seen'],['total_calls','Total calls'],['calls_last_7_days','Last 7 days']])}</SqlPanel>
+      <SqlPanel title="Proxy" sql={proxyCalls.sql}>{table(proxyCalls.rows, [['client','Client'],['provider','Provider'],['calls','Calls'],['average_memories_injected','Average memories injected']])}</SqlPanel>
     </div>
     <EvaluationPanel />
     <section className="insight-card run-sql-card"><header><h2>Run SQL</h2><small>Read only · SELECT only · 200 rows · 3 second timeout</small></header><textarea aria-label="SQL query" spellCheck="false" value={sql} onChange={(event) => setSql(event.target.value)} /><button className="run-sql-button" type="button" onClick={runSql} disabled={sqlRunning}>{sqlRunning ? 'Running…' : 'Run SQL'}</button>{sqlResult?.error && <p className="sql-error" role="alert">{sqlResult.error}</p>}{sqlResult?.rows && table(sqlResult.rows, sqlResult.columns.map((column) => [column, column]), 'Query returned no rows')}</section>
@@ -142,6 +190,7 @@ function dateLabel(value) {
 }
 
 function connectorPreviewText(edit) {
+  if (edit.path.startsWith('Local token for ') || edit.path.startsWith('Secure token for ') || edit.path.startsWith('Copyable setup for ')) return edit.after;
   if (edit.path.endsWith('AGENTS.md') || edit.path.endsWith('GEMINI.md')) {
     const match = edit.after.match(/<!-- ONE-BRAIN:BEGIN -->[\s\S]*?<!-- ONE-BRAIN:END -->/);
     return match ? match[0] : 'Remove the marked One Brain instruction block.';
@@ -226,6 +275,8 @@ function App() {
   const [databaseStatus, setDatabaseStatus] = useState({ writable: true, message: '' });
   const [showSemanticLinks, setShowSemanticLinks] = useState(true);
   const [connectOpen, setConnectOpen] = useState(false);
+  const [pendingOpen, setPendingOpen] = useState(false);
+  const [pendingMemories, setPendingMemories] = useState([]);
   const [clients, setClients] = useState([]);
   const [pendingClient, setPendingClient] = useState(null);
   const [pendingReadSources, setPendingReadSources] = useState([]);
@@ -290,6 +341,12 @@ function App() {
     return savedClients;
   }
 
+  async function refreshPendingMemories() {
+    const items = await window.brain.listPendingMemories();
+    setPendingMemories(items);
+    return items;
+  }
+
   async function refreshConnectors() {
     const rows = await window.brain.listConnectors();
     setConnectorCards(rows);
@@ -303,6 +360,11 @@ function App() {
   }
 
   async function previewDisconnectConnector(client) {
+    const card = connectorCards.find((item) => item.id === client);
+    if (card?.kind === 'snippet') {
+      setConnectorSnippet({ client, operation: 'disconnect', snippet: client === 'claude-code' ? 'claude mcp remove one-brain' : 'In Claude Desktop settings, remove only the "one-brain" entry under "mcpServers".' });
+      return;
+    }
     const files = await window.brain.previewDisconnectConnector(client);
     setConnectorSnippet(null);
     setConnectorAction({ operation: 'disconnect', client, files });
@@ -310,7 +372,15 @@ function App() {
 
   async function confirmConnectorAction() {
     if (!connectorAction) return;
-    if (connectorAction.operation === 'connect') await window.brain.connectConnector(connectorAction.client);
+    if (connectorAction.operation === 'connect') {
+      await window.brain.connectConnector(connectorAction.client);
+      const client = connectorCards.find((item) => item.id === connectorAction.client);
+      if (client?.kind === 'snippet') {
+        const snippet = await window.brain.getConnectorSnippet(connectorAction.client);
+        setConnectorSnippet({ client: connectorAction.client, operation: 'connect', snippet });
+      }
+    } else if (connectorAction.operation === 'rotate-token') await window.brain.rotateConnectorToken(connectorAction.client);
+    else if (connectorAction.operation === 'revoke-token') await window.brain.revokeConnectorToken(connectorAction.client);
     else await window.brain.disconnectConnector(connectorAction.client);
     setConnectorAction(null);
     await Promise.all([refreshConnectors(), refreshClients()]);
@@ -448,6 +518,8 @@ function App() {
       setPendingWriteSource(SOURCES[2]);
       void refreshClients();
     });
+    void refreshPendingMemories().catch(() => {});
+    const unsubscribePending = window.brain.onPendingMemoriesChanged(() => { void refreshPendingMemories(); });
     window.brain.listClients().then((rows) => {
       if (!active) return;
       setClients(rows);
@@ -464,6 +536,7 @@ function App() {
       unsubscribeRetrieved();
       unsubscribeChanged();
       unsubscribeClientPending();
+      unsubscribePending();
     };
   }, []);
 
@@ -725,8 +798,8 @@ function App() {
       <BrainGraph ref={graphRef} memories={memories} counts={counts} links={visibleGraphLinks} dataReady={dataReady} sidebarCollapsed={sidebarCollapsed} linksVisible={linksVisible} onLinksVisibleChange={setLinksVisible} />
       {insightsOpen && <InsightsView data={insightsData} onBack={() => setInsightsOpen(false)} sql={sql} setSql={setSql} runSql={runAnalyticsQuery} sqlResult={sqlResult} sqlRunning={sqlRunning} />}
       <aside className={`memory-panel${sidebarCollapsed ? ' is-collapsed' : ''}`} style={insightsOpen ? { display: 'none' } : undefined}>
-        <header className="sidebar-header"><strong>One Brain</strong><button type="button" onClick={openInsights}>Insights</button></header>
-        {connectOpen ? (
+        <header className="sidebar-header"><strong>One Brain</strong><button type="button" onClick={() => { setPendingOpen(true); setConnectOpen(false); void refreshPendingMemories(); }}>Pending ({pendingMemories.length})</button><button type="button" onClick={openInsights}>Insights</button></header>
+        {pendingOpen ? <><header className="detail-header"><button className="back-button" type="button" onClick={() => setPendingOpen(false)}>‹</button><span>Pending memories</span></header><PendingMemoryInbox items={pendingMemories} onRefresh={refreshPendingMemories} /></> : connectOpen ? (
           <section className="connect-view">
             <header className="detail-header"><button className="back-button" type="button" onClick={() => setConnectOpen(false)}>‹</button><span>Connect AI</span>{suggestions.length > 0 && <button className="header-suggestions" type="button" onClick={() => { setConnectOpen(false); setSuggestionsOpen(true); }}>Suggestions ({suggestions.length})</button>}</header>
             {mcpConfig ? <>
@@ -738,18 +811,25 @@ function App() {
                 {connectorCards.map((client) => <article className="connector-card" key={client.id}>
                   <div className="client-heading"><strong>{client.name}</strong><span className={`client-status ${client.status}`}>{client.status}</span></div>
                   <small>Last seen {dateLabel(client.lastSeen) || '—'}</small>
-                  {client.kind === 'managed' ? <div className="connector-actions">
+                  <small>Token: {client.tokenStatus || 'none'}</small>
+                  <div className="connector-actions">
                     <button type="button" onClick={() => void previewConnector(client.id)}>Connect</button>
                     <button type="button" onClick={() => void previewDisconnectConnector(client.id)}>Disconnect</button>
-                  </div> : <div className="connector-actions"><button type="button" onClick={() => void showConnectorSnippet(client.id)}>Connect</button><button type="button" onClick={() => void showConnectorSnippet(client.id, 'disconnect')}>Disconnect</button><button type="button" onClick={() => void copyConnectorSnippet(client.id)}>Copy</button></div>}
+                    {client.tokenStatus === 'active' && <button type="button" onClick={() => setConnectorAction({ operation: 'rotate-token', client: client.id, files: [{ path: `Secure token for ${client.name}`, before: '', after: 'Generate a new private token. The old token becomes invalid immediately; the token value is never shown.', changed: true }] })}>Rotate token</button>}
+                    {client.tokenStatus === 'active' && <button type="button" onClick={() => setConnectorAction({ operation: 'revoke-token', client: client.id, files: [{ path: `Secure token for ${client.name}`, before: '', after: 'Revoke this client token immediately and remove its private token file.', changed: true }] })}>Revoke</button>}
+                    {client.kind === 'snippet' && <button type="button" disabled={client.tokenStatus !== 'active'} onClick={() => void copyConnectorSnippet(client.id)}>Copy</button>}
+                  </div>
                   {connectorSnippet?.client === client.id && <div className="connector-snippet"><strong>{connectorSnippet.operation === 'connect' ? 'Copy into the client' : 'Remove One Brain from the client'}</strong><pre>{connectorSnippet.snippet}</pre><button type="button" onClick={() => copyText(connectorSnippet.snippet, `connector-${client.id}`)}>{copied === `connector-${client.id}` ? 'Copied' : 'Copy snippet'}</button></div>}
                 </article>)}
               </section>
+              <ProviderKeysPanel clients={clients} />
             </> : <p className="empty-note">Starting the local MCP server...</p>}
             <section className="clients-settings">
               <header><h2>Connected AIs</h2><button type="button" onClick={() => { void refreshClients(); }}>Refresh</button></header>
               {clients.map((client) => <article className="client-card" key={client.client}>
                 <div className="client-heading"><strong>{client.client}</strong><span className={`client-status ${client.status}`}>{client.status}</span></div>
+                <small>{client.verified ? 'Verified' : 'Unverified'}{!client.verified ? ' · Connect it again to get its own token' : ''}</small>
+                {client.reported_name && client.reported_name !== client.client && <small>Reported name: {client.reported_name}</small>}
                 <small>Last seen {dateLabel(client.last_seen) || '—'}</small>
                 <label>Write as<select value={client.write_source || ''} onChange={(event) => handleClientWriteSource(client.client, event.target.value || null)}><option value="">Choose source</option>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label>
                 <fieldset><legend>May read</legend>{SOURCES.map((source) => <label className="client-grant" key={source}><input type="checkbox" checked={client.grants?.[source] === 'allow'} onChange={(event) => handleClientGrant(client.client, source, event.target.checked)} />{source}</label>)}</fieldset>
@@ -1131,6 +1211,25 @@ function App() {
         .client-card fieldset { gap:5px 10px; }
         .client-grant { display:flex;align-items:center;gap:4px;color:#b9c7d8;font-size:9px;text-transform:capitalize; }
         .client-card > .client-block,.client-card > .client-unblock { justify-self:end;padding:5px 9px;font-size:10px; }
+        .proxy-settings { display:grid;gap:8px; }
+        .proxy-settings > header { display:grid;gap:4px; }
+        .proxy-settings > header small,.proxy-settings .connect-hint { color:#8494aa;font-size:9px; }
+        .proxy-key-row { display:flex;align-items:end;gap:5px; }
+        .proxy-key-row label { display:grid;flex:1;gap:4px;color:#bac9dc;font-size:10px;text-transform:capitalize; }
+        .proxy-key-row input,.proxy-setting input:not([type=checkbox]) { box-sizing:border-box;min-width:0;padding:6px;border:1px solid rgba(175,195,224,.18);border-radius:5px;color:#dce8f7;background:#0c1421;font:10px system-ui,sans-serif; }
+        .proxy-key-row button,.pending-memory-inbox button { border:1px solid rgba(143,196,255,.22);border-radius:5px;padding:5px 7px;color:#c7e1ff;background:#182a40;font:9px system-ui,sans-serif;cursor:pointer; }
+        .proxy-settings h3 { margin:8px 0 0;color:#d5e1f0;font-size:11px; }
+        .proxy-setting { display:flex;align-items:center;gap:6px;color:#bac9dc;font-size:10px; }
+        .proxy-setting input[type=number] { width:58px;margin-left:auto; }
+        .proxy-setting input[type=text] { width:145px;margin-left:auto; }
+        .pending-memory-inbox { display:grid;gap:9px; }
+        .pending-memory-inbox > header { display:flex;align-items:center;justify-content:space-between; }
+        .pending-memory-inbox h2 { margin:0;color:#dce6f2;font-size:13px; }
+        .pending-memory-inbox article { display:grid;gap:5px;padding:9px;border:1px solid rgba(175,195,224,.14);border-radius:7px;background:rgba(20,29,43,.45); }
+        .pending-memory-inbox article strong { color:#e4edf8;font-size:11px; }
+        .pending-memory-inbox article small { color:#8797ad;font-size:9px; }
+        .pending-memory-inbox article p { margin:0;color:#bac9dc;font-size:10px;white-space:pre-wrap;overflow-wrap:anywhere; }
+        .pending-memory-inbox footer { display:flex;gap:5px; }
         .add-modal { box-sizing:border-box;display:grid;gap:13px;width:min(560px,calc(100vw - 32px));max-height:calc(100vh - 32px);min-width:0;overflow-x:hidden;overflow-y:auto;padding:18px;border:1px solid rgba(175,195,224,.22);border-radius:12px;background:#0c1421;box-shadow:0 20px 70px rgba(0,0,0,.48); }
         .add-modal header { display:flex;align-items:center;justify-content:space-between; }
         .add-modal h2 { margin:0;color:#e9f0fb;font-size:16px; }

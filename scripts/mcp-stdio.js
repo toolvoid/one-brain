@@ -15,7 +15,18 @@ function userDataPath() {
 }
 
 const dataPath = userDataPath();
-const token = fs.readFileSync(path.join(dataPath, 'mcp-token'), 'utf8').trim();
+const bridgeArgs = process.argv.slice(2);
+let clientName = null;
+if (bridgeArgs.length) {
+  if (bridgeArgs.length !== 2 || bridgeArgs[0] !== '--client' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(bridgeArgs[1])) {
+    throw new Error('Invalid One Brain client argument.');
+  }
+  clientName = bridgeArgs[1];
+}
+const tokenFile = clientName
+  ? path.join(dataPath, 'tokens', `${clientName}.token`)
+  : path.join(dataPath, 'mcp-token');
+const token = fs.readFileSync(tokenFile, 'utf8').trim();
 const port = Number(fs.readFileSync(path.join(dataPath, 'mcp-port'), 'utf8').trim());
 if (!/^[a-f\d]{64}$/i.test(token) || !Number.isInteger(port) || port < 1 || port > 65535) {
   throw new Error('One Brain MCP token or port file is invalid.');
