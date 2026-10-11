@@ -13,6 +13,7 @@ const allowedMessageKeys = new Set(['role', 'content', 'name', 'tool_calls', 'to
 
 async function withMock(run, { failModels = false, echoKey = false } = {}) {
   let calls = [];
+  const pendingCandidates = [];
   const server = http.createServer((req, res) => {
     if (req.url === '/v1/models' && req.method === 'GET') {
       calls.push({ method: 'GET', authorization: req.headers.authorization });
@@ -29,26 +30,37 @@ async function withMock(run, { failModels = false, echoKey = false } = {}) {
       ] }));
       return;
     }
-    if (req.url !== '/v1/chat/completions' || req.method !== 'POST') { res.writeHead(404); res.end(); return; }
+    if (!['/v1/chat/completions', '/v1/messages'].includes(req.url) || req.method !== 'POST') { res.writeHead(404); res.end(); return; }
     let raw = '';
     req.setEncoding('utf8');
     req.on('data', (part) => { raw += part; });
     req.on('end', () => {
       const body = JSON.parse(raw);
-      calls.push({ method: 'POST', authorization: req.headers.authorization, body });
-      assert.equal(req.headers.authorization, `Bearer ${localKey}`);
-      if (body.messages[0].role === 'system') assert.deepEqual(Object.keys(body.messages[0]), ['role', 'content']);
+      calls.push({ method: 'POST', url: req.url, authorization: req.headers.authorization, apiKey: req.headers['x-api-key'], body });
+      if (req.url === '/v1/messages') assert.equal(req.headers['x-api-key'], localKey);
+      else assert.equal(req.headers.authorization, `Bearer ${localKey}`);
+      if (req.url === '/v1/chat/completions' && body.messages[0].role === 'system') assert.deepEqual(Object.keys(body.messages[0]), ['role', 'content']);
       for (const message of body.messages) for (const key of Object.keys(message)) {
         assert.ok(allowedMessageKeys.has(key), `unsupported message key ${key}`);
         assert.notEqual(key, 'tokens');
         assert.notEqual(key, 'memoryCount');
       }
-      for (const key of Object.keys(body)) assert.ok(['model', 'messages', 'stream'].includes(key), `unknown top-level key ${key}`);
+      for (const key of Object.keys(body)) assert.ok((req.url === '/v1/messages' ? ['model', 'messages', 'stream', 'system', 'max_tokens'] : ['model', 'messages', 'stream']).includes(key), `unknown top-level key ${key}`);
+      if (body.stream === false) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify([{ title: 'Gemini setup', content: 'Synthetic durable fact from Gemini.' }]) } }] }));
+        return;
+      }
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
       const first = echoKey ? localKey.slice(0, 9) : 'mock ';
       const second = echoKey ? `${localKey.slice(9)} mock answer` : 'answer';
-      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: first } }] })}\n\n`);
-      const timer = setTimeout(() => { res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: second } }] })}\n\ndata: [DONE]\n\n`); }, 100);
+      const claude = req.url === '/v1/messages';
+      res.write(claude
+        ? `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: first } })}\n\n`
+        : `data: ${JSON.stringify({ choices: [{ delta: { content: first } }] })}\n\n`);
+      const timer = setTimeout(() => { res.end(claude
+        ? `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', delta: { type: 'text_delta', text: second } })}\n\nevent: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`
+        : `data: ${JSON.stringify({ choices: [{ delta: { content: second } }] })}\n\ndata: [DONE]\n\n`); }, 100);
       res.on('close', () => clearTimeout(timer));
     });
   });
@@ -57,7 +69,7 @@ async function withMock(run, { failModels = false, echoKey = false } = {}) {
   const proxy = createMemoryProxy({
     userDataPath: root,
     safeStorage: { isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'test', encryptString: (text) => Buffer.from(text), decryptString: (buffer) => buffer.toString() },
-    providerUrls: { openai: `http://127.0.0.1:${server.address().port}/v1` },
+    providerUrls: { openai: `http://127.0.0.1:${server.address().port}/v1`, gemini: `http://127.0.0.1:${server.address().port}/v1`, claude: `http://127.0.0.1:${server.address().port}/v1` },
     listenPort: 0,
     fetchImpl: globalThis.fetch,
     getClientProfile: () => ({ client: 'chat:openai', status: 'approved', allowedSources: ['codex'] }),
@@ -72,10 +84,12 @@ async function withMock(run, { failModels = false, echoKey = false } = {}) {
       return { memory: memory && !memory.private && profile.allowedSources.includes(memory.source) ? memory : null };
     },
     recordProxyEvent: (event) => calls.push({ method: 'EVENT', event }),
-    addPendingMemory: async () => ({ added: true })
+    addPendingMemory: async (item) => { pendingCandidates.push(item); return { added: true }; }
   });
   proxy.saveKey('openai', localKey);
-  try { await run({ proxy, calls }); }
+  proxy.saveKey('gemini', localKey);
+  proxy.saveKey('claude', localKey);
+  try { await run({ proxy, calls, pendingCandidates }); }
   finally {
     await new Promise((resolve) => server.close(resolve));
     fs.rmSync(root, { recursive: true, force: true });
@@ -121,6 +135,25 @@ test('chat injects only allowed public synthetic memories and streams mock outpu
   });
 });
 
+test('Claude uses its native local mock API, keeps system injection out of messages, and streams text', async () => {
+  await withMock(async ({ proxy, calls }) => {
+    const chunks = [];
+    const models = await proxy.listModels('claude', true);
+    assert.ok(models.ids.includes('chat-model-mini'));
+    const result = await proxy.chatCompletion({ provider: 'claude', model: 'claude-sonnet-test',
+      messages: [{ role: 'user', content: 'What setup do I have?' }],
+      profile: { client: 'chat:claude', status: 'approved', allowedSources: ['codex'] }, onChunk: (chunk) => chunks.push(chunk) });
+    assert.equal(result.answer, 'mock answer');
+    assert.equal(chunks.join(''), 'mock answer');
+    const request = calls.find((call) => call.url === '/v1/messages');
+    assert.equal(request.apiKey, localKey);
+    assert.equal(request.authorization, undefined);
+    assert.match(request.body.system, /synthetic allowed memory/);
+    assert.doesNotMatch(request.body.system, /synthetic private memory|synthetic denied memory/);
+    assert.deepEqual(request.body.messages.map((item) => item.role), ['user']);
+  });
+});
+
 test('aborting the chat request stops the local mock stream', async () => {
   await withMock(async ({ proxy }) => {
     const controller = new AbortController();
@@ -140,4 +173,15 @@ test('provider output containing a key never streams the key to the renderer', a
     assert.equal(result.answer, '[redacted] mock answer');
     assert.equal(chunks.join('').includes(localKey), false);
   }, { echoKey: true });
+});
+
+test('Gemini save-back uses its active model and queues a review candidate', async () => {
+  await withMock(async ({ proxy, pendingCandidates }) => {
+    await proxy.chatCompletion({ provider: 'gemini', model: 'gemini-chat-model', useMemory: false, suggestMemories: true,
+      messages: [{ role: 'user', content: 'Synthetic durable setup fact.' }] });
+    for (let i = 0; i < 20 && pendingCandidates.length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(pendingCandidates.length, 1);
+    assert.equal(pendingCandidates[0].client, 'chat:gemini');
+    assert.equal(pendingCandidates[0].title, 'Gemini setup');
+  });
 });

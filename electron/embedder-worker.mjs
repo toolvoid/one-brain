@@ -1,5 +1,6 @@
 import { mkdir } from 'node:fs/promises';
 import { parentPort, workerData } from 'node:worker_threads';
+import { blockRelativeModelFetch, localModelEnvironment } from '../src/lib/embedder-config.mjs';
 
 let extractor;
 let activeModel = workerData.model;
@@ -12,9 +13,11 @@ function modelUnavailable(error) {
 
 async function loadModel() {
   parentPort.postMessage({ type: 'status', state: 'loading' });
-  await mkdir(workerData.cacheDir, { recursive: true });
+  const modelEnvironment = localModelEnvironment(workerData.userDataPath);
+  await mkdir(modelEnvironment.cacheDir, { recursive: true });
   const { env, pipeline } = await import('@huggingface/transformers');
-  env.cacheDir = workerData.cacheDir;
+  Object.assign(env, modelEnvironment);
+  globalThis.fetch = blockRelativeModelFetch(globalThis.fetch.bind(globalThis));
 
   try {
     extractor = await pipeline('feature-extraction', workerData.model, { dtype: 'q8' });

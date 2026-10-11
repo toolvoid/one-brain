@@ -1,6 +1,6 @@
 const { app, BrowserWindow, ipcMain, Menu, safeStorage } = require('electron');
 const path = require('path');
-const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, recordProxyEvent, getPendingMemories, addPendingMemory, approvePendingMemory, rejectPendingMemory, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, addMemory, createImport, importMemories, finishImport, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
+const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, recordProxyEvent, getPendingMemories, addPendingMemory, approvePendingMemory, rejectPendingMemory, listRecentImports, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, addMemory, createImport, importMemories, finishImport, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
 const { startMcpServer } = require('./mcp-server');
 const { createEmbedder } = require('./embedder');
 const connectors = require('./connectors');
@@ -10,6 +10,7 @@ const { createMemoryProxy } = require('./memory-proxy');
 let mcpConnection;
 let memoryProxy;
 let embedder;
+let embedderGeneration = 0;
 let embeddingStatus = { state: 'loading' };
 const chatControllers = new Map();
 
@@ -20,6 +21,27 @@ function publishEmbeddingStatus(status) {
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.send('brain:embedding-status', status);
   }
+}
+
+function configureReadyEmbedder(status) {
+  configureEmbeddingProvider(embedder.embed, status.model, {
+    onProgress: ({ done, total }) => publishEmbeddingStatus({ state: total > done ? 'indexing' : 'ready', done, total, model: status.model, fallback: status.fallback }),
+    onLinksChanged: (change = {}) => {
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.send('brain:changed', { type: 'semantic-links', ...change });
+      }
+    },
+    onError: (message) => publishEmbeddingStatus({ state: 'error', message: String(message || 'Local semantic indexing failed.') })
+  });
+}
+
+function startEmbedder() {
+  const generation = ++embedderGeneration;
+  embedder = createEmbedder(app.getPath('userData'), (status) => {
+    if (generation !== embedderGeneration) return;
+    if (status.state === 'ready') configureReadyEmbedder(status);
+    else publishEmbeddingStatus(status);
+  });
 }
 
 ipcMain.handle('memories:add', (_event, memory) => addMemory(memory, { handAdded: true }));
@@ -50,7 +72,7 @@ ipcMain.handle('memories:search', async (_event, query, source, limit, offset, c
   return results;
 });
 ipcMain.handle('memories:count-by-source', () => countBySource());
-ipcMain.handle('mcp:config', () => mcpConnection ? { endpoint: mcpConnection.config.endpoint } : null);
+ipcMain.handle('mcp:config', () => mcpConnection ? { endpoint: mcpConnection.config.endpoint, port: mcpConnection.config.port } : null);
 ipcMain.handle('connectors:list', () => connectors.discoverClients(app.getPath('home'), app.getAppPath(), listClients(), listClientTokenStates()));
 ipcMain.handle('connectors:preview', (_event, client) => connectors.previewClient(client, app.getPath('home'), app.getAppPath()));
 ipcMain.handle('connectors:connect', (_event, client) => {
@@ -64,6 +86,14 @@ ipcMain.handle('connectors:disconnect-preview', (_event, client) => connectors.d
 ipcMain.handle('connectors:disconnect', (_event, client) => connectors.applyEdits(connectors.disconnectPreview(client, app.getPath('home'), app.getAppPath())));
 ipcMain.handle('connectors:snippet', (_event, client) => connectors.snippetFor(client, app.getAppPath()));
 ipcMain.handle('embeddings:status', () => embeddingStatus);
+ipcMain.handle('embeddings:retry', async () => {
+  ++embedderGeneration;
+  const previous = embedder;
+  embedder = null;
+  try { await previous?.close(); } catch {}
+  startEmbedder();
+  return true;
+});
 ipcMain.handle('database:status', () => getDatabaseStatus());
 ipcMain.handle('clients:list', () => listClients());
 ipcMain.handle('clients:approve', (_event, client, readSources, writeSource) => approveClient(client, readSources, writeSource));
@@ -87,7 +117,7 @@ ipcMain.handle('memory-proxy:save-key', (_event, provider, key) => memoryProxy.s
 ipcMain.handle('memory-proxy:delete-key', (_event, provider) => memoryProxy.deleteKey(provider));
 ipcMain.handle('chat:models', (_event, provider, refresh) => memoryProxy.listModels(provider, refresh));
 ipcMain.handle('chat:grant', (_event, provider) => getChatGrant(provider));
-ipcMain.handle('chat:grant-save', (_event, provider, sources) => saveChatGrant(provider, sources));
+ipcMain.handle('chat:grant-save', (_event, provider, sources, writeSource) => saveChatGrant(provider, sources, writeSource));
 ipcMain.handle('chat:list', () => listChats());
 ipcMain.handle('chat:create', (_event, provider, model) => createChat(provider, model));
 ipcMain.handle('chat:update', (_event, id, patch) => updateChat(id, patch));
@@ -168,21 +198,7 @@ app.whenReady().then(async () => {
   const databaseStatus = await initializeDatabase(app.getPath('userData'), safeStorage);
   if (databaseStatus.message) console.error(databaseStatus.message);
 
-  embedder = createEmbedder(app.getPath('userData'), (status) => {
-    if (status.state === 'ready') {
-      configureEmbeddingProvider(embedder.embed, status.model, {
-        onProgress: ({ done, total }) => publishEmbeddingStatus({ state: total > done ? 'indexing' : 'ready', done, total, model: status.model, fallback: status.fallback }),
-        onLinksChanged: (change = {}) => {
-          for (const win of BrowserWindow.getAllWindows()) {
-            if (!win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.send('brain:changed', { type: 'semantic-links', ...change });
-          }
-        },
-        onError: () => publishEmbeddingStatus({ state: 'error', message: 'Local semantic indexing failed; full-text search remains available.' })
-      });
-    } else if (status.state === 'error') {
-      publishEmbeddingStatus({ state: 'error', message: 'Local semantic model unavailable; full-text search remains available.' });
-    }
-  });
+  startEmbedder();
 
   memoryProxy = createMemoryProxy({ userDataPath: app.getPath('userData'), safeStorage, authenticateClientToken,
     getClientProfile: getProxyClientProfile, searchMemoriesForClient, getMemoryForClient, recordProxyEvent,

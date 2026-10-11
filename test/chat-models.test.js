@@ -12,5 +12,22 @@ test('default model filter hides non-chat families and source mapping is provide
   assert.equal(memorySourceForProvider('gemini'), 'gemini');
   assert.equal(memorySourceForProvider('groq'), 'groq');
   assert.equal(memorySourceForProvider('deepseek'), 'deepseek');
+  assert.equal(memorySourceForProvider('claude'), 'claude');
   assert.equal(memorySourceForProvider('openrouter'), '');
+});
+
+test('semantic link switch filters semantic edges while the general link switch can still show other links', async () => {
+  const { visibleGraphLinks } = await import('../src/lib/graph-links.mjs');
+  const links = [{ id: 1, kind: 'manual' }, { id: 2, kind: 'auto' }, { id: 3, kind: 'semantic' }];
+  assert.deepEqual(visibleGraphLinks(links, false).map((link) => link.kind), ['manual', 'auto']);
+  assert.deepEqual(visibleGraphLinks(links, true).map((link) => link.kind), ['manual', 'auto', 'semantic']);
+  assert.deepEqual(visibleGraphLinks(links, true, 2).map((link) => link.kind), ['manual', 'auto']);
+});
+
+test('graph link controls classify title-matched, manual and semantic links and apply one master filter', async () => {
+  const { graphLinkCounts, visibleGraphLinks } = await import('../src/lib/graph-links.mjs');
+  const links = [{ kind: 'auto' }, { kind: 'manual' }, { kind: 'semantic' }];
+  assert.deepEqual(graphLinkCounts(links), { titleMatched: 1, manual: 1, semantic: 1 });
+  assert.deepEqual(visibleGraphLinks(links, { titleMatched: false, manual: true, semantic: true }).map((link) => link.kind), ['manual', 'semantic']);
+  assert.deepEqual(visibleGraphLinks(links, { titleMatched: false, manual: false, semantic: false }), []);
 });

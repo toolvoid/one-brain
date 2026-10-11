@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const readline = require('node:readline');
+const { fetchWithPortRetry, parseSavedPort } = require('./mcp-stdio-port');
 
 function userDataPath() {
   if (process.env.ONE_BRAIN_USER_DATA) return process.env.ONE_BRAIN_USER_DATA;
@@ -27,12 +28,13 @@ const tokenFile = clientName
   ? path.join(dataPath, 'tokens', `${clientName}.token`)
   : path.join(dataPath, 'mcp-token');
 const token = fs.readFileSync(tokenFile, 'utf8').trim();
-const port = Number(fs.readFileSync(path.join(dataPath, 'mcp-port'), 'utf8').trim());
+const portPath = path.join(dataPath, 'mcp-port');
+let port = parseSavedPort(fs.readFileSync(portPath, 'utf8'));
 if (!/^[a-f\d]{64}$/i.test(token) || !Number.isInteger(port) || port < 1 || port > 65535) {
   throw new Error('One Brain MCP token or port file is invalid.');
 }
 
-const endpoint = `http://127.0.0.1:${port}/mcp`;
+let endpoint = `http://127.0.0.1:${port}/mcp`;
 let sessionId = null;
 let protocolVersion = null;
 let requestedProtocolVersion = null;
@@ -47,7 +49,14 @@ async function postMessage(message) {
   if (sessionId) headers['Mcp-Session-Id'] = sessionId;
   if (protocolVersion) headers['MCP-Protocol-Version'] = protocolVersion;
 
-  const response = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(message) });
+  const retried = await fetchWithPortRetry((targetPort) => fetch(`http://127.0.0.1:${targetPort}/mcp`, {
+    method: 'POST', headers, body: JSON.stringify(message)
+  }), port, () => {
+    try { return fs.readFileSync(portPath, 'utf8'); } catch { return ''; }
+  });
+  port = retried.port;
+  endpoint = `http://127.0.0.1:${port}/mcp`;
+  const response = retried.response;
   const text = await response.text();
   const responseSessionId = response.headers.get('mcp-session-id');
   if (message?.method === 'initialize') {

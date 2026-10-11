@@ -5,6 +5,7 @@ import { CSS2DObject, CSS2DRenderer } from 'three/addons/renderers/CSS2DRenderer
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { fitCameraToPoints, linkArcPoints } from '../lib/graph-math.mjs';
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 const COLORS = {
@@ -85,9 +86,11 @@ const LINE_FRAGMENT = `
   void main() { gl_FragColor = vec4(vColor, vAlpha); }
 `;
 
-const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], counts = {}, sidebarCollapsed = false, dataReady = false, linksVisible = true, onLinksVisibleChange = () => {} }, ref) {
+const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], counts = {}, linkCounts = {}, linkVisibility = {}, onLinkVisibilityChange = () => {}, fitRevision = 0, sidebarCollapsed = false, dataReady = false, onMemoryClick = () => {} }, ref) {
   const hostRef = useRef(null);
-  const apiRef = useRef({ retrieve: () => false });
+  const onMemoryClickRef = useRef(onMemoryClick);
+  onMemoryClickRef.current = onMemoryClick;
+  const apiRef = useRef({ retrieve: () => false, focus: () => false });
   useImperativeHandle(ref, () => ({
     retrieve: (id) => apiRef.current.retrieve(id),
     focus: (id) => apiRef.current.focus(id)
@@ -97,14 +100,14 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
     const host = hostRef.current;
     if (!host) return undefined;
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color('#05070f');
-    scene.fog = new THREE.FogExp2('#05070f', 0.004);
+    scene.background = new THREE.Color('#0b1020');
+    scene.fog = new THREE.FogExp2('#0b1020', 0.003);
     const camera = new THREE.PerspectiveCamera(48, 1, 0.1, 250);
     camera.position.set(32, 24, 42);
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.1;
+    renderer.toneMappingExposure = 1.0;
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.domElement.className = 'brain-webgl';
     host.appendChild(renderer.domElement);
@@ -116,10 +119,10 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
     controls.enableDamping = true;
     controls.dampingFactor = 0.06;
     controls.minDistance = 20;
-    controls.maxDistance = 110;
+    controls.maxDistance = 2000;
     const composer = new EffectComposer(renderer);
     composer.addPass(new RenderPass(scene, camera));
-    composer.addPass(new UnrealBloomPass(new THREE.Vector2(1, 1), 0.6, 0.5, 0.3));
+    composer.addPass(new UnrealBloomPass(new THREE.Vector2(1, 1), 0.18, 0.25, 0.86));
 
     const pointMat = new THREE.ShaderMaterial({
       vertexShader: POINT_VERTEX, fragmentShader: POINT_FRAGMENT, transparent: true,
@@ -166,35 +169,41 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
     let packetSlots = new Map();
     let pointAttrs = null;
     let lineAttrs = null;
+    let segmentToEdge = [];
     let currentMemories = [];
     let currentLinks = [];
     let currentCounts = {};
     let previousMemoryIds = new Set();
+    let previousMemoryLayout = '';
     let previousLinkIds = new Set();
     let initialized = false;
     let events = [];
     let edgeDraws = new Map();
     let hubFlash = { color: new THREE.Color('#ffffff'), strength: 0, until: 0 };
     let focusMove = null;
+    let manualOrbitPaused = false;
+    let hoveredMemoryId = null;
+    let hoveredMemorySource = null;
+    let hoveredLinkIndex = -1;
+    let orbitPointerStart = null;
 
-    function fitView(smooth = true) {
-      const radius = Math.max(...SOURCES.map((key) => new THREE.Vector3(...ANCHORS[key]).length() + 3.2)) + 1.5;
-      const verticalHalfFov = THREE.MathUtils.degToRad(camera.fov / 2);
-      const horizontalHalfFov = Math.atan(Math.tan(verticalHalfFov) * Math.max(camera.aspect, 0.01));
-      const limitingHalfFov = Math.max(0.05, Math.min(verticalHalfFov, horizontalHalfFov));
-      const distance = Math.min(110, Math.max(20, radius / Math.sin(limitingHalfFov) * 1.12));
+    function fitView(smooth = true, explicit = false) {
+      if (explicit) manualOrbitPaused = false;
+      const positions = [HUB.toArray(), ...SOURCES.map((key) => ANCHORS[key]), ...currentMemories.map((memory) => hashPosition(memory.id, memory.source).toArray())];
+      const fit = fitCameraToPoints(positions, camera.fov, camera.aspect);
       const direction = new THREE.Vector3(32, 24, 42).normalize();
-      const cameraTo = HUB.clone().addScaledVector(direction, distance);
+      const center = new THREE.Vector3(...fit.center);
+      const cameraTo = center.clone().addScaledVector(direction, fit.distance);
       if (!smooth) {
         camera.position.copy(cameraTo);
-        controls.target.copy(HUB);
+        controls.target.copy(center);
         focusMove = null;
         controls.update();
         return;
       }
       focusMove = {
         cameraFrom: camera.position.clone(), targetFrom: controls.target.clone(),
-        cameraTo, targetTo: HUB.clone(), startedAt: performance.now(), duration: 700
+        cameraTo, targetTo: center, startedAt: performance.now(), duration: 700
       };
     }
 
@@ -203,26 +212,61 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
     fitButton.className = 'brain-fit-button';
     fitButton.textContent = 'Fit';
     fitButton.setAttribute('aria-label', 'Fit all AI anchors and hub in view');
-    fitButton.addEventListener('click', () => fitView(true));
+    fitButton.addEventListener('click', () => fitView(true, true));
+    host.__brainGraphFit = () => { if (!manualOrbitPaused) fitView(true); };
+    controls.addEventListener('start', () => { focusMove = null; });
     host.appendChild(fitButton);
 
-    const linksToggle = document.createElement('div');
-    linksToggle.className = 'brain-links-toggle';
-    linksToggle.setAttribute('role', 'group');
-    linksToggle.setAttribute('aria-label', 'Memory links visibility');
-    linksToggle.innerHTML = '<span>Links:</span><button type="button" data-visible="true">On</button><button type="button" data-visible="false">Off</button>';
-    linksToggle.addEventListener('click', (event) => {
-      const button = event.target.closest('button[data-visible]');
-      if (button) host.__brainSetLinksVisible?.(button.dataset.visible === 'true');
+    const linksControl = document.createElement('div');
+    linksControl.className = 'brain-links-control';
+    linksControl.innerHTML = '<button class="brain-links-button" type="button" aria-expanded="false">Links</button><div class="brain-links-popover" hidden><label class="brain-link-master"><input data-kind="master" type="checkbox"><span>Show memory links</span></label><div class="brain-link-options"><label><input data-kind="auto" type="checkbox"><i class="brain-link-swatch"></i><span>Title-matched</span><b data-count="auto">0</b></label><label><input data-kind="manual" type="checkbox"><i class="brain-link-swatch"></i><span>Manual</span><b data-count="manual">0</b></label><label><input data-kind="semantic" type="checkbox"><i class="brain-link-swatch"></i><span>Semantic</span><b data-count="semantic">0</b></label></div><small class="brain-link-cap"></small></div>';
+    const linksButton = linksControl.querySelector('.brain-links-button');
+    const linksPopover = linksControl.querySelector('.brain-links-popover');
+    linksButton.addEventListener('click', () => {
+      linksPopover.hidden = !linksPopover.hidden;
+      linksButton.setAttribute('aria-expanded', String(!linksPopover.hidden));
     });
-    host.appendChild(linksToggle);
+    linksControl.addEventListener('change', (event) => {
+      const input = event.target.closest('input[data-kind]');
+      if (!input) return;
+      const kind = input.dataset.kind;
+      if (kind === 'master') {
+        const show = input.checked;
+        host.__brainSetLinkVisibility?.({ titleMatched: show, manual: show, semantic: show });
+      } else host.__brainSetLinkVisibility?.({ ...host.__brainLinkVisibility, [kind === 'auto' ? 'titleMatched' : kind]: input.checked });
+    });
+    host.appendChild(linksControl);
+    host.__brainGraphLinkState = (visibility, counts) => {
+      host.__brainLinkVisibility = visibility || {};
+      host.__brainSetLinkVisibility = (next) => onLinkVisibilityChange(next);
+      const kinds = [['titleMatched', 'auto'], ['manual', 'manual'], ['semantic', 'semantic']];
+      let checked = 0;
+      for (const [key, kind] of kinds) {
+        const input = linksControl.querySelector(`input[data-kind="${kind}"]`);
+        const visible = Boolean(host.__brainLinkVisibility[key]);
+        input.checked = visible;
+        if (visible) checked += 1;
+        linksControl.querySelector(`[data-count="${kind}"]`).textContent = Number(counts?.[key]) || 0;
+      }
+      const master = linksControl.querySelector('input[data-kind="master"]');
+      master.checked = checked === kinds.length;
+      master.indeterminate = checked > 0 && checked < kinds.length;
+      const total = kinds.reduce((sum, [key]) => sum + (Number(counts?.[key]) || 0), 0);
+      linksControl.querySelector('.brain-link-cap').textContent = total > 3000 ? 'Semantic links are automatically hidden above 3,000 total links.' : '';
+    };
+    const legend = document.createElement('details');
+    legend.className = 'brain-legend';
+    legend.innerHTML = '<summary>Legend</summary><div><i class="brain-legend-structural"></i><span>Belongs to AI or hub</span></div><div><i class="brain-legend-link"></i><span>Linked memories</span></div>';
+    host.appendChild(legend);
 
-    function makeEdge(key, a, b, color, alpha, glow = 0) {
-      edgeMeta.push({ key, a: a.clone(), b: b.clone(), color: new THREE.Color(color), alpha, glow, memoryLink: key.startsWith('link:') });
+    function makeEdge(key, a, b, color, alpha, glow = 0, linkDetails = null) {
+      const memoryLink = key.startsWith('link:');
+      edgeMeta.push({ key, a: a.clone(), b: b.clone(), points: linkDetails?.points || [a.toArray(), b.toArray()], color: new THREE.Color(color), alpha, glow, memoryLink, ...linkDetails });
     }
     function rebuild(nextMemories, nextLinks, nextCounts, animateChanges) {
       const nextMemoryIds = new Set(nextMemories.map((memory) => String(memory.id)));
-      const shouldFit = !initialized || nextMemoryIds.size !== previousMemoryIds.size || [...nextMemoryIds].some((id) => !previousMemoryIds.has(id));
+      const memoryLayout = JSON.stringify(nextMemories.map((memory) => [String(memory.id), memory.source]));
+      const shouldFit = !initialized || memoryLayout !== previousMemoryLayout;
       const oldMem = pointGeometry;
       const oldLine = lineGeometry;
       currentMemories = nextMemories;
@@ -241,23 +285,23 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
         labelObjects[key].querySelector('.brain-label-dot').style.background = active ? COLORS[key] : '#63738a';
         labelObjects[key].querySelector('.brain-label-dot').style.boxShadow = active ? `0 0 9px ${COLORS[key]}` : 'none';
         nodeMeta.push({ kind: 'anchor', key, source: key, position: new THREE.Vector3(...ANCHORS[key]), color: c, size: 13, alpha: active ? 0.95 : 0.22, scale: 1, glow: 0 });
-        makeEdge(`anchor:${key}`, HUB, new THREE.Vector3(...ANCHORS[key]), active ? COLORS[key] : '#536176', active ? 0.34 : 0.045);
+        makeEdge(`anchor:${key}`, HUB, new THREE.Vector3(...ANCHORS[key]), COLORS[key], active ? 0.24 : 0.04);
       }
       const hubIndex = nodeMeta.length;
-      nodeMeta.unshift({ kind: 'hub', key: 'hub', source: '', position: HUB.clone(), color: new THREE.Color('#ffffff'), size: 28, alpha: 0.96, scale: 1, glow: 0.6 });
+      nodeMeta.unshift({ kind: 'hub', key: 'hub', source: '', position: HUB.clone(), color: new THREE.Color('#ffffff'), size: 28, alpha: 0.96, scale: 1, glow: 0.25 });
       for (const memory of nextMemories) {
         const source = SOURCES.includes(memory.source) ? memory.source : 'chatgpt';
         const position = hashPosition(memory.id, source);
         const active = (Number(nextCounts[source]) || 0) > 0;
         const index = nodeMeta.length;
         memorySlot.set(String(memory.id), index);
-        nodeMeta.push({ kind: 'memory', key: String(memory.id), id: memory.id, source, title: memory.title || memory.content || 'Memory', position, color: new THREE.Color(active ? COLORS[source] : '#728095'), size: 5.2, alpha: 0.88, scale: 1, glow: 0 });
+        nodeMeta.push({ kind: 'memory', key: String(memory.id), id: memory.id, source, title: memory.title || 'Untitled memory', position, color: new THREE.Color(active ? COLORS[source] : '#728095'), size: 5.2, alpha: 0.88, scale: 1, glow: 0 });
         const edgeKey = `memory:${memory.id}`;
         const newAdd = animateChanges && !previousMemoryIds.has(String(memory.id));
         const anchor = new THREE.Vector3(...ANCHORS[source]);
-        const edgeColor = new THREE.Color(COLORS[source]).lerp(new THREE.Color('#ffffff'), 0.42);
+        const edgeColor = new THREE.Color(COLORS[source]);
         // Draw new memories along their single structural edge from the anchor.
-        makeEdge(edgeKey, anchor, newAdd ? anchor : position, edgeColor, 0.1);
+        makeEdge(edgeKey, anchor, newAdd ? anchor : position, edgeColor, 0.22);
         if (newAdd) {
           // Draw the existing structural edge outward so each memory has exactly one
           // anchor connection, including while the add animation is playing.
@@ -275,10 +319,11 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
         if (!a || !b) continue;
         const ka = String(a.id), kb = String(b.id);
         const id = String(link.id ?? `${ka}-${kb}`);
-        const drawing = animateChanges && !previousLinkIds.has(id);
         const aPos = hashPosition(a.id, a.source);
         const bPos = hashPosition(b.id, b.source);
-        makeEdge(`link:${id}`, aPos, drawing ? aPos : bPos, '#ffffff', 0.1, 0);
+        const obstacles = SOURCES.filter((source) => source !== a.source && source !== b.source).map((source) => ANCHORS[source]);
+        const points = linkArcPoints(aPos.toArray(), bPos.toArray(), [0, 0, 0], 24, 9, obstacles);
+        makeEdge(`link:${id}`, aPos, bPos, '#ffffff', 0.1, 0, { points, linkKind: link.kind, linkScore: link.score, linkMemoryIds: [ka, kb] });
       }
       edgeMeta.forEach((e, i) => edgeIndex.set(e.key, i));
 
@@ -303,15 +348,26 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
       pointGeometry.setAttribute('nodeGlow', new THREE.BufferAttribute(glows, 1).setUsage(THREE.DynamicDrawUsage));
       pointGeometry.setAttribute('packetAlpha', new THREE.BufferAttribute(packets, 1).setUsage(THREE.DynamicDrawUsage));
       pointGeometry.computeBoundingSphere();
-      const linePositions = new Float32Array(edgeMeta.length * 6);
-      const lineColors = new Float32Array(edgeMeta.length * 6);
-      const lineAlphas = new Float32Array(edgeMeta.length * 2);
-      const lineGlows = new Float32Array(edgeMeta.length * 2);
-      edgeMeta.forEach((edge, i) => {
-        edge.a.toArray(linePositions, i * 6); edge.b.toArray(linePositions, i * 6 + 3);
-        edge.color.toArray(lineColors, i * 6); edge.color.toArray(lineColors, i * 6 + 3);
-        lineAlphas[i * 2] = edge.alpha; lineAlphas[i * 2 + 1] = edge.alpha;
-        lineGlows[i * 2] = edge.glow; lineGlows[i * 2 + 1] = edge.glow;
+      const totalSegments = edgeMeta.reduce((total, edge) => total + edge.points.length - 1, 0);
+      const linePositions = new Float32Array(totalSegments * 6);
+      const lineColors = new Float32Array(totalSegments * 6);
+      const lineAlphas = new Float32Array(totalSegments * 2);
+      const lineGlows = new Float32Array(totalSegments * 2);
+      segmentToEdge = new Array(totalSegments);
+      let segmentOffset = 0;
+      edgeMeta.forEach((edge, edgeNumber) => {
+        edge.segmentStart = segmentOffset;
+        edge.segmentCount = edge.points.length - 1;
+        for (let segment = 0; segment < edge.segmentCount; segment++) {
+          const i = segmentOffset + segment;
+          new THREE.Vector3(...edge.points[segment]).toArray(linePositions, i * 6);
+          new THREE.Vector3(...edge.points[segment + 1]).toArray(linePositions, i * 6 + 3);
+          edge.color.toArray(lineColors, i * 6); edge.color.toArray(lineColors, i * 6 + 3);
+          lineAlphas[i * 2] = edge.alpha; lineAlphas[i * 2 + 1] = edge.alpha;
+          lineGlows[i * 2] = edge.glow; lineGlows[i * 2 + 1] = edge.glow;
+          segmentToEdge[i] = edgeNumber;
+        }
+        segmentOffset += edge.segmentCount;
       });
       lineGeometry = new THREE.BufferGeometry();
       lineGeometry.setAttribute('position', new THREE.BufferAttribute(linePositions, 3).setUsage(THREE.DynamicDrawUsage));
@@ -338,15 +394,14 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
           if (!previousLinkIds.has(id)) {
             const a = byId.get(String(link.a_id)); const b = byId.get(String(link.b_id));
             if (!a || !b) continue;
-            const key = `link:${id}`;
-            edgeDraws.set(key, { start: hashPosition(a.id, a.source), end: hashPosition(b.id, b.source), startedAt: now, duration: 550 });
             events.push({ kind: 'link', aId: String(a.id), bId: String(b.id), linkId: id, linkKind: link.kind, startedAt: now });
           }
         }
       }
       previousMemoryIds = new Set(nextMemories.map((m) => String(m.id)));
+      previousMemoryLayout = memoryLayout;
       previousLinkIds = new Set(nextLinks.map((link) => String(link.id ?? `${link.a_id}-${link.b_id}`)));
-      if (shouldFit) fitView(true);
+      if (shouldFit && !manualOrbitPaused) fitView(true);
     }
 
     function retrieve(memoryId) {
@@ -383,22 +438,67 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
 
     const raycaster = new THREE.Raycaster();
     raycaster.params.Points.threshold = 0.55;
+    raycaster.params.Line.threshold = 0.55;
     const pointer = new THREE.Vector2();
+    function onPointerClick(event) {
+      if (event.button !== 0) return;
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
+      raycaster.setFromCamera(pointer, camera);
+      const pointHit = raycaster.intersectObject(points, false).find((item) => nodeMeta[item.index]?.kind === 'memory');
+      if (pointHit) { onMemoryClickRef.current?.(nodeMeta[pointHit.index].id); return; }
+      if (!currentLinks.length) return;
+      const edgeHit = raycaster.intersectObject(lines, false).find((item) => {
+        const edge = edgeMeta[segmentToEdge[Math.floor((item.index || 0) / 2)]];
+        return edge?.memoryLink && edge.linkMemoryIds?.length === 2;
+      });
+      if (!edgeHit) return;
+      const edge = edgeMeta[segmentToEdge[Math.floor((edgeHit.index || 0) / 2)]];
+      if (!currentLinks.some((link) => String(link.id ?? `${link.a_id}-${link.b_id}`) === edge.key.slice(5))) return;
+      events.push({ kind: 'link', aId: edge.linkMemoryIds[0], bId: edge.linkMemoryIds[1], linkId: edge.key.slice(5), linkKind: edge.linkKind, startedAt: performance.now() });
+      onMemoryClickRef.current?.(edge.linkMemoryIds[1]);
+    }
     function onPointerMove(event) {
       const rect = renderer.domElement.getBoundingClientRect();
       pointer.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
       raycaster.setFromCamera(pointer, camera);
       const hits = raycaster.intersectObject(points, false);
       const hit = hits.find((item) => nodeMeta[item.index]?.kind === 'memory');
-      if (!hit) { tooltip.hidden = true; return; }
-      const node = nodeMeta[hit.index];
-      tooltip.textContent = node.title;
+      hoveredMemoryId = hit ? String(nodeMeta[hit.index].id) : null;
+      hoveredMemorySource = hit ? nodeMeta[hit.index].source : null;
+      hoveredLinkIndex = -1;
+      if (hoveredMemoryId === null && currentLinks.length) {
+        const lineHit = raycaster.intersectObject(lines, false).find((item) => edgeMeta[segmentToEdge[Math.floor((item.index || 0) / 2)]]?.memoryLink);
+        if (lineHit) hoveredLinkIndex = segmentToEdge[Math.floor((lineHit.index || 0) / 2)];
+      }
+      if (hit) {
+        const node = nodeMeta[hit.index];
+        tooltip.textContent = `${node.title}\n${node.source}`;
+      } else if (hoveredLinkIndex >= 0) {
+        const edge = edgeMeta[hoveredLinkIndex];
+        tooltip.textContent = `${edge.linkKind || 'Memory'} link${edge.linkScore !== null && edge.linkScore !== undefined && Number.isFinite(Number(edge.linkScore)) ? ` · score ${Number(edge.linkScore).toFixed(2)}` : ''}`;
+      } else { tooltip.hidden = true; return; }
       tooltip.hidden = false;
       tooltip.style.left = `${event.clientX - rect.left + 12}px`;
       tooltip.style.top = `${event.clientY - rect.top + 12}px`;
     }
     renderer.domElement.addEventListener('pointermove', onPointerMove);
-    renderer.domElement.addEventListener('pointerleave', () => { tooltip.hidden = true; });
+    renderer.domElement.addEventListener('click', onPointerClick);
+    labels.domElement.addEventListener('click', onPointerClick);
+    const onOrbitPointerDown = (event) => { orbitPointerStart = [event.clientX, event.clientY]; };
+    const onOrbitPointerMove = (event) => {
+      if (orbitPointerStart && Math.hypot(event.clientX - orbitPointerStart[0], event.clientY - orbitPointerStart[1]) > 4) {
+        manualOrbitPaused = true;
+        focusMove = null;
+      }
+    };
+    const onOrbitPointerUp = () => { orbitPointerStart = null; };
+    labels.domElement.addEventListener('pointerdown', onOrbitPointerDown);
+    labels.domElement.addEventListener('pointermove', onOrbitPointerMove);
+    labels.domElement.addEventListener('pointerup', onOrbitPointerUp);
+    labels.domElement.addEventListener('pointercancel', onOrbitPointerUp);
+    const onPointerLeave = () => { tooltip.hidden = true; hoveredMemoryId = null; hoveredMemorySource = null; hoveredLinkIndex = -1; };
+    renderer.domElement.addEventListener('pointerleave', onPointerLeave);
 
     function resize() {
       const width = Math.max(1, host.clientWidth - (host.__brainGraphCollapsed ? 0 : Math.min(360, window.innerWidth * 0.92)));
@@ -406,6 +506,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
       camera.aspect = width / height; camera.updateProjectionMatrix();
       renderer.setSize(width, height); labels.setSize(width, height); composer.setSize(width, height);
       pointMat.uniforms.pixelRatio.value = renderer.getPixelRatio();
+      if (!manualOrbitPaused && initialized) fitView(true);
     }
     const observer = new ResizeObserver(resize);
     observer.observe(host); resize(); fitView(false);
@@ -476,14 +577,15 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
       for (const [key, draw] of edgeDraws) {
         const i = edgeIndex.get(key);
         if (i === undefined) { edgeDraws.delete(key); continue; }
+        const segment = edgeMeta[i].segmentStart;
         const t = Math.min(1, (now - draw.startedAt) / draw.duration);
         const b = draw.start.clone().lerp(draw.end, t);
         if (t < 1) {
-          draw.start.toArray(lineGeometry.attributes.position.array, i * 6);
-          b.toArray(lineGeometry.attributes.position.array, i * 6 + 3);
+          draw.start.toArray(lineGeometry.attributes.position.array, segment * 6);
+          b.toArray(lineGeometry.attributes.position.array, segment * 6 + 3);
         } else {
-          draw.start.toArray(lineGeometry.attributes.position.array, i * 6);
-          draw.end.toArray(lineGeometry.attributes.position.array, i * 6 + 3);
+          draw.start.toArray(lineGeometry.attributes.position.array, segment * 6);
+          draw.end.toArray(lineGeometry.attributes.position.array, segment * 6 + 3);
         }
         if (t >= 1) edgeDraws.delete(key);
       }
@@ -491,41 +593,59 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
       const lineColors = lineGeometry.attributes.baseColor.array;
       const lineAlpha = lineGeometry.attributes.baseAlpha.array;
       lineGlow.fill(0);
-      edgeMeta.forEach((edge, i) => {
-        edge.color.toArray(lineColors, i * 6);
-        edge.color.toArray(lineColors, i * 6 + 3);
-        lineAlpha[2 * i] = lineAlpha[2 * i + 1] = edge.memoryLink && !host.__brainLinksVisible ? 0 : edge.alpha;
+      edgeMeta.forEach((edge) => {
+        for (let localSegment = 0; localSegment < edge.segmentCount; localSegment++) {
+          const segment = edge.segmentStart + localSegment;
+          edge.color.toArray(lineColors, segment * 6);
+          edge.color.toArray(lineColors, segment * 6 + 3);
+          let alpha = edge.alpha;
+          if (hoveredMemoryId !== null) {
+            const ownMemoryEdge = edge.key === `memory:${hoveredMemoryId}` || edge.key === `anchor:${hoveredMemorySource}`;
+            const ownLinkEdge = edge.memoryLink && edge.linkMemoryIds.includes(hoveredMemoryId);
+            alpha = ownMemoryEdge ? 0.8 : ownLinkEdge ? 0.6 : edge.alpha * 0.4;
+          } else if (hoveredLinkIndex >= 0) alpha = edgeIndex.get(edge.key) === hoveredLinkIndex ? 0.6 : edge.alpha * 0.4;
+          lineAlpha[2 * segment] = lineAlpha[2 * segment + 1] = alpha;
+        }
       });
+      const brightenEdge = (edge, strength, color = null) => {
+        if (!edge) return;
+        for (let localSegment = 0; localSegment < edge.segmentCount; localSegment++) {
+          const segment = edge.segmentStart + localSegment;
+          lineGlow[2 * segment] = lineGlow[2 * segment + 1] = Math.max(lineGlow[2 * segment], strength);
+          if (color) {
+            color.toArray(lineColors, segment * 6);
+            color.toArray(lineColors, segment * 6 + 3);
+          }
+        }
+      };
       for (const event of events) {
         const elapsed = (now - event.startedAt) / 1000;
         const strength = Math.max(0, 1 - elapsed / (event.kind === 'retrieve' ? 2 : 1.5));
         for (const id of (event.kind === 'link' ? [event.aId, event.bId] : [event.memoryId])) {
           const i = edgeIndex.get(`memory:${id}`);
-          if (i !== undefined) { lineGlow[2 * i] = lineGlow[2 * i + 1] = Math.max(lineGlow[2 * i], 0.9 * strength); }
+          if (i !== undefined) brightenEdge(edgeMeta[i], 0.35 * strength);
         }
         if (event.kind !== 'link') {
           const anchorIndex = edgeIndex.get(`anchor:${event.source}`);
-          if (anchorIndex !== undefined) lineGlow[2 * anchorIndex] = lineGlow[2 * anchorIndex + 1] = Math.max(lineGlow[2 * anchorIndex], 1.05 * strength);
+          if (anchorIndex !== undefined) brightenEdge(edgeMeta[anchorIndex], 0.4 * strength);
         }
-        if (event.kind === 'link' && host.__brainLinksVisible) {
+        if (event.kind === 'link') {
           const i = edgeMeta.findIndex((edge) => edge.key.startsWith('link:') && (edge.key === `link:${event.linkId}`));
-          if (i >= 0) lineGlow[2 * i] = lineGlow[2 * i + 1] = (event.linkKind === 'semantic' ? 0.8 : 1.3) * strength;
+          if (i >= 0) brightenEdge(edgeMeta[i], 0.35 * strength);
         }
         if (event.kind === 'retrieve') for (const id of event.linkedIds) {
           const i = edgeIndex.get(`memory:${id}`);
           if (i !== undefined) {
-            lineGlow[2 * i] = lineGlow[2 * i + 1] = Math.max(lineGlow[2 * i], 1.1 * strength);
-            new THREE.Color('#ffffff').lerp(edgeMeta[i].color, 1 - strength).toArray(lineColors, i * 6);
-            new THREE.Color('#ffffff').lerp(edgeMeta[i].color, 1 - strength).toArray(lineColors, i * 6 + 3);
+            brightenEdge(edgeMeta[i], 0.4 * strength, new THREE.Color('#ffffff').lerp(edgeMeta[i].color, 1 - strength));
           }
           const linkedMemory = currentMemories.find((memory) => String(memory.id) === id);
           const anchorEdge = linkedMemory && edgeIndex.get(`anchor:${linkedMemory.source}`);
-          if (anchorEdge !== undefined) lineGlow[2 * anchorEdge] = lineGlow[2 * anchorEdge + 1] = Math.max(lineGlow[2 * anchorEdge], 1.1 * strength);
-          for (const link of host.__brainLinksVisible ? currentLinks : []) {
+          if (anchorEdge !== undefined) brightenEdge(edgeMeta[anchorEdge], 0.4 * strength);
+          for (const link of currentLinks) {
             const a = String(link.a_id), b = String(link.b_id);
             if ((a === event.memoryId && b === id) || (b === event.memoryId && a === id)) {
               const linkEdge = edgeIndex.get(`link:${String(link.id ?? `${a}-${b}`)}`);
-              if (linkEdge !== undefined) lineGlow[2 * linkEdge] = lineGlow[2 * linkEdge + 1] = Math.max(lineGlow[2 * linkEdge], 1.25 * strength);
+              if (linkEdge !== undefined) brightenEdge(edgeMeta[linkEdge], 0.5 * strength, new THREE.Color('#ffffff'));
             }
           }
         }
@@ -547,41 +667,52 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
       .brain-webgl,.brain-label-layer { position:absolute; inset:0; width:100%; height:100%; }
       .brain-label-layer { pointer-events:auto; overflow:hidden; right:0; }
       .brain-webgl { right:0; }
-      .brain-label-card { display:grid; grid-template-columns:8px auto; align-items:center; gap:2px 7px; padding:7px 9px; border:1px solid rgba(182,205,233,.24); border-radius:8px; color:#eaf0fa; background:rgba(8,13,24,.78); box-shadow:0 4px 16px rgba(0,0,0,.25); font:11px/1.2 system-ui,sans-serif; white-space:nowrap; }
-      .brain-label-dot { width:7px;height:7px;border-radius:50%;box-shadow:0 0 9px currentColor;grid-row:span 2; }
+      .brain-label-card { display:grid; grid-template-columns:8px auto; align-items:center; gap:2px 7px; padding:7px 9px; border:1px solid rgba(182,195,216,.24); border-radius:8px; color:#e5e7eb; background:rgba(11,16,32,.94); font:11px/1.2 system-ui,sans-serif; white-space:nowrap; }
+      .brain-label-dot { width:7px;height:7px;border-radius:50%;grid-row:span 2; }
       .brain-label-card strong { font-weight:600;text-transform:capitalize; }
       .brain-label-count { color:#aab8ca;font-size:9px; }
-      .brain-memory-tooltip { position:absolute;z-index:4;max-width:280px;padding:5px 8px;border:1px solid rgba(180,200,228,.24);border-radius:5px;color:#eef4ff;background:rgba(8,13,24,.95);font:11px/1.3 system-ui,sans-serif;pointer-events:none; }
+      .brain-memory-tooltip { position:absolute;z-index:4;max-width:280px;padding:7px 9px;border:1px solid rgba(180,200,228,.24);border-radius:6px;color:#eef4ff;background:rgba(11,16,32,.97);font:12px/1.4 system-ui,sans-serif;white-space:pre-line;pointer-events:none; }
       .brain-fit-button { position:absolute;z-index:5;right:18px;bottom:18px;padding:7px 12px;border:1px solid rgba(190,210,238,.24);border-radius:7px;color:#dce8f8;background:rgba(12,19,32,.86);font:11px/1 system-ui,sans-serif;cursor:pointer; }
       .brain-fit-button:hover { background:rgba(35,48,68,.96); }
-      .brain-links-toggle { position:absolute;z-index:5;right:18px;top:18px;display:flex;align-items:center;gap:2px;padding:4px 5px;border:1px solid rgba(190,210,238,.24);border-radius:7px;color:#dce8f8;background:rgba(12,19,32,.86);font:11px/1 system-ui,sans-serif; }
-      .brain-links-toggle span { padding:0 4px;color:#aab8ca; }
-      .brain-links-toggle button { padding:4px 7px;border:0;border-radius:4px;color:#aab8ca;background:transparent;font:inherit;cursor:pointer; }
-      .brain-links-toggle button[aria-pressed="true"] { color:#f0f6ff;background:rgba(90,117,153,.45); }
-      .brain-links-toggle button:hover { color:#fff; }
+      .brain-links-control { position:absolute;z-index:6;right:18px;top:18px;font:12px/1.4 system-ui,sans-serif; }
+      .brain-links-button { padding:7px 11px;border:1px solid rgba(190,210,238,.24);border-radius:7px;color:#dce8f8;background:rgba(11,16,32,.94);font:inherit;cursor:pointer; }
+      .brain-links-popover { position:absolute;top:calc(100% + 6px);right:0;width:250px;padding:11px;border:1px solid rgba(190,210,238,.25);border-radius:9px;color:#e5e7eb;background:#111827; }
+      .brain-links-popover[hidden] { display:none; }
+      .brain-link-master,.brain-link-options label { display:flex;align-items:center;gap:8px;min-height:30px;color:#d4dbe6;cursor:pointer; }
+      .brain-link-master { padding-bottom:7px;border-bottom:1px solid #1f2a44;font-weight:600; }
+      .brain-link-options { display:grid;padding:5px 0; }.brain-link-options input,.brain-link-master input { accent-color:#60a5fa; }
+      .brain-link-options b { margin-left:auto;color:#9ca3af;font-weight:500;font-variant-numeric:tabular-nums; }
+      .brain-link-swatch { width:21px;height:2px;background:rgba(255,255,255,.36); }
+      .brain-link-cap { display:block;color:#f0bf63;font-size:10px; }
+      .brain-legend { position:absolute;z-index:5;left:14px;bottom:14px;min-width:122px;padding:6px 9px;border:1px solid rgba(190,210,238,.2);border-radius:7px;color:#d1d8e2;background:rgba(11,16,32,.9);font:10px/1.5 system-ui,sans-serif; }
+      .brain-legend summary { cursor:pointer; }.brain-legend div { display:flex;align-items:center;gap:7px;padding:3px 0; }
+      .brain-legend-structural { width:20px;height:2px;background:#60a5fa; }.brain-legend-link { width:20px;height:2px;background:rgba(255,255,255,.3); }
     `;
     host.appendChild(style);
 
     return () => {
       cancelAnimationFrame(raf); observer.disconnect(); controls.dispose();
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
+      renderer.domElement.removeEventListener('pointerleave', onPointerLeave);
+      renderer.domElement.removeEventListener('click', onPointerClick);
+      labels.domElement.removeEventListener('click', onPointerClick);
+      labels.domElement.removeEventListener('pointerdown', onOrbitPointerDown);
+      labels.domElement.removeEventListener('pointermove', onOrbitPointerMove);
+      labels.domElement.removeEventListener('pointerup', onOrbitPointerUp);
+      labels.domElement.removeEventListener('pointercancel', onOrbitPointerUp);
       composer.dispose(); pointGeometry.dispose(); lineGeometry.dispose(); pointMat.dispose(); lineMat.dispose();
-      renderer.dispose(); labels.domElement.remove(); tooltip.remove(); fitButton.remove(); linksToggle.remove(); style.remove();
+      renderer.dispose(); labels.domElement.remove(); tooltip.remove(); fitButton.remove(); linksControl.remove(); legend.remove(); style.remove();
       delete host.__brainGraphRebuild;
       delete host.__brainGraphResize;
+      delete host.__brainGraphFit;
+      delete host.__brainGraphLinkState;
       for (const obj of Object.values(labelObjects)) obj.remove();
       host.replaceChildren();
     };
   }, []);
 
-  useEffect(() => {
-    const host = hostRef.current;
-    if (!host) return;
-    host.__brainLinksVisible = linksVisible;
-    host.__brainSetLinksVisible = onLinksVisibleChange;
-    const buttons = host.querySelectorAll('.brain-links-toggle button[data-visible]');
-    buttons.forEach((button) => button.setAttribute('aria-pressed', String((button.dataset.visible === 'true') === linksVisible)));
-  }, [linksVisible, onLinksVisibleChange]);
+  useEffect(() => { hostRef.current?.__brainGraphLinkState?.(linkVisibility, linkCounts); }, [linkVisibility, linkCounts, onLinkVisibilityChange]);
+  useEffect(() => { hostRef.current?.__brainGraphFit?.(); }, [fitRevision]);
 
   useEffect(() => {
     const host = hostRef.current;

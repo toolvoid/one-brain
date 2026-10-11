@@ -34,9 +34,21 @@ test('chat grants, stored memory ids, memory source, and chat deletion use the l
   try {
     const status = await db.initializeDatabase(userData, safeStorage);
     assert.equal(status.state, 'ready');
+    assert.deepEqual(db.listRecentImports(), []);
     const profile = db.saveChatGrant('openai', ['codex']);
     assert.equal(profile.client, 'chat:openai');
     assert.deepEqual(profile.allowedSources, ['codex']);
+    assert.equal(profile.write_source, 'chatgpt');
+    const geminiGrant = db.saveChatGrant('gemini', ['gemini']);
+    assert.equal(geminiGrant.write_source, 'gemini');
+    const claudeGrant = db.saveChatGrant('claude', ['claude']);
+    assert.equal(claudeGrant.write_source, 'claude');
+    const openRouterGrant = db.saveChatGrant('openrouter', [], 'claude');
+    assert.equal(openRouterGrant.write_source, 'claude');
+    const candidate = await db.addPendingMemory({ title: 'Gemini fact', content: 'Synthetic Gemini durable fact.', client: 'chat:gemini' });
+    assert.equal(candidate.added, true, 'save-back candidates should still reach review if embeddings are unavailable');
+    const savedPendingId = db.approvePendingMemory(candidate.id, 'Gemini fact', 'Synthetic Gemini durable fact.');
+    assert.equal(db.listMemories().find((item) => item.id === savedPendingId).source, 'gemini');
     const memory = db.addMemory({ source: 'chatgpt', title: 'Saved from Chat', content: 'Synthetic saved answer.' }, { event: false });
     const chatId = db.createChat('openai', 'mock-chat-model');
     db.appendChatMessage({ chat_id: chatId, role: 'assistant', content: memory.content, model: 'mock-chat-model', memory_ids: [memory.id] });

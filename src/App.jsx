@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import BrainGraph from './components/BrainGraph.jsx';
 import { MAX_IMPORT_ITEMS, isLogLikeChunk, parseImportText } from './lib/importers.js';
 import { isChatModel, memorySourceForProvider } from './lib/chat-models.mjs';
+import { DEFAULT_LINK_VISIBILITY, graphLinkCounts, visibleGraphLinks } from './lib/graph-links.mjs';
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 const SOURCE_COLORS = {
@@ -11,6 +12,41 @@ const SOURCE_COLORS = {
 };
 const EMPTY_COUNTS = Object.fromEntries(SOURCES.map((source) => [source, 0]));
 const PAGE_SIZE = 50;
+
+function ChannelNotice({ channel, loading, error, onRetry }) {
+  if (!loading && !error) return null;
+  return <div className="channel-load-notice" role={error ? 'alert' : 'status'}>
+    <span>{loading ? `Loading ${channel}…` : `Could not load ${channel}.`}</span>
+    {error && <button type="button" onClick={onRetry}>Retry</button>}
+  </div>;
+}
+
+function AccessiblePicker({ label, value, options, onChange, renderOption, searchable = false }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const root = useRef(null);
+  const filtered = options.filter((option) => String(option).toLowerCase().includes(query.toLowerCase()));
+  useEffect(() => {
+    if (!open) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') { setOpen(false); root.current?.querySelector('button')?.focus(); }
+      if (event.key === 'ArrowDown' && event.target.matches('[role=option]')) {
+        event.preventDefault(); const optionsInList = [...root.current.querySelectorAll('[role=option]')];
+        optionsInList[(optionsInList.indexOf(event.target) + 1) % optionsInList.length]?.focus();
+      }
+      if (event.key === 'ArrowUp' && event.target.matches('[role=option]')) {
+        event.preventDefault(); const optionsInList = [...root.current.querySelectorAll('[role=option]')];
+        optionsInList[(optionsInList.indexOf(event.target) - 1 + optionsInList.length) % optionsInList.length]?.focus();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [open]);
+  return <div className="accessible-picker" ref={root}>
+    <button type="button" aria-haspopup="listbox" aria-expanded={open} aria-label={label} onClick={() => setOpen((current) => !current)}>{renderOption ? renderOption(value) : value || `Choose ${label}`} <span aria-hidden="true">▾</span></button>
+    {open && <div className="accessible-picker-menu">{searchable && <input aria-label={`Search ${label}`} autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${label}`} />}<div role="listbox" aria-label={label}>{filtered.map((option) => <button role="option" aria-selected={option === value} type="button" key={option} onClick={() => { onChange(option); setOpen(false); }}>{renderOption ? renderOption(option) : option}</button>)}</div>{filtered.length === 0 && <small>No matches</small>}</div>}
+  </div>;
+}
 
 function SqlPanel({ title, children, sql }) {
   const [showSql, setShowSql] = useState(false);
@@ -115,7 +151,7 @@ function EvaluationPanel() {
   </section>;
 }
 
-const PROXY_PROVIDERS = ['openai', 'groq', 'deepseek', 'gemini', 'openrouter'];
+const PROXY_PROVIDERS = ['openai', 'groq', 'deepseek', 'gemini', 'openrouter', 'claude'];
 
 function ProviderKeysPanel({ clients }) {
   const [settings, setSettings] = useState(null);
@@ -148,7 +184,7 @@ function ProviderKeysPanel({ clients }) {
   </section>;
 }
 
-function PendingMemoryInbox({ items, onRefresh }) {
+function PendingMemoryInbox({ items, onRefresh, loading = false, loadError = false }) {
   const [editing, setEditing] = useState(null);
   const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
@@ -157,7 +193,8 @@ function PendingMemoryInbox({ items, onRefresh }) {
   async function reject(id) { await window.brain.rejectPendingMemory(id); await onRefresh(); }
   return <section className="pending-memory-inbox"><header><h2>Pending ({items.length})</h2><button type="button" onClick={() => void onRefresh()}>Refresh</button></header>
     {items.map((item) => <article key={item.id}><strong>{item.title}</strong><small>{item.client} · {dateLabel(item.created_at)}</small><p>{item.content}</p><footer><button type="button" onClick={() => void approve(item.id, item.title, item.content)}>Approve</button><button type="button" onClick={() => void edit(item)}>Edit</button><button type="button" onClick={() => void reject(item.id)}>Reject</button></footer></article>)}
-    {items.length === 0 && <p className="empty-note">No pending memory candidates.</p>}
+    <ChannelNotice channel="pending memories" loading={loading} error={loadError} onRetry={() => void onRefresh()} />
+    {!loading && !loadError && items.length === 0 && <p className="empty-note">No pending memory candidates.</p>}
     {editing && createPortal(<div className="modal-backdrop"><form className="add-modal" onSubmit={(event) => { event.preventDefault(); void approve(); }}><header><h2>Edit pending memory</h2><button type="button" onClick={() => setEditing(null)}>×</button></header><label>Title<input value={title} onChange={(event) => setTitle(event.target.value)} /></label><label>Content<textarea rows="6" value={content} onChange={(event) => setContent(event.target.value)} /></label><button className="save-button" type="submit">Approve edited memory</button></form></div>, document.body)}
   </section>;
 }
@@ -191,16 +228,29 @@ function dateLabel(value) {
   return new Date(`${value.replace(' ', 'T')}Z`).toLocaleString();
 }
 
-const CHAT_PROVIDERS = ['openai', 'groq', 'deepseek', 'gemini', 'openrouter'];
+function relativeDate(value) {
+  if (!value) return '';
+  const elapsed = Math.max(0, Date.now() - new Date(`${String(value).replace(' ', 'T')}Z`).getTime());
+  const minutes = Math.floor(elapsed / 60000);
+  if (minutes < 1) return 'now';
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return days < 30 ? `${days}d ago` : new Date(`${String(value).replace(' ', 'T')}Z`).toLocaleDateString();
+}
+
+const CHAT_PROVIDERS = ['openai', 'groq', 'deepseek', 'gemini', 'openrouter', 'claude'];
 const CHAT_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 
-function ChatView({ onBack, onOpenMemory, memoryTitles }) {
+function ChatView({ onBack, onManageProviders, onOpenMemory, memoryTitles }) {
   const [settings, setSettings] = useState(null);
   const [chats, setChats] = useState([]);
   const [activeId, setActiveId] = useState(null);
   const [provider, setProvider] = useState('openai');
   const [model, setModel] = useState('');
   const [models, setModels] = useState([]);
+  const [modelLoading, setModelLoading] = useState(false);
   const [modelsUpdatedAt, setModelsUpdatedAt] = useState(null);
   const [modelError, setModelError] = useState('');
   const [modelQuery, setModelQuery] = useState('');
@@ -210,45 +260,81 @@ function ChatView({ onBack, onOpenMemory, memoryTitles }) {
   const [draft, setDraft] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [chatLoading, setChatLoading] = useState(true);
+  const [chatLoadError, setChatLoadError] = useState(false);
   const [grantProvider, setGrantProvider] = useState('');
   const [grantStatus, setGrantStatus] = useState(null);
   const [grantSources, setGrantSources] = useState([]);
+  const [grantWriteSource, setGrantWriteSource] = useState('chatgpt');
   const [savingGrant, setSavingGrant] = useState(false);
+  const [providerKeyDraft, setProviderKeyDraft] = useState('');
+  const [savingProviderKey, setSavingProviderKey] = useState(false);
+  const [providerSettingsOpen, setProviderSettingsOpen] = useState(false);
   const [saveEditor, setSaveEditor] = useState(null);
   const [saveTitle, setSaveTitle] = useState('');
   const [saveContent, setSaveContent] = useState('');
   const [requestId, setRequestId] = useState('');
   const chatRef = useRef(null);
   const requestChatRef = useRef(null);
+  const modelRequestRef = useRef(0);
   const activeChat = chats.find((chat) => chat.id === activeId) || null;
   const availableProviders = CHAT_PROVIDERS.filter((item) => settings?.providerKeyStatus?.[item]);
   const visibleModels = models.filter((id) => (showAllModels || isChatModel(id)) && id.toLowerCase().includes(modelQuery.toLowerCase()));
 
   async function refreshChats(selectId) {
-    const next = await window.brain.listChats();
-    setChats(next);
-    if (selectId) setActiveId(selectId);
+    setChatLoading(true); setChatLoadError(false);
+    try {
+      const next = await window.brain.listChats();
+      setChats(next);
+      if (selectId) setActiveId(selectId);
+      return next;
+    } catch {
+      setChatLoadError(true);
+      throw new Error('Could not load saved chats.');
+    } finally { setChatLoading(false); }
   }
   async function loadModels(nextProvider, refresh = false, preferred = '') {
     if (!nextProvider) return;
-    setProvider(nextProvider); setModelError(''); setModels([]); setModelsUpdatedAt(null);
+    const request = ++modelRequestRef.current;
+    setProvider(nextProvider); setModelError(''); setModels([]); setModelsUpdatedAt(null); setModelLoading(true);
     const remembered = localStorage.getItem(`onebrain-chat-model:${nextProvider}`) || '';
     try {
       const result = await window.brain.listChatModels(nextProvider, refresh);
+      if (request !== modelRequestRef.current) return;
       setModels(result.ids); setModelsUpdatedAt(result.updatedAt);
       setModel(preferred && result.ids.includes(preferred) ? preferred : remembered && result.ids.includes(remembered) ? remembered : result.ids.find(isChatModel) || result.ids[0] || '');
-    } catch (reason) { setModelError(reason.message || 'Could not load models.'); setModel(preferred || remembered); }
+      setModelLoading(false);
+    } catch (reason) { if (request === modelRequestRef.current) { setModelError(reason.message || 'Could not load models.'); setModel(preferred || remembered); setModelLoading(false); } }
+  }
+  async function saveChatProviderKey() {
+    if (!providerKeyDraft.trim()) { setModelError('Paste the provider API key first.'); return; }
+    setSavingProviderKey(true); setModelError('');
+    try {
+      await window.brain.saveProviderKey(provider, providerKeyDraft);
+      setProviderKeyDraft('');
+      const next = await window.brain.getMemoryProxySettings();
+      setSettings(next);
+      await loadModels(provider, true);
+      return true;
+    } catch (reason) { setModelError(reason.message || `Could not save the ${provider} key.`); return false; }
+    finally { setSavingProviderKey(false); }
   }
   useEffect(() => {
     let alive = true;
-    Promise.all([window.brain.getMemoryProxySettings(), window.brain.listChats()]).then(([proxySettings, existing]) => {
+    Promise.allSettled([window.brain.getMemoryProxySettings(), window.brain.listChats()]).then(([settingsResult, chatsResult]) => {
       if (!alive) return;
-      setSettings(proxySettings); setChats(existing);
-      const nextProviders = CHAT_PROVIDERS.filter((item) => proxySettings.providerKeyStatus?.[item]);
+      const proxySettings = settingsResult.status === 'fulfilled' ? settingsResult.value : null;
+      const existing = chatsResult.status === 'fulfilled' ? chatsResult.value : [];
+      if (proxySettings) setSettings(proxySettings);
+      if (chatsResult.status === 'fulfilled') setChats(existing);
+      else setError(chatsResult.reason?.message || 'Could not load saved chats.');
+      setChatLoading(false);
+      const nextProviders = CHAT_PROVIDERS.filter((item) => proxySettings?.providerKeyStatus?.[item]);
       if (existing[0]) { setActiveId(existing[0].id); setProvider(existing[0].provider); setModel(existing[0].model); void loadModels(existing[0].provider, false, existing[0].model); }
       else if (nextProviders[0]) void loadModels(nextProviders[0]);
-    }).catch((reason) => { if (alive) setError(reason.message || 'Chat is unavailable.'); });
-    return () => { alive = false; };
+      else if (settingsResult.status === 'rejected') setError(settingsResult.reason?.message || 'Could not load provider settings.');
+    });
+    return () => { alive = false; modelRequestRef.current += 1; };
   }, []);
   useEffect(() => window.brain.onChatChunk(({ requestId: id, chunk }) => {
     if (id !== chatRef.current) return;
@@ -261,7 +347,7 @@ function ChatView({ onBack, onOpenMemory, memoryTitles }) {
   async function createNewChat() {
     if (!provider || !model.trim()) { setModelError('Choose or enter a model first.'); return; }
     let grant = await window.brain.getChatGrant(provider);
-    if (!grant) { setGrantProvider(provider); setGrantStatus(null); setGrantSources([]); return; }
+    if (!grant) { setGrantProvider(provider); setGrantStatus(null); setGrantSources([]); setGrantWriteSource(memorySourceForProvider(provider) || 'chatgpt'); return; }
     await openNew(grant, provider);
   }
   async function openNew(grant, targetProvider = provider) {
@@ -273,7 +359,7 @@ function ChatView({ onBack, onOpenMemory, memoryTitles }) {
   async function saveGrant() {
     setSavingGrant(true);
     try {
-      await window.brain.saveChatGrant(grantProvider, grantSources);
+      await window.brain.saveChatGrant(grantProvider, grantSources, grantWriteSource);
       const providerToContinue = grantProvider;
       setGrantProvider('');
       if (grantStatus) { await window.brain.updateChat(grantStatus.id, { use_memory: true }); await refreshChats(grantStatus.id); }
@@ -294,7 +380,7 @@ function ChatView({ onBack, onOpenMemory, memoryTitles }) {
   async function toggleMemory(value) {
     if (!activeChat) return;
     if (value && !(await window.brain.getChatGrant(activeChat.provider))) {
-      setGrantProvider(activeChat.provider); setGrantStatus(activeChat); setGrantSources([]); return;
+      setGrantProvider(activeChat.provider); setGrantStatus(activeChat); setGrantSources([]); setGrantWriteSource(memorySourceForProvider(activeChat.provider) || 'chatgpt'); return;
     }
     await window.brain.updateChat(activeChat.id, { use_memory: value }); await refreshChats(activeChat.id);
   }
@@ -327,19 +413,17 @@ function ChatView({ onBack, onOpenMemory, memoryTitles }) {
     catch (reason) { setError(reason.message || 'Could not save memory.'); }
   }
   const mappedSource = (item) => memorySourceForProvider(item.provider);
+  const newChatModelControl = modelLoading ? <span className="model-loading">Loading models…</span> : models.length > 0 && !modelError
+    ? <AccessiblePicker label="model" value={model} options={visibleModels} searchable renderOption={(item) => item} onChange={selectNewModel} />
+    : <input aria-label="Model name" value={model} onChange={(event) => selectNewModel(event.target.value)} placeholder="Type a model id" />;
   return <section className="chat-view">
     <header className="chat-topbar"><button className="back-button" type="button" onClick={onBack}>‹</button><div><h1>Chat</h1><p>Conversations are stored locally in your encrypted database.</p></div></header>
-    <div className="chat-layout"><aside className="chat-list"><div className="chat-new-box"><strong>New chat</strong><label>Provider<select value={provider} onChange={(event) => { setActiveId(null); void loadModels(event.target.value); }}>{availableProviders.map((item) => <option key={item}>{item}</option>)}</select></label>
-      <label>Model{models.length && !modelError ? <div className="model-picker"><button type="button" onClick={() => setModelPickerOpen((value) => !value)}>{model || 'Choose model'} ▾</button>{modelPickerOpen && <div className="model-menu"><input value={modelQuery} onChange={(event) => setModelQuery(event.target.value)} placeholder="Search models" />{visibleModels.map((item) => <button type="button" key={item} onClick={() => { selectNewModel(item); setModelPickerOpen(false); }}>{item}</button>)}{visibleModels.length === 0 && <small>No models match.</small>}</div>}</div> : <input value={model} onChange={(event) => selectNewModel(event.target.value)} placeholder="Type a model id" />}</label>
-      {models.length > 0 && !modelError && <><label className="chat-toggle"><input type="checkbox" checked={showAllModels} onChange={(event) => setShowAllModels(event.target.checked)} />Show all models</label><div className="model-refresh"><button type="button" onClick={() => void loadModels(provider, true)}>Refresh</button><small>{modelsUpdatedAt ? `Updated ${new Date(modelsUpdatedAt).toLocaleString()}` : ''}</small></div></>}
-      {(modelError || error) && <p className="chat-error">{modelError || error}</p>}<button className="chat-create" type="button" onClick={() => void createNewChat()} disabled={!availableProviders.length}>New chat</button></div>
-      <div className="chat-list-items">{chats.map((chat) => <article className={chat.id === activeId ? 'is-active' : ''} key={chat.id}><button type="button" className="chat-select" onClick={() => void selectChat(chat)}><small>{chat.provider}</small><strong>{chat.title}</strong></button><button type="button" title="Rename chat" onClick={() => void renameChat(chat)}>✎</button><button type="button" title="Delete chat" onClick={() => void removeChat(chat)}>×</button></article>)}{chats.length === 0 && <p className="empty-note">No chats yet.</p>}</div></aside>
-      <section className="chat-conversation">{activeChat ? <><header className="chat-controls"><div><span className="chat-provider-badge">{activeChat.provider}</span><input aria-label="Chat title" value={activeChat.title} onChange={(event) => { setChats((items) => items.map((item) => item.id === activeChat.id ? { ...item, title: event.target.value } : item)); }} onBlur={() => void window.brain.updateChat(activeChat.id, { title: activeChat.title })} /></div><label className="chat-toggle"><input type="checkbox" checked={Boolean(activeChat.use_memory)} onChange={(event) => void toggleMemory(event.target.checked)} />Use memory</label><label className="chat-toggle"><input type="checkbox" checked={Boolean(activeChat.suggest_memories)} onChange={async (event) => { await window.brain.updateChat(activeChat.id, { suggest_memories: event.target.checked }); await refreshChats(activeChat.id); }} />Suggest memories after answers</label><label className="chat-model-inline">Model{models.length && !modelError ? <div className="model-picker"><button type="button" onClick={() => setChatModelPickerOpen((value) => !value)}>{activeChat.model} ▾</button>{chatModelPickerOpen && <div className="model-menu"><input value={modelQuery} onChange={(event) => setModelQuery(event.target.value)} placeholder="Search models" />{visibleModels.map((item) => <button type="button" key={item} onClick={() => { void changeModel(item); setChatModelPickerOpen(false); }}>{item}</button>)}</div>}</div> : <input value={model} onChange={(event) => setModel(event.target.value)} onBlur={() => void changeModel(model)} />}</label></header>
-        <div className="chat-messages">{activeChat.messages.map((message) => <article className={`chat-message ${message.role}`} key={message.id}><div className="chat-message-head"><strong>{message.role === 'assistant' ? activeChat.provider : 'You'}</strong>{message.model && <small>{message.model}</small>}</div><p>{message.content}</p><div className="chat-message-actions"><button type="button" onClick={() => { setSaveTitle(''); setSaveContent(message.content); setSaveEditor({ message, source: mappedSource(activeChat.provider) || '' }); }}>Save</button>{message.role === 'assistant' && <details><summary>Memories used ({message.memory_ids?.length || 0})</summary><ul>{message.memory_ids.map((memoryId) => <li key={memoryId}><button type="button" onClick={() => onOpenMemory(memoryId)}>{memoryTitles[memoryId] || `Memory #${memoryId}`}</button></li>)}</ul></details>}</div></article>)}{activeChat.messages.length === 0 && <p className="chat-empty">Send a message to start this conversation.</p>}</div>
-        {error && <p className="chat-error chat-error-line" role="alert">{error}</p>}<form className="chat-compose" onSubmit={(event) => void send(event)}><textarea value={draft} onChange={(event) => setDraft(event.target.value)} rows="3" placeholder="Message" disabled={busy} /><div><small>Sent to {activeChat.provider} using the selected model.</small>{busy && <button type="button" onClick={() => void stop()}>Stop</button>}<button type="submit" disabled={busy || !draft.trim()}>Send</button></div></form>
-      </> : <div className="chat-empty">{availableProviders.length ? 'Choose a chat or create a new one.' : 'Save a provider key in Connect AI to start chatting.'}</div>}</section></div>
-    {grantProvider && <div className="modal-backdrop"><section className="chat-grant-modal"><header><h2>Allow {grantProvider} to read memories?</h2><button type="button" onClick={() => setGrantProvider('')}>×</button></header><p>Memory text you select here may be sent to {grantProvider} when you use memory in Chat. Private memories are never sent.</p>{CHAT_SOURCES.map((source) => <label className="chat-toggle" key={source}><input type="checkbox" checked={grantSources.includes(source)} onChange={(event) => setGrantSources((items) => event.target.checked ? [...items, source] : items.filter((item) => item !== source))} />{source}</label>)}<footer><button type="button" onClick={() => setGrantProvider('')}>Cancel</button><button type="button" disabled={savingGrant} onClick={() => void saveGrant()}>{savingGrant ? 'Saving…' : 'Save permissions'}</button></footer></section></div>}
-    {saveEditor && <div className="modal-backdrop"><form className="chat-grant-modal" onSubmit={(event) => { event.preventDefault(); void saveMemory(); }}><header><h2>Save as memory</h2><button type="button" onClick={() => setSaveEditor(null)}>×</button></header>{!saveEditor.source && <label>Memory source<select value={saveEditor.source} onChange={(event) => setSaveEditor({ ...saveEditor, source: event.target.value })}>{CHAT_SOURCES.map((source) => <option key={source}>{source}</option>)}</select></label>}<label>Title<input value={saveTitle} onChange={(event) => setSaveTitle(event.target.value)} /></label><label>Text<textarea rows="7" value={saveContent} onChange={(event) => setSaveContent(event.target.value)} /></label><footer><button type="button" onClick={() => setSaveEditor(null)}>Cancel</button><button type="submit" disabled={!saveEditor.source || !saveContent.trim()}>Save memory</button></footer></form></div>}
+    <div className="chat-layout"><aside className="chat-list"><button className="chat-create chat-new-button" type="button" onClick={() => { setActiveId(null); setError(''); }}>＋ New chat</button>
+      <div className="chat-list-items"><ChannelNotice channel="saved chats" loading={chatLoading} error={chatLoadError} onRetry={() => void refreshChats()} />{!chatLoading && !chatLoadError && chats.map((chat) => <article className={chat.id === activeId ? 'is-active' : ''} key={chat.id}><button type="button" className="chat-select" onClick={() => void selectChat(chat)}><small>{chat.provider}</small><strong>{chat.title}</strong></button><button type="button" title="Rename chat" onClick={() => void renameChat(chat)}>✎</button><button type="button" title="Delete chat" onClick={() => void removeChat(chat)}>×</button></article>)}{!chatLoading && !chatLoadError && chats.length === 0 && <p className="empty-note">No chats yet.</p>}</div></aside>
+      <section className="chat-conversation">{activeChat ? <><header className="chat-controls"><div><span className="chat-provider-badge">{activeChat.provider}</span><input aria-label="Chat title" value={activeChat.title} onChange={(event) => { setChats((items) => items.map((item) => item.id === activeChat.id ? { ...item, title: event.target.value } : item)); }} onBlur={() => void window.brain.updateChat(activeChat.id, { title: activeChat.title })} /></div><label className="chat-toggle"><input type="checkbox" checked={Boolean(activeChat.use_memory)} onChange={(event) => void toggleMemory(event.target.checked)} />Use memory</label><label className="chat-toggle"><input type="checkbox" checked={Boolean(activeChat.suggest_memories)} onChange={async (event) => { await window.brain.updateChat(activeChat.id, { suggest_memories: event.target.checked }); await refreshChats(activeChat.id); }} />Suggest memories after answers</label><label className="chat-model-inline">Model{models.length && !modelError ? <AccessiblePicker label="model" value={activeChat.model} options={visibleModels} searchable renderOption={(item) => item} onChange={(item) => void changeModel(item)} /> : <input aria-label="Model name" value={model} onChange={(event) => setModel(event.target.value)} onBlur={() => void changeModel(model)} />}</label><label className="chat-toggle"><input type="checkbox" checked={showAllModels} onChange={(event) => setShowAllModels(event.target.checked)} />Show all models</label><div className="model-refresh"><button type="button" onClick={() => void loadModels(activeChat.provider, true)}>Refresh</button><small>{modelsUpdatedAt ? `Updated ${new Date(modelsUpdatedAt).toLocaleString()}` : ''}</small></div><button type="button" className="chat-manage-keys" onClick={() => setProviderSettingsOpen(true)}>Provider settings</button></header><div className="chat-messages">{activeChat.messages.map((message) => <article className={`chat-message ${message.role}`} key={message.id}><div className="chat-message-head"><strong>{message.role === 'assistant' ? activeChat.provider : 'You'}</strong>{message.model && <small>{message.model}</small>}</div><p>{message.content}</p><div className="chat-message-actions"><button type="button" onClick={() => { setSaveTitle(''); setSaveContent(message.content); setSaveEditor({ message, source: mappedSource(activeChat.provider) || '' }); }}>Save</button>{message.role === 'assistant' && <details><summary>Memories used ({message.memory_ids?.length || 0})</summary><ul>{message.memory_ids.map((memoryId) => <li key={memoryId}><button type="button" onClick={() => onOpenMemory(memoryId)}>{memoryTitles[memoryId] || `Memory #${memoryId}`}</button></li>)}</ul></details>}</div></article>)}{activeChat.messages.length === 0 && <p className="chat-empty">Send a message to start this conversation.</p>}</div>{error && <p className="chat-error chat-error-line" role="alert">{error}</p>}<form className="chat-compose" onSubmit={(event) => void send(event)}><textarea value={draft} onChange={(event) => setDraft(event.target.value)} rows="3" placeholder="Message" disabled={busy} /><div><small>Sent to {activeChat.provider} using the selected model.</small>{busy && <button type="button" onClick={() => void stop()}>Stop</button>}<button type="submit" disabled={busy || !draft.trim()}>Send</button></div></form></> : <><header className="chat-controls new-chat-controls"><div className="new-chat-provider"><span className="chat-provider-badge">New chat</span><AccessiblePicker label="provider" value={provider} options={CHAT_PROVIDERS} renderOption={(item) => <span className={settings?.providerKeyStatus?.[item] ? 'provider-option saved' : 'provider-option missing'}>{item[0].toUpperCase() + item.slice(1)} <small>{settings?.providerKeyStatus?.[item] ? 'key saved' : 'add key'}</small></span>} onChange={(nextProvider) => { setModelError(''); setModels([]); setProviderKeyDraft(''); setProvider(nextProvider); if (settings?.providerKeyStatus?.[nextProvider]) void loadModels(nextProvider); }} />{!settings?.providerKeyStatus?.[provider] && <button type="button" onClick={() => setProviderSettingsOpen(true)}>Add key</button>}</div><label className="chat-model-inline">Model{newChatModelControl}</label>{models.length > 0 && !modelError && <><label className="chat-toggle"><input type="checkbox" checked={showAllModels} onChange={(event) => setShowAllModels(event.target.checked)} />Show all models</label><div className="model-refresh"><button type="button" onClick={() => void loadModels(provider, true)}>Refresh</button><small>{modelsUpdatedAt ? `Updated ${new Date(modelsUpdatedAt).toLocaleString()}` : ''}</small></div></>}{modelError && <p className="chat-error">{modelError}</p>}<button type="button" className="chat-create" onClick={() => void createNewChat()} disabled={!settings?.providerKeyStatus?.[provider] || modelLoading || !model.trim()}>Start conversation</button><button type="button" className="chat-manage-keys" onClick={() => setProviderSettingsOpen(true)}>Provider settings</button></header>{error && <p className="chat-error chat-error-line" role="alert">{error}</p>}<div className="chat-empty">{chatLoading ? 'Loading saved chats…' : chatLoadError ? 'Could not load saved chats. Retry from the chat list.' : 'Choose a provider and model, then start a conversation.'}</div></>}</section></div>
+    {grantProvider && <div className="modal-backdrop"><section className="chat-grant-modal"><header><h2>Allow {grantProvider} to read memories?</h2><button type="button" onClick={() => setGrantProvider('')}>×</button></header><p>Memory text you select here may be sent to {grantProvider} when you use memory in Chat. Private memories are never sent.</p>{CHAT_SOURCES.map((source) => <label className="chat-toggle" key={source}><input type="checkbox" checked={grantSources.includes(source)} onChange={(event) => setGrantSources((items) => event.target.checked ? [...items, source] : items.filter((item) => item !== source))} />{source}</label>)}{grantProvider === 'openrouter' && <label>Save suggested memories under<AccessiblePicker label="memory source" value={grantWriteSource} options={CHAT_SOURCES} onChange={setGrantWriteSource} /></label>}<footer><button type="button" onClick={() => setGrantProvider('')}>Cancel</button><button type="button" disabled={savingGrant} onClick={() => void saveGrant()}>{savingGrant ? 'Saving…' : 'Save permissions'}</button></footer></section></div>}
+    {providerSettingsOpen && <div className="modal-backdrop"><section className="chat-grant-modal" role="dialog" aria-modal="true" aria-label="Provider settings"><header><h2>Provider settings</h2><button type="button" onClick={() => setProviderSettingsOpen(false)}>×</button></header><label>Provider<AccessiblePicker label="provider" value={provider} options={CHAT_PROVIDERS} renderOption={(item) => <span className="provider-option">{item[0].toUpperCase() + item.slice(1)}</span>} onChange={(item) => { setProvider(item); setProviderKeyDraft(''); setModelError(''); }} /></label><label>{settings?.providerKeyStatus?.[provider] ? `Replace ${provider} key` : `Add ${provider} key`}<input type="password" autoComplete="new-password" value={providerKeyDraft} onChange={(event) => setProviderKeyDraft(event.target.value)} placeholder="Provider API key" /></label>{modelError && <p className="chat-error">{modelError}</p>}<footer><button type="button" onClick={() => setProviderSettingsOpen(false)}>Close</button><button type="button" disabled={!providerKeyDraft.trim() || savingProviderKey} onClick={async () => { if (await saveChatProviderKey()) setProviderSettingsOpen(false); }}>{savingProviderKey ? 'Saving…' : 'Save key'}</button></footer></section></div>}
+    {saveEditor && <div className="modal-backdrop"><form className="chat-grant-modal" onSubmit={(event) => { event.preventDefault(); void saveMemory(); }}><header><h2>Save as memory</h2><button type="button" onClick={() => setSaveEditor(null)}>×</button></header>{!saveEditor.source && <label>Memory source<AccessiblePicker label="memory source" value={saveEditor.source || CHAT_SOURCES[0]} options={CHAT_SOURCES} onChange={(source) => setSaveEditor({ ...saveEditor, source })} /></label>}<label>Title<input value={saveTitle} onChange={(event) => setSaveTitle(event.target.value)} /></label><label>Text<textarea rows="7" value={saveContent} onChange={(event) => setSaveContent(event.target.value)} /></label><footer><button type="button" onClick={() => setSaveEditor(null)}>Cancel</button><button type="submit" disabled={!saveEditor.source || !saveContent.trim()}>Save memory</button></footer></form></div>}
   </section>;
 }
 
@@ -386,8 +470,18 @@ function App() {
   const [rejectedLinks, setRejectedLinks] = useState([]);
   const [counts, setCounts] = useState(EMPTY_COUNTS);
   const [dataReady, setDataReady] = useState(false);
+  const [dataLoadError, setDataLoadError] = useState('');
+  const [channelStates, setChannelStates] = useState({});
+  const [pendingLoading, setPendingLoading] = useState(false);
+  const [pendingLoadError, setPendingLoadError] = useState(false);
+  const [insightsLoading, setInsightsLoading] = useState(false);
+  const [insightsLoadError, setInsightsLoadError] = useState(false);
+  const [embeddingRetrying, setEmbeddingRetrying] = useState(false);
+  const [mcpConfigLoading, setMcpConfigLoading] = useState(true);
+  const [mcpConfigError, setMcpConfigError] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [linksVisible, setLinksVisible] = useState(true);
+  const [linkVisibility, setLinkVisibility] = useState(DEFAULT_LINK_VISIBILITY);
+  const [graphFitRevision, setGraphFitRevision] = useState(0);
   const [suggestionsOpen, setSuggestionsOpen] = useState(false);
   const [rejectedOpen, setRejectedOpen] = useState(false);
   const [suggestionToast, setSuggestionToast] = useState(false);
@@ -427,7 +521,6 @@ function App() {
   const [pendingImportPulse, setPendingImportPulse] = useState(null);
   const [embeddingStatus, setEmbeddingStatus] = useState({ state: 'loading' });
   const [databaseStatus, setDatabaseStatus] = useState({ writable: true, message: '' });
-  const [showSemanticLinks, setShowSemanticLinks] = useState(true);
   const [connectOpen, setConnectOpen] = useState(false);
   const [pendingOpen, setPendingOpen] = useState(false);
   const [pendingMemories, setPendingMemories] = useState([]);
@@ -474,39 +567,92 @@ function App() {
   }, [links, memories, selectedMemory]);
   const relatedMemories = linkedMemories.filter(({ link }) => link.kind === 'semantic');
   const regularLinkedMemories = linkedMemories.filter(({ link }) => link.kind !== 'semantic');
-  const visibleGraphLinks = useMemo(() => links.filter((link) => link.kind !== 'semantic' || (showSemanticLinks && links.length <= 3000)), [links, showSemanticLinks]);
+  const graphLinks = useMemo(() => visibleGraphLinks(links, linkVisibility), [links, linkVisibility]);
+  const graphLinkCountValues = useMemo(() => graphLinkCounts(links), [links]);
   const rejectedPairKeys = useMemo(() => new Set(rejectedLinks.map((row) => `${row.a_id}:${row.b_id}`)), [rejectedLinks]);
 
-  async function refreshData() {
-    const [savedMemories, savedCounts, savedLinks, savedSuggestions, savedRejected, savedImports, cleanupStatus] = await Promise.all([
-      window.brain.listMemories(), window.brain.countBySource(), window.brain.listLinks(), window.brain.listSuggestions(), window.brain.listRejected(), window.brain.listRecentImports?.() || Promise.resolve([]), window.brain.getLegacyCleanupStatus?.() || Promise.resolve({ count: 0, backupPath: null, error: '' })
-    ]);
+  function setChannelState(channel, state) {
+    setChannelStates((previous) => ({ ...previous, [channel]: state }));
+  }
+
+  async function loadIpcChannel(channel, load) {
+    setChannelState(channel, 'loading');
+    try {
+      const result = await load();
+      setChannelState(channel, 'ready');
+      return result;
+    } catch {
+      setChannelState(channel, 'error');
+      throw new Error(`Could not load ${channel}.`);
+    }
+  }
+
+  async function retryChannel(channel) {
+    if (channel === 'connected AI clients') return refreshClients();
+    if (channel === 'connector settings') return refreshConnectors();
+    if (channel === 'database status') {
+      try { const status = await loadIpcChannel(channel, () => window.brain.getDatabaseStatus()); setDatabaseStatus(status); }
+      catch {}
+      return;
+    }
+    if (channel === 'embedding status') return retryEmbedding();
+    return refreshData().catch(() => {});
+  }
+
+  async function loadDashboardData() {
+    const savedMemories = await loadIpcChannel('memory list', () => window.brain.listMemories());
     setMemories(savedMemories);
-    setLinks(savedLinks);
-    setSuggestions(savedSuggestions);
-    setRejectedLinks(savedRejected);
-    setRecentImports(savedImports);
-    setLegacyCleanupStatus(cleanupStatus);
-    setCounts({ ...EMPTY_COUNTS, ...savedCounts });
+    const channels = [
+      ['source counts', () => window.brain.countBySource()],
+      ['graph data', () => window.brain.listLinks()],
+      ['suggestions', () => window.brain.listSuggestions()],
+      ['rejected links', () => window.brain.listRejected()],
+      ['imports list', () => window.brain.listRecentImports?.() || Promise.resolve([])],
+      ['cleanup status', () => window.brain.getLegacyCleanupStatus?.() || Promise.resolve({ count: 0, backupPath: null, error: '' })]
+    ];
+    const tasks = await Promise.allSettled(channels.map(([name, load]) => loadIpcChannel(name, load)));
+    const defaults = [EMPTY_COUNTS, [], [], [], [], { count: 0, backupPath: null, error: '' }];
+    const values = tasks.map((task, index) => task.status === 'fulfilled' ? task.value : defaults[index]);
+    const [savedCounts, savedLinks, savedSuggestions, savedRejected, savedImports, cleanupStatus] = values;
+    setLinks(savedLinks); setSuggestions(savedSuggestions); setRejectedLinks(savedRejected);
+    setRecentImports(savedImports); setLegacyCleanupStatus(cleanupStatus); setCounts({ ...EMPTY_COUNTS, ...savedCounts });
+    setDataLoadError('');
     return { savedMemories, savedLinks, savedCounts };
   }
 
+  async function refreshData() {
+    try { return await loadDashboardData(); }
+    catch (error) {
+      setDataLoadError(error.message || 'Could not read the local memory database.');
+      throw error;
+    }
+  }
+
   async function refreshClients() {
-    const savedClients = await window.brain.listClients();
-    setClients(savedClients);
-    return savedClients;
+    const savedClients = await loadIpcChannel('connected AI clients', () => window.brain.listClients());
+    setClients(savedClients); return savedClients;
   }
 
   async function refreshPendingMemories() {
-    const items = await window.brain.listPendingMemories();
-    setPendingMemories(items);
-    return items;
+    setPendingLoading(true); setPendingLoadError(false);
+    try {
+      const items = await window.brain.listPendingMemories();
+      setPendingMemories(items);
+      return items;
+    } catch { setPendingLoadError(true); throw new Error('Could not load pending memories.'); }
+    finally { setPendingLoading(false); }
   }
 
   async function refreshConnectors() {
-    const rows = await window.brain.listConnectors();
-    setConnectorCards(rows);
-    return rows;
+    const rows = await loadIpcChannel('connector settings', () => window.brain.listConnectors());
+    setConnectorCards(rows); return rows;
+  }
+
+  async function refreshMcpConfig() {
+    setMcpConfigLoading(true); setMcpConfigError(false);
+    try { setMcpConfig(await window.brain.getMcpConfig()); }
+    catch { setMcpConfigError(true); }
+    finally { setMcpConfigLoading(false); }
   }
 
   async function previewConnector(client) {
@@ -558,7 +704,7 @@ function App() {
 
   function openConnectSettings() {
     setConnectOpen(true);
-    void refreshConnectors();
+    void refreshConnectors().catch(() => {});
     void refreshClients().then((rows) => {
       const pending = rows.find((client) => client.status === 'pending');
       if (pending && !pendingClient) {
@@ -566,7 +712,7 @@ function App() {
         setPendingReadSources([]);
         setPendingWriteSource(SOURCES[2]);
       }
-    });
+    }).catch(() => {});
   }
 
   async function handleApproveClient() {
@@ -623,8 +769,17 @@ function App() {
   async function openInsights() {
     setChatOpen(false);
     setInsightsOpen(true);
-    try { setInsightsData(await window.brain.getInsights()); }
-    catch (error) { setInsightsData({}); setSqlResult({ error: error.message || 'Could not load insights.' }); }
+    setInsightsLoading(true); setInsightsLoadError(true); setInsightsData(null);
+    try { setInsightsData(await window.brain.getInsights()); setInsightsLoadError(false); }
+    catch { setInsightsLoadError(true); }
+    finally { setInsightsLoading(false); }
+  }
+
+  async function retryEmbedding() {
+    setEmbeddingRetrying(true);
+    try { await window.brain.retryEmbedding(); setEmbeddingStatus({ state: 'loading' }); }
+    catch { setEmbeddingStatus({ state: 'error', message: 'Could not restart the local semantic model.' }); }
+    finally { setEmbeddingRetrying(false); }
   }
 
   async function resetRetrievalCounts() {
@@ -643,16 +798,13 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    window.brain.getDatabaseStatus().then((status) => { if (active) setDatabaseStatus(status); }).catch(() => {});
-    Promise.all([window.brain.listMemories(), window.brain.countBySource(), window.brain.listLinks(), window.brain.listSuggestions(), window.brain.listRejected(), window.brain.listRecentImports?.() || Promise.resolve([]), window.brain.getLegacyCleanupStatus?.() || Promise.resolve({ count: 0, backupPath: null, error: '' })]).then(([savedMemories, savedCounts, savedLinks, savedSuggestions, savedRejected, savedImports, cleanupStatus]) => {
+    loadIpcChannel('database status', () => window.brain.getDatabaseStatus()).then((status) => { if (active) setDatabaseStatus(status); }).catch(() => {});
+    loadDashboardData().then(() => {
       if (!active) return;
-      setMemories(savedMemories);
-      setCounts({ ...EMPTY_COUNTS, ...savedCounts });
-      setLinks(savedLinks);
-      setSuggestions(savedSuggestions);
-      setRejectedLinks(savedRejected);
-      setRecentImports(savedImports);
-      setLegacyCleanupStatus(cleanupStatus);
+      setDataReady(true);
+    }).catch((error) => {
+      if (!active) return;
+      setDataLoadError(error.message || 'Could not read the local memory database.');
       setDataReady(true);
     });
     return () => { active = false; };
@@ -660,8 +812,8 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    window.brain.getMcpConfig().then((config) => { if (active) setMcpConfig(config); });
-    window.brain.getEmbeddingStatus().then((status) => { if (active) setEmbeddingStatus(status); });
+    void refreshMcpConfig();
+    window.brain.getEmbeddingStatus().then((status) => { if (active) setEmbeddingStatus(status); }).catch(() => setChannelState('embedding status', 'error'));
     const unsubscribeEmbeddingStatus = window.brain.onEmbeddingStatus((status) => setEmbeddingStatus(status));
     const unsubscribeRetrieved = window.brain.onRetrieved((ids) => {
       [...new Set((ids || []).map((id) => String(id)))].slice(0, 10).forEach((id, index) => {
@@ -682,8 +834,8 @@ function App() {
       void refreshClients();
     });
     void refreshPendingMemories().catch(() => {});
-    const unsubscribePending = window.brain.onPendingMemoriesChanged(() => { void refreshPendingMemories(); });
-    window.brain.listClients().then((rows) => {
+    const unsubscribePending = window.brain.onPendingMemoriesChanged(() => { void refreshPendingMemories().catch(() => {}); });
+    refreshClients().then((rows) => {
       if (!active) return;
       setClients(rows);
       const pending = rows.find((client) => client.status === 'pending');
@@ -750,11 +902,18 @@ function App() {
     return () => { pickerRequest.current += 1; };
   }, [pickerOpen, pickerDebouncedQuery]);
 
+  function focusMemory(memoryId, tries = 0) {
+    requestAnimationFrame(() => {
+      const focused = graphRef.current?.focus(memoryId);
+      if (!focused && tries < 8) focusMemory(memoryId, tries + 1);
+    });
+  }
+
   function openDetail(memoryId) {
     setSelectedId(memoryId);
     setSuggestionsOpen(false);
     setPickerOpen(false);
-    graphRef.current?.focus(memoryId);
+    focusMemory(memoryId);
   }
 
   async function handleDelete(memoryId) {
@@ -960,18 +1119,20 @@ function App() {
 
   return (
     <main className="memory-app">
-      <BrainGraph ref={graphRef} memories={memories} counts={counts} links={visibleGraphLinks} dataReady={dataReady} sidebarCollapsed={sidebarCollapsed} linksVisible={linksVisible} onLinksVisibleChange={setLinksVisible} />
-      {insightsOpen && <InsightsView data={insightsData} onBack={() => setInsightsOpen(false)} sql={sql} setSql={setSql} runSql={runAnalyticsQuery} sqlResult={sqlResult} sqlRunning={sqlRunning} onResetRetrievalCounts={resetRetrievalCounts} />}
-      {chatOpen && <ChatView onBack={() => setChatOpen(false)} memoryTitles={Object.fromEntries(memories.map((item) => [item.id, item.title || 'Untitled memory']))} onOpenMemory={(id) => { setChatOpen(false); setInsightsOpen(false); setSelectedId(id); setSidebarCollapsed(false); graphRef.current?.retrieve(id); }} />}
+      <BrainGraph ref={graphRef} memories={memories} counts={counts} links={graphLinks} linkCounts={graphLinkCountValues} linkVisibility={linkVisibility} onLinkVisibilityChange={setLinkVisibility} fitRevision={graphFitRevision} dataReady={dataReady} sidebarCollapsed={sidebarCollapsed} onMemoryClick={openDetail} />
+    {insightsOpen && (insightsData ? <InsightsView data={insightsData} onBack={() => { setInsightsOpen(false); setGraphFitRevision((value) => value + 1); }} sql={sql} setSql={setSql} runSql={runAnalyticsQuery} sqlResult={sqlResult} sqlRunning={sqlRunning} onResetRetrievalCounts={resetRetrievalCounts} /> : <section className="insights-view"><header className="insights-header"><button className="back-button" type="button" onClick={() => { setInsightsOpen(false); setGraphFitRevision((value) => value + 1); }}>‹</button><div><h1>Insights</h1><p>Local activity and retrieval analytics</p></div></header><ChannelNotice channel="insights" loading={insightsLoading} error={insightsLoadError} onRetry={() => void openInsights()} /></section>)}
+      {chatOpen && <ChatView onBack={() => { setChatOpen(false); setGraphFitRevision((value) => value + 1); }} onManageProviders={() => { setChatOpen(false); openConnectSettings(); }} memoryTitles={Object.fromEntries(memories.map((item) => [item.id, item.title || 'Untitled memory']))} onOpenMemory={(id) => { setChatOpen(false); setInsightsOpen(false); setSelectedId(id); setSidebarCollapsed(false); focusMemory(id); }} />}
       <aside className={`memory-panel${sidebarCollapsed ? ' is-collapsed' : ''}`} style={insightsOpen || chatOpen ? { display: 'none' } : undefined}>
-        <header className="sidebar-header"><strong>One Brain</strong><button type="button" onClick={() => { setPendingOpen(true); setConnectOpen(false); void refreshPendingMemories(); }}>Pending ({pendingMemories.length})</button><button type="button" onClick={() => { setInsightsOpen(false); setChatOpen(true); }}>Chat</button><button type="button" onClick={openInsights}>Insights</button></header>
-        {pendingOpen ? <><header className="detail-header"><button className="back-button" type="button" onClick={() => setPendingOpen(false)}>‹</button><span>Pending memories</span></header><PendingMemoryInbox items={pendingMemories} onRefresh={refreshPendingMemories} /></> : connectOpen ? (
+        <header className="sidebar-header"><strong>One Brain</strong><nav aria-label="Main views"><button title="Open Chat" type="button" onClick={() => { setInsightsOpen(false); setChatOpen(true); }}>Chat</button><button title="Open Insights" type="button" onClick={openInsights}>Insights</button><button title="Pending memories" type="button" onClick={() => { setPendingOpen(true); setConnectOpen(false); void refreshPendingMemories().catch(() => {}); }}>Pending ({pendingMemories.length})</button><button title="Settings" aria-label="Settings" type="button" onClick={openConnectSettings}>⚙</button></nav></header>
+        {pendingOpen ? <><header className="detail-header"><button className="back-button" type="button" onClick={() => setPendingOpen(false)}>‹</button><span>Pending memories</span></header><PendingMemoryInbox items={pendingMemories} onRefresh={refreshPendingMemories} loading={pendingLoading} loadError={pendingLoadError} /></> : connectOpen ? (
           <section className="connect-view">
             <header className="detail-header"><button className="back-button" type="button" onClick={() => setConnectOpen(false)}>‹</button><span>Connect AI</span>{suggestions.length > 0 && <button className="header-suggestions" type="button" onClick={() => { setConnectOpen(false); setSuggestionsOpen(true); }}>Suggestions ({suggestions.length})</button>}</header>
             {mcpConfig ? <>
               <h1>One Brain MCP</h1>
               <p className="connect-hint">Your local MCP server is ready for AI clients on this device.</p>
+              <p className="connect-hint mcp-port-status">Listening on port <strong>{mcpConfig.port}</strong></p>
               <label className="connect-field">Endpoint<code>{mcpConfig.endpoint}</code></label>
+              {embeddingStatus.state === 'error' && <section className="clients-settings embedding-retry-card"><header><h2>Semantic search model</h2><button type="button" onClick={() => void retryEmbedding()} disabled={embeddingRetrying}>{embeddingRetrying ? 'Retrying…' : 'Retry'}</button></header><p>{embeddingStatus.message}</p></section>}
               <section className="clients-settings">
                 <header><h2>Connect AI</h2><button type="button" onClick={() => { void refreshConnectors(); }}>Refresh</button></header>
                 {connectorCards.map((client) => <article className="connector-card" key={client.id}>
@@ -989,7 +1150,7 @@ function App() {
                 </article>)}
               </section>
               <ProviderKeysPanel clients={clients} />
-            </> : <p className="empty-note">Starting the local MCP server...</p>}
+            </> : <ChannelNotice channel="Connect AI settings" loading={mcpConfigLoading} error={mcpConfigError || (!mcpConfigLoading && !mcpConfig)} onRetry={() => void refreshMcpConfig()} />}
             <section className="clients-settings">
               <header><h2>Connected AIs</h2><button type="button" onClick={() => { void refreshClients(); }}>Refresh</button></header>
               {clients.map((client) => <article className="client-card" key={client.client}>
@@ -1008,6 +1169,8 @@ function App() {
         ) : suggestionsOpen ? (
           <section className="suggestions-view">
             <header className="detail-header"><button className="back-button" type="button" onClick={() => setSuggestionsOpen(false)}>‹</button><span>Link suggestions</span></header>
+            <ChannelNotice channel="suggestions" loading={channelStates.suggestions === 'loading'} error={channelStates.suggestions === 'error'} onRetry={() => void refreshData().catch(() => {})} />
+            <ChannelNotice channel="rejected links" loading={channelStates['rejected links'] === 'loading'} error={channelStates['rejected links'] === 'error'} onRetry={() => void refreshData().catch(() => {})} />
             <div className="suggestion-actions">
               <button type="button" onClick={handleJoinAboveThreshold}>Join all above 0.6</button>
               <button type="button" onClick={handleDismissAllSuggestions}>Dismiss all</button>
@@ -1024,7 +1187,7 @@ function App() {
                 </div>
                 <footer><span>Similarity {Number(item.score).toFixed(2)}</span><button type="button" onClick={() => handleJoinSuggestion(item.id)}>Join</button><button type="button" className="dismiss-suggestion" onClick={() => handleRejectSuggestion(item.id)}>Not related</button></footer>
               </article>)}
-              {suggestions.length === 0 && <p className="empty-note">No pending suggestions</p>}
+              {suggestions.length === 0 && channelStates.suggestions !== 'error' && channelStates.suggestions !== 'loading' && <p className="empty-note">No pending suggestions</p>}
             </div>
             <details className="rejected-section" open={rejectedOpen} onToggle={(event) => setRejectedOpen(event.currentTarget.open)}>
               <summary>Rejected ({rejectedLinks.length})</summary>
@@ -1032,7 +1195,7 @@ function App() {
                 <span>{item.a_title || 'Untitled'} ↔ {item.b_title || 'Untitled'}<small>Similarity {Number(item.score).toFixed(2)}</small></span>
                 <button type="button" onClick={() => handleRestoreRejected(item.id)}>Restore</button>
               </article>)}
-              {rejectedLinks.length === 0 && <p className="empty-note">No rejected pairs</p>}
+              {rejectedLinks.length === 0 && channelStates['rejected links'] !== 'error' && channelStates['rejected links'] !== 'loading' && <p className="empty-note">No rejected pairs</p>}
             </details>
           </section>
         ) : selectedMemory ? (
@@ -1089,25 +1252,20 @@ function App() {
           <>
             <div className="search-row">
               <input value={query} onChange={(event) => { typedSearchPending.current = event.target.value; setQuery(event.target.value); setPageOffset(0); }} placeholder="Search memories..." aria-label="Search memories" />
-              {suggestions.length > 0 && <button className="suggestions-button" type="button" onClick={() => setSuggestionsOpen(true)}>Suggestions ({suggestions.length})</button>}
-              <button className="settings-button" type="button" aria-label="Connect AI settings" title="Connect AI" onClick={openConnectSettings}>⚙</button>
               <button className="add-button" type="button" aria-label="Add memory or import" title={databaseStatus.writable ? 'Add or import memories' : 'Memory writes are disabled'} disabled={!databaseStatus.writable} onClick={() => { setAddMode('add'); setAddOpen(true); }}>+</button>
-            </div>
-            <div className="embedding-status" aria-live="polite">
-              {!databaseStatus.writable && <span className="embedding-error">{databaseStatus.message || 'Database is read-only; memory writes are disabled.'}</span>}
-              {embeddingStatus.state === 'indexing' && <span>Indexing {embeddingStatus.done}/{embeddingStatus.total}</span>}
-              {embeddingStatus.state === 'error' && <span className="embedding-error">{embeddingStatus.message}</span>}
-              {embeddingStatus.fallback && embeddingStatus.state !== 'indexing' && <span className="embedding-error">Using fallback model: Xenova/all-MiniLM-L6-v2</span>}
             </div>
             <nav className="source-filters" aria-label="Filter by source">
               {['all', ...SOURCES].map((source) => <button type="button" key={source} className={`filter-chip${sourceFilter === source ? ' is-selected' : ''}`} onClick={() => { typedSearchPending.current = null; setSourceFilter(source); setPageOffset(0); }}>
                 {source !== 'all' && <i style={{ background: SOURCE_COLORS[source] }} />}{source === 'all' ? 'All' : source}
               </button>)}
             </nav>
-            <div className="semantic-toggle-row">
-              <button type="button" className={`semantic-toggle${showSemanticLinks ? ' is-on' : ''}`} aria-pressed={showSemanticLinks} onClick={() => setShowSemanticLinks((value) => !value)}>Semantic links {showSemanticLinks ? 'On' : 'Off'}</button>
-              {links.length > 3000 && <small>Hidden above 3,000 total links</small>}
-            </div>
+            {(() => {
+              const pendingChannels = Object.entries(channelStates).filter(([, state]) => state === 'loading' || state === 'error');
+              const hasStatus = pendingChannels.length || embeddingStatus.state === 'loading' || embeddingStatus.state === 'indexing' || embeddingStatus.state === 'error' || embeddingStatus.fallback || !databaseStatus.writable || dataLoadError;
+              if (!hasStatus) return null;
+              return <details className="global-status"><summary><span aria-hidden="true">ⓘ</span> {embeddingStatus.state === 'indexing' ? `Indexing ${embeddingStatus.done}/${embeddingStatus.total}` : embeddingStatus.state === 'error' ? 'Semantic search needs attention' : !databaseStatus.writable ? 'Read-only mode' : pendingChannels.some(([, state]) => state === 'loading') ? 'Loading supporting data' : 'Some data needs attention'}</summary><div>{embeddingStatus.state === 'error' && <p><span>Semantic model: {embeddingStatus.message}</span><button type="button" onClick={() => void retryEmbedding()} disabled={embeddingRetrying}>{embeddingRetrying ? 'Retrying…' : 'Retry'}</button></p>}{!databaseStatus.writable && <p>{databaseStatus.message || 'Database is read-only; memory writes are disabled.'}</p>}{embeddingStatus.fallback && <p>Using fallback model: Xenova/all-MiniLM-L6-v2</p>}{pendingChannels.map(([channel, state]) => <p key={channel}><span>{channel}: {state === 'loading' ? 'loading' : 'could not load'}</span><button type="button" onClick={() => channel === 'memory list' ? void refreshData() : void retryChannel(channel)}>Retry</button></p>)}</div></details>;
+            })()}
+            {suggestions.length > 0 && <button className="suggestion-banner" type="button" onClick={() => setSuggestionsOpen(true)}>{suggestions.length} suggested links · Review</button>}
             <section className="result-list" aria-label="Search results">
               {results.map((item) => {
                 const full = resultMemory(item.id);
@@ -1115,7 +1273,7 @@ function App() {
                 return <button type="button" className="result-item" key={item.id} onClick={() => openDetail(item.id)}>
                   <i className="result-dot" style={{ background: SOURCE_COLORS[item.source] }} />
                   <span className="result-copy"><strong>{item.private ? '🔒 ' : ''}{displayTitle}</strong><small>{item.snippet || full?.content.slice(0, 120) || ''}</small></span>
-                  <span className="result-source">{item.source}</span>
+                  <span className="result-meta"><span>{item.source}</span><time>{relativeDate(item.created_at || resultMemory(item.id)?.created_at)}</time></span>
                 </button>;
               })}
               {results.length === 0 && dataReady && <p className="empty-note">No memories found</p>}
@@ -1179,6 +1337,7 @@ function App() {
         .memory-panel { box-sizing:border-box;position:absolute;z-index:5;inset:0 auto 0 0;width:min(360px,92vw);padding:16px 15px;overflow-y:auto;background:rgba(9,13,22,.96);border-right:1px solid rgba(175,195,224,.17);backdrop-filter:blur(16px);transition:transform 250ms ease; }
         .sidebar-header { display:flex;align-items:center;justify-content:space-between;margin:0 0 13px;padding:0 1px;color:#edf3fc;font-size:14px; }
         .sidebar-header button,.sql-toggle,.run-sql-button { border:1px solid rgba(143,196,255,.25);border-radius:6px;padding:6px 10px;color:#c7e1ff;background:#182a40;font:11px system-ui,sans-serif;cursor:pointer; }
+        .database-load-error { display:grid;gap:7px;margin:0 0 10px;padding:9px;border:1px solid rgba(255,140,140,.32);border-radius:7px;color:#ffc1bd;background:rgba(78,29,34,.35);font-size:10px;overflow-wrap:anywhere; }.database-load-error button { justify-self:start;border:1px solid rgba(255,170,160,.25);border-radius:5px;padding:5px 7px;color:#ffe0dc;background:#40252c;font:10px system-ui,sans-serif;cursor:pointer; }
         .insights-view { box-sizing:border-box;position:absolute;z-index:10;inset:0;overflow:auto;padding:24px clamp(18px,4vw,56px) 48px;color:#e8edf7;background:#080d17;font:13px/1.45 system-ui,sans-serif; }
         .chat-view { box-sizing:border-box;position:absolute;z-index:15;inset:0;display:flex;flex-direction:column;overflow:hidden;color:#e8edf7;background:#080d17;font:13px/1.45 system-ui,sans-serif; }
         .chat-topbar { display:flex;align-items:center;gap:12px;flex:0 0 auto;padding:13px 20px;border-bottom:1px solid rgba(175,195,224,.14);background:#0b111c; }
@@ -1464,6 +1623,115 @@ function App() {
         .legacy-cleanup-section p { margin:4px 0 8px;color:#c5a5a5;font-size:10px; }
         .legacy-cleanup-section button { border:1px solid rgba(255,136,136,.3);border-radius:6px;padding:7px 9px;color:#ffd5d5;background:#48272a;font:10px system-ui,sans-serif;cursor:pointer; }
         .legacy-cleanup-section button:disabled { opacity:.55;cursor:default; }
+        /* Chat uses frosted glass layers, inset controls and restrained spatial depth. */
+        .chat-view { isolation:isolate;background:radial-gradient(ellipse at 78% 3%,rgba(75,110,170,.19),transparent 40%),radial-gradient(ellipse at 18% 92%,rgba(65,135,126,.12),transparent 38%),#070b13; }
+        .chat-view::before { content:"";position:absolute;inset:0;z-index:-1;pointer-events:none;background:linear-gradient(145deg,rgba(255,255,255,.025),transparent 34%,rgba(115,161,211,.025)); }
+        .chat-topbar { position:relative;border-bottom-color:rgba(190,213,245,.15);background:linear-gradient(110deg,rgba(18,29,45,.88),rgba(12,20,33,.76));backdrop-filter:blur(24px);box-shadow:0 8px 28px rgba(0,0,0,.18),inset 0 1px rgba(255,255,255,.07); }
+        .chat-list { border-right-color:rgba(190,213,245,.13);background:linear-gradient(160deg,rgba(17,27,42,.78),rgba(8,14,24,.84));backdrop-filter:blur(20px);box-shadow:inset -1px 0 rgba(255,255,255,.025); }
+        .chat-new-box { padding:13px;border-color:rgba(190,213,245,.16);border-radius:13px;background:linear-gradient(145deg,rgba(30,45,65,.74),rgba(14,22,35,.84));box-shadow:0 12px 26px rgba(0,0,0,.22),inset 0 1px rgba(255,255,255,.09),inset 0 -1px rgba(0,0,0,.22); }
+        .chat-new-box input,.chat-new-box select,.chat-model-inline input,.chat-model-inline select,.chat-controls input,.chat-grant-modal input,.chat-grant-modal select,.chat-grant-modal textarea,.model-menu input { border-color:rgba(172,195,225,.2);border-radius:8px;padding:8px 9px;background:linear-gradient(180deg,rgba(7,13,22,.88),rgba(20,29,43,.88));box-shadow:inset 0 2px 5px rgba(0,0,0,.3),inset 0 1px rgba(255,255,255,.035); }
+        .model-menu { padding:7px;border-color:rgba(184,206,235,.2);border-radius:10px;background:rgba(12,20,32,.94);backdrop-filter:blur(22px);box-shadow:0 18px 38px rgba(0,0,0,.46),inset 0 1px rgba(255,255,255,.07); }
+        .model-loading { display:block;padding:8px 9px;border:1px solid rgba(172,195,225,.14);border-radius:8px;color:#a8bad0;background:rgba(8,14,24,.58);font-size:10px; }
+        .model-refresh button,.chat-create,.chat-manage-keys,.chat-list-items article > button,.chat-message-actions button,.chat-compose button,.chat-grant-modal footer button { border-color:rgba(160,204,241,.25);border-radius:8px;background:linear-gradient(180deg,rgba(37,62,88,.92),rgba(22,40,60,.94));box-shadow:0 3px 8px rgba(0,0,0,.24),inset 0 1px rgba(255,255,255,.12),inset 0 -1px rgba(0,0,0,.18);transition:transform .16s ease,border-color .16s ease,filter .16s ease; }
+        .model-refresh button:hover,.chat-create:hover,.chat-manage-keys:hover,.chat-list-items article > button:hover,.chat-message-actions button:hover,.chat-compose button:hover,.chat-grant-modal footer button:hover { transform:translateY(-1px);border-color:rgba(172,220,255,.45);filter:brightness(1.12); }
+        .chat-manage-keys { color:#c6d2e2!important;background:linear-gradient(180deg,rgba(34,47,63,.82),rgba(20,29,41,.9))!important; }
+        .chat-list-items article { border-radius:10px;transition:background .16s ease,border-color .16s ease; }
+        .chat-list-items article:hover { background:rgba(255,255,255,.035); }
+        .chat-list-items article.is-active { border-color:rgba(143,200,239,.27);background:linear-gradient(120deg,rgba(64,105,140,.2),rgba(33,51,74,.18));box-shadow:inset 0 1px rgba(255,255,255,.07),0 5px 16px rgba(0,0,0,.14); }
+        .chat-conversation { padding-right:clamp(16px,3vw,36px);padding-left:clamp(16px,3vw,36px); }
+        .chat-provider-badge { border-color:rgba(105,179,220,.3);padding:5px 9px;background:linear-gradient(145deg,rgba(41,79,98,.55),rgba(19,39,54,.72));box-shadow:inset 0 1px rgba(255,255,255,.09),0 3px 12px rgba(0,0,0,.18); }
+        .chat-messages { gap:14px;padding:20px max(2px,calc((100% - 900px)/2));scrollbar-color:rgba(133,166,200,.3) transparent; }
+        .chat-message { padding:13px 16px;border-color:rgba(188,210,239,.15);border-radius:15px 15px 15px 5px;background:linear-gradient(145deg,rgba(30,43,61,.8),rgba(15,24,38,.9));box-shadow:0 10px 26px rgba(0,0,0,.2),inset 0 1px rgba(255,255,255,.075),inset 0 -1px rgba(0,0,0,.18);animation:chat-message-in .28s ease both; }
+        .chat-message.user { border-color:rgba(130,192,226,.2);border-radius:15px 15px 5px 15px;background:linear-gradient(145deg,rgba(33,63,82,.85),rgba(20,39,57,.94)); }
+        .chat-compose { gap:8px;padding:13px;border:1px solid rgba(186,208,235,.16);border-radius:15px;background:linear-gradient(145deg,rgba(25,37,54,.78),rgba(13,21,34,.88));backdrop-filter:blur(18px);box-shadow:0 14px 34px rgba(0,0,0,.24),inset 0 1px rgba(255,255,255,.08),inset 0 -1px rgba(0,0,0,.22); }
+        .chat-compose textarea { border-color:rgba(172,195,225,.2);border-radius:10px;padding:12px;background:linear-gradient(180deg,rgba(7,13,22,.9),rgba(17,27,41,.9));box-shadow:inset 0 3px 8px rgba(0,0,0,.34),inset 0 1px rgba(255,255,255,.035); }
+        .chat-error { padding:8px 10px;border:1px solid rgba(255,144,144,.2);border-radius:8px;background:rgba(85,35,42,.24); }
+        .channel-load-notice { display:flex;align-items:center;justify-content:space-between;gap:8px;margin:6px 0;padding:7px 9px;border:1px solid rgba(143,196,255,.17);border-radius:7px;color:#b9c8da;background:rgba(17,29,45,.82);font-size:10px; }
+        .channel-load-notice[role="alert"] { border-color:rgba(245,158,11,.28);color:#f4c875;background:rgba(72,51,21,.22); }
+        .channel-load-notice button,.embedding-status button { flex:none;border:1px solid rgba(143,196,255,.2);border-radius:5px;padding:4px 7px;color:#c9e2fb;background:#182a40;font:10px system-ui,sans-serif;cursor:pointer; }
+        .mcp-port-status { color:#b6c4d5; }.mcp-port-status strong { color:#e5edf7;font-size:12px; }
+        .embedding-retry-card { margin:12px 0;padding:10px;border:1px solid rgba(245,158,11,.24);border-radius:8px;background:rgba(72,51,21,.18); }
+        .embedding-retry-card > p { margin:5px 0 0;color:#e6c27c;font-size:11px;overflow-wrap:anywhere; }
+        .embedding-status { display:flex;flex-wrap:wrap;align-items:center;gap:7px; }
+        .embedding-error { display:flex;align-items:center;gap:7px;flex-wrap:wrap; }
+        .chat-layout { grid-template-columns:minmax(275px,320px) minmax(0,1fr); }
+        .chat-list { gap:0;overflow-y:auto;overscroll-behavior:contain; }
+        .chat-new-box { position:relative;z-index:2;gap:12px;padding:15px; }
+        .chat-new-heading { display:flex;align-items:center;gap:10px;margin-bottom:2px; }
+        .chat-new-heading > div { display:grid;gap:2px; }.chat-new-heading strong { font-size:13px; }.chat-new-heading small,.chat-add-key > small { color:#8da0b8;font-size:10px; }
+        .chat-new-icon { display:grid;place-items:center;width:34px;height:34px;border:1px solid rgba(140,200,234,.24);border-radius:11px;color:#c8ebff;background:linear-gradient(145deg,rgba(66,113,143,.5),rgba(26,46,69,.78));font-size:19px;box-shadow:inset 0 1px rgba(255,255,255,.14),0 5px 14px #0003; }
+        .chat-new-box label { gap:6px;color:#aebed1;font-size:11px;font-weight:550; }
+        .chat-new-box select,.chat-new-box input,.model-picker > button { min-height:38px;font-size:12px; }
+        .chat-add-key { display:grid;gap:8px;padding:11px;border:1px solid rgba(148,190,220,.15);border-radius:10px;background:rgba(7,13,23,.4); }
+        .chat-add-key .chat-create { min-height:38px; }
+        .chat-toggle { min-height:28px;gap:9px;padding:3px 8px;border:1px solid rgba(170,195,225,.11);border-radius:8px;background:rgba(255,255,255,.025);font-size:10px; }
+        .chat-toggle input { width:16px;height:16px;margin:0;flex:none; }
+        .model-show-all { border:0;background:transparent; }
+        .model-refresh button { min-height:32px; }
+        .chat-create { min-height:40px;font-size:11px; }
+        .chat-manage-keys { min-height:35px;font-size:10px; }
+        .chat-list-items { gap:6px;margin-top:14px; }
+        .chat-list-items article { min-height:58px;padding:6px; }
+        .chat-list-items article .chat-select { align-self:stretch;justify-content:center;gap:3px;padding:5px 8px;border-radius:7px;cursor:pointer; }
+        .chat-select small { font-size:9px;letter-spacing:.03em; }
+        .chat-select strong { font-size:12px; }
+        .chat-list-items article > button:not(.chat-select) { width:32px;height:32px;padding:0;font-size:13px; }
+        .chat-controls { display:grid;grid-template-columns:minmax(170px,1fr) minmax(115px,auto) minmax(150px,auto) minmax(170px,205px);gap:10px;padding:15px 0; }
+        .chat-controls > div { min-width:0; }
+        .chat-controls > .chat-toggle { justify-content:flex-start;min-height:38px;padding:6px 9px; }
+        .chat-model-inline { min-width:0; }
+        .chat-model-inline .model-picker > button,.chat-model-inline > input { min-height:38px;font-size:11px; }
+        .chat-message p { font-size:13px;line-height:1.65; }
+        .chat-compose textarea { min-height:88px;font-size:13px; }
+        .chat-compose button { min-height:36px; }
+        @media (max-width:1050px) { .chat-layout { grid-template-columns:minmax(245px,280px) minmax(0,1fr); }.chat-controls { grid-template-columns:minmax(160px,1fr) minmax(145px,auto); }.chat-model-inline { grid-column:2; } }
+        @media (max-width:700px) { .chat-topbar { padding:10px 13px; }.chat-layout { grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(175px,37vh) minmax(0,1fr); }.chat-list { border-right:0;border-bottom:1px solid rgba(190,213,245,.13); }.chat-new-box { grid-template-columns:1fr 1fr;align-items:end; }.chat-new-heading,.chat-add-key,.chat-manage-keys { grid-column:1/-1; }.chat-add-key { align-self:stretch; }.chat-list-items { grid-template-columns:repeat(auto-fill,minmax(175px,1fr)); }.chat-controls { grid-template-columns:1fr 1fr; }.chat-controls > div { grid-column:1/-1; }.chat-controls > .chat-toggle { font-size:9px; }.chat-conversation { padding-right:12px;padding-left:12px; }.chat-compose { padding:9px; } }
+        @media (max-width:430px) { .chat-new-box { grid-template-columns:1fr; }.chat-new-heading,.chat-add-key,.chat-manage-keys { grid-column:auto; }.chat-controls { grid-template-columns:1fr; }.chat-model-inline { grid-column:auto; } }
+        @keyframes chat-message-in { from { opacity:0;transform:translateY(7px) scale(.99); } to { opacity:1;transform:translateY(0) scale(1); } }
+        :root { color-scheme:dark;--bg:#0b1020;--panel:#111827;--border:#1f2a44;--text:#e5e7eb;--muted:#9ca3af;--accent:#60a5fa;--warning:#f59e0b; }
+        html,body,#root { color-scheme:dark;background:var(--bg); }
+        body { font-size:14px; }
+        .memory-app,.chat-view,.insights-view { background:var(--bg)!important;color:var(--text)!important;font-size:14px!important; }
+        .memory-panel,.chat-list,.chat-new-box,.chat-message,.insight-card,.chat-grant-modal,.add-modal,.consent-modal,.config-section,.client-card { background:var(--panel)!important;color:var(--text)!important;border-color:var(--border)!important; }
+        .memory-panel { backdrop-filter:none!important;border-right-color:var(--border)!important; }
+        * { text-shadow:none!important;filter:none!important; }
+        * { box-shadow:none!important; }
+        .sidebar-header { display:grid;grid-template-columns:1fr;gap:10px;margin-bottom:10px;color:var(--text); }
+        .sidebar-header nav { display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px; }
+        .sidebar-header button,.chat-manage-keys,.chat-create,.chat-compose button,.model-refresh button { min-height:36px;font-size:13px!important;color:var(--text)!important;background:#172238!important;border-color:var(--border)!important; }
+        .search-row { display:grid;grid-template-columns:minmax(0,1fr) 42px;gap:8px;margin:10px 0; }
+        .search-row input { min-height:40px;font-size:14px!important;background:var(--panel)!important;border-color:var(--border)!important;color:var(--text)!important; }
+        .source-filters { gap:6px!important;margin:7px 0 10px!important; }
+        .filter-chip { min-height:32px;padding:6px 9px!important;color:var(--muted)!important;background:var(--panel)!important;border-color:var(--border)!important;font-size:13px!important; }
+        .filter-chip.is-selected { color:var(--text)!important;background:#1a2941!important;border-color:#3b5274!important; }
+        .global-status { margin:7px 0;padding:0 9px;border:1px solid #594820;border-radius:7px;color:#f3c977;background:#211d12;font-size:13px; }
+        .global-status summary { min-height:34px;display:flex;align-items:center;gap:7px;cursor:pointer;list-style:none; }
+        .global-status summary::-webkit-details-marker { display:none; }.global-status summary span { color:var(--warning); }
+        .global-status > div { padding:0 0 7px;color:#f3c977; }.global-status p { display:flex;align-items:center;justify-content:space-between;gap:10px;margin:5px 0;font-size:13px;overflow-wrap:anywhere; }
+        .global-status p button { flex:none;min-height:30px;color:var(--text);background:#302814;border:1px solid #594820;border-radius:5px; }
+        .suggestion-banner { width:100%;margin:3px 0 7px;padding:7px 9px;border:1px solid var(--border);border-radius:6px;color:var(--text);background:#172238;text-align:left;font-size:13px; }
+        .result-item { gap:8px;padding:8px 3px;border-bottom-color:var(--border); }.result-dot { flex:none;width:8px;height:8px;box-shadow:none!important; }
+        .result-copy { display:grid;gap:2px;min-width:0;flex:1; }.result-copy strong,.result-copy small { display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+        .result-copy strong { color:var(--text);font-size:14px; }.result-copy small { color:var(--muted);font-size:13px; }
+        .result-meta { display:grid;gap:2px;flex:none;text-align:right;color:var(--muted);font-size:12px;text-transform:capitalize; }.result-meta time { font-size:11px;text-transform:none; }
+        .result-item:hover,.result-item[aria-current=true] { background:#172238!important; }
+        .chat-topbar { background:var(--panel)!important;border-color:var(--border)!important; }.chat-topbar p,.chat-select small,.chat-message-head small,.model-refresh small { color:var(--muted)!important;font-size:12px!important; }
+        .chat-layout { grid-template-columns:minmax(220px,270px) minmax(0,1fr)!important; }.chat-list { padding:14px!important;border-color:var(--border)!important; }.chat-new-button { width:100%;margin-bottom:10px; }
+        .chat-list-items article { padding:5px!important; }.chat-list-items article.is-active { background:#172238!important;border-color:#31415d!important; }.chat-select strong { color:var(--text)!important;font-size:14px!important; }
+        .chat-conversation { padding-bottom:12px!important; }.chat-controls { display:flex!important;gap:10px!important;background:var(--bg);border-color:var(--border)!important; }.chat-controls > div { min-width:190px!important; }
+        .chat-controls input,.chat-grant-modal input,.chat-grant-modal textarea,.model-menu input,.accessible-picker input { background:var(--bg)!important;color:var(--text)!important;border-color:var(--border)!important;font-size:14px!important; }
+        .chat-toggle,.chat-model-inline,.chat-grant-modal > label { color:var(--muted)!important;font-size:13px!important; }.chat-message { border-color:var(--border)!important;background:var(--panel)!important; }.chat-message.user { background:#16243a!important; }
+        .chat-message p { color:var(--text)!important;font-size:14px!important;line-height:1.55; }.chat-message-head,.chat-message-actions details { color:var(--text)!important;font-size:13px!important; }.chat-message-actions button { font-size:13px!important; }
+        .chat-empty { color:var(--muted)!important;font-size:14px!important; }.chat-compose { flex:none!important;padding:10px!important;border:1px solid var(--border)!important;border-radius:10px;background:var(--panel)!important; }
+        .chat-compose textarea { min-height:90px!important;background:var(--bg)!important;color:var(--text)!important;border-color:var(--border)!important;font-size:14px!important; }.chat-compose small { color:var(--muted)!important;font-size:13px!important; }
+        .accessible-picker { position:relative;min-width:0; }.accessible-picker > button { display:flex;justify-content:space-between;align-items:center;gap:8px;width:100%;min-height:38px;padding:7px 9px;border:1px solid var(--border);border-radius:7px;color:var(--text);background:var(--panel);text-align:left;font:14px system-ui,sans-serif;cursor:pointer; }
+        .accessible-picker-menu { position:absolute;z-index:30;top:calc(100% + 4px);left:0;right:0;display:grid;gap:5px;max-height:260px;overflow:auto;padding:6px;border:1px solid var(--border);border-radius:8px;background:var(--panel); }
+        .accessible-picker-menu [role=listbox] { display:grid;gap:2px; }.accessible-picker-menu [role=option] { min-height:36px;padding:6px 8px;border:0;border-radius:5px;color:var(--text);background:transparent;text-align:left;font:14px system-ui,sans-serif;cursor:pointer; }
+        .accessible-picker-menu [role=option]:hover,.accessible-picker-menu [role=option]:focus-visible,.accessible-picker-menu [aria-selected=true] { outline:0;background:#1a2941; }
+        .provider-option { display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;color:var(--text);text-transform:capitalize; }.provider-option small { color:#c2cad6!important;font-size:12px!important;text-transform:none; }.provider-option.missing small { color:var(--muted)!important; }
+        select,select option { color:var(--text)!important;background:var(--panel)!important;color-scheme:dark; }.channel-load-notice,.embedding-error,.chat-error { color:#f3c977!important;font-size:13px!important; }.embedding-status { display:none!important; }
+        .brain-tooltip { color:var(--text)!important;background:#111827!important;border-color:var(--border)!important;box-shadow:none!important; }
+        @media (max-width:700px) { .sidebar-header nav { grid-template-columns:repeat(2,minmax(0,1fr)); }.chat-layout { grid-template-columns:minmax(0,1fr)!important;grid-template-rows:minmax(115px,25vh) minmax(0,1fr)!important; }.chat-controls { flex-wrap:wrap!important; }.new-chat-controls > * { flex:1 1 180px; } }
       `}</style>
     </main>
   );

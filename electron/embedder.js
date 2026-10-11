@@ -6,7 +6,7 @@ const FALLBACK_MODEL = 'Xenova/all-MiniLM-L6-v2';
 
 function createEmbedder(userDataPath, onStatus = () => {}) {
   const worker = new Worker(path.join(__dirname, 'embedder-worker.mjs'), {
-    workerData: { model: MODEL, fallbackModel: FALLBACK_MODEL, cacheDir: path.join(userDataPath, 'models') }
+    workerData: { model: MODEL, fallbackModel: FALLBACK_MODEL, userDataPath }
   });
   let nextId = 1;
   let activeModel = MODEL;

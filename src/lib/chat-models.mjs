@@ -5,5 +5,5 @@ export function isChatModel(modelId) {
 }
 
 export function memorySourceForProvider(provider) {
-  return ({ openai: 'chatgpt', gemini: 'gemini', groq: 'groq', deepseek: 'deepseek' })[provider] || '';
+  return ({ openai: 'chatgpt', gemini: 'gemini', groq: 'groq', deepseek: 'deepseek', claude: 'claude' })[provider] || '';
 }

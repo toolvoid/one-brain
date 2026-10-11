@@ -181,14 +181,16 @@ function getChatGrant(provider) {
   return profile;
 }
 
-function saveChatGrant(provider, readSources) {
+function saveChatGrant(provider, readSources, writeSource = '') {
   ensureWritable();
   const client = `chat:${String(provider || '')}`;
+  const mappedSource = ({ openai: 'chatgpt', gemini: 'gemini', groq: 'groq', deepseek: 'deepseek', claude: 'claude' })[provider];
+  const selectedWriteSource = mappedSource || (MEMORY_SOURCES.includes(writeSource) ? writeSource : 'chatgpt');
   const allowed = new Set((Array.isArray(readSources) ? readSources : []).filter((source) => MEMORY_SOURCES.includes(source)));
   const db = getDatabase();
   const save = db.transaction(() => {
-    db.prepare(`INSERT INTO client_profiles (client, write_source, status, verified) VALUES (?, NULL, 'approved', 1)
-      ON CONFLICT(client) DO UPDATE SET status = 'approved'`).run(client);
+    db.prepare(`INSERT INTO client_profiles (client, write_source, status, verified) VALUES (?, ?, 'approved', 1)
+      ON CONFLICT(client) DO UPDATE SET write_source = excluded.write_source, status = 'approved'`).run(client, selectedWriteSource);
     const grant = db.prepare(`INSERT INTO client_grants (client, read_source, status) VALUES (?, ?, ?)
       ON CONFLICT(client, read_source) DO UPDATE SET status = excluded.status`);
     for (const source of MEMORY_SOURCES) grant.run(client, source, allowed.has(source) ? 'allow' : 'deny');
@@ -267,9 +269,13 @@ function getPendingMemories() {
 async function addPendingMemory({ title, content, client }) {
   ensureWritable();
   const text = String(content || '').trim();
-  if (!text || !embeddingReady || !embeddingProvider) return { added: false, reason: 'embedding_unavailable' };
-  const candidates = await semanticSearch(text, 'all', 500);
-  if (candidates.some((row) => Number(row.score) >= 0.9)) return { added: false, reason: 'duplicate' };
+  if (!text) return { added: false, reason: 'empty' };
+  if (embeddingReady && embeddingProvider) {
+    try {
+      const candidates = await semanticSearch(text, 'all', 500);
+      if (candidates.some((row) => Number(row.score) >= 0.9)) return { added: false, reason: 'duplicate' };
+    } catch {}
+  }
   const safeTitle = String(title || '').trim().slice(0, 160) || text.slice(0, 80);
   const result = getDatabase().prepare('INSERT INTO pending_memories(title, text, client) VALUES (?, ?, ?)')
     .run(safeTitle, text.slice(0, 4000), String(client || '').slice(0, 120));
@@ -1380,7 +1386,7 @@ function searchFts(query, source, limit, offset) {
     const params = filterSource ? [filterSource, safeLimit, safeOffset] : [safeLimit, safeOffset];
     const where = filterSource ? 'WHERE source = ?' : '';
     return db.prepare(`
-      SELECT id, source, title, private, substr(content, 1, 120) AS snippet
+      SELECT id, source, title, created_at, private, substr(content, 1, 120) AS snippet
       FROM memories ${where}
       ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
     `).all(...params).map((row, index) => ({ ...row, score: 1 / (60 + safeOffset + index + 1) }));
@@ -1390,7 +1396,7 @@ function searchFts(query, source, limit, offset) {
   const params = filterSource ? [match, filterSource, safeLimit, safeOffset] : [match, safeLimit, safeOffset];
   const sourceWhere = filterSource ? 'AND memories.source = ?' : '';
   return db.prepare(`
-    SELECT memories.id, memories.source, memories.title, memories.private,
+    SELECT memories.id, memories.source, memories.title, memories.created_at, memories.private,
       substr(snippet(memories_fts, -1, '', '', ' … ', 24), 1, 120) AS snippet
     FROM memories_fts
     JOIN memories ON memories.id = memories_fts.rowid
@@ -1410,7 +1416,7 @@ async function semanticSearch(query, source, limit = 50) {
     const memory = memoryCache.get(id);
     if (!memory || (source && source !== 'all' && memory.source !== source)) continue;
     const score = cosineSimilarity(queryVector, entry.vector);
-    results.push({ id, source: memory.source, title: memory.title, snippet: String(memory.content || '').slice(0, 120), score });
+    results.push({ id, source: memory.source, title: memory.title, created_at: memory.created_at, snippet: String(memory.content || '').slice(0, 120), score });
   }
   results.sort((a, b) => b.score - a.score);
   return results.slice(0, safeLimit);
