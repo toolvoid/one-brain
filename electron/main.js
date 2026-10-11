@@ -1,6 +1,6 @@
 const { app, BrowserWindow, ipcMain, Menu, safeStorage } = require('electron');
 const path = require('path');
-const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, searchMemoriesForClient, getMemoryForClient, recordProxyEvent, getPendingMemories, addPendingMemory, approvePendingMemory, rejectPendingMemory, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, addMemory, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
+const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, recordProxyEvent, getPendingMemories, addPendingMemory, approvePendingMemory, rejectPendingMemory, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, addMemory, createImport, importMemories, finishImport, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
 const { startMcpServer } = require('./mcp-server');
 const { createEmbedder } = require('./embedder');
 const connectors = require('./connectors');
@@ -11,6 +11,7 @@ let mcpConnection;
 let memoryProxy;
 let embedder;
 let embeddingStatus = { state: 'loading' };
+const chatControllers = new Map();
 
 Menu.setApplicationMenu(null);
 
@@ -84,6 +85,41 @@ ipcMain.handle('memory-proxy:settings', () => memoryProxy.publicSettings());
 ipcMain.handle('memory-proxy:update-settings', (_event, values) => memoryProxy.updateSettings(values));
 ipcMain.handle('memory-proxy:save-key', (_event, provider, key) => memoryProxy.saveKey(provider, key));
 ipcMain.handle('memory-proxy:delete-key', (_event, provider) => memoryProxy.deleteKey(provider));
+ipcMain.handle('chat:models', (_event, provider, refresh) => memoryProxy.listModels(provider, refresh));
+ipcMain.handle('chat:grant', (_event, provider) => getChatGrant(provider));
+ipcMain.handle('chat:grant-save', (_event, provider, sources) => saveChatGrant(provider, sources));
+ipcMain.handle('chat:list', () => listChats());
+ipcMain.handle('chat:create', (_event, provider, model) => createChat(provider, model));
+ipcMain.handle('chat:update', (_event, id, patch) => updateChat(id, patch));
+ipcMain.handle('chat:delete', (_event, id) => deleteChat(id));
+ipcMain.handle('chat:save-memory', (_event, source, title, content) => {
+  const memory = addMemory({ source, title, content }, { handAdded: true });
+  for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:changed', { type: 'add', id: memory.id });
+  return memory;
+});
+ipcMain.handle('chat:stop', (_event, requestId) => { chatControllers.get(requestId)?.abort(); return true; });
+ipcMain.handle('chat:send', async (event, payload) => {
+  const { requestId, chatId, text, model, useMemory, suggestMemories } = payload;
+  const chat = listChats().find((item) => item.id === Number(chatId));
+  if (!chat) throw new Error('Chat not found.');
+  updateChat(chatId, { model });
+  const title = chat.title === 'New chat' ? String(text).slice(0, 40) : chat.title;
+  if (chat.title === 'New chat') updateChat(chatId, { title });
+  appendChatMessage({ chat_id: chatId, role: 'user', content: text, model });
+  const messages = [...chat.messages.filter((item) => item.role === 'user' || item.role === 'assistant').map(({ role, content }) => ({ role, content })), { role: 'user', content: text }];
+  const controller = new AbortController(); chatControllers.set(requestId, controller);
+  const profile = useMemory ? getChatGrant(chat.provider) : null;
+  try {
+    const result = await memoryProxy.chatCompletion({ provider: chat.provider, model, messages, useMemory,
+      profile, signal: controller.signal, suggestMemories,
+      onChunk: (chunk) => { if (!event.sender.isDestroyed()) event.sender.send('chat:chunk', { requestId, chunk }); } });
+    appendChatMessage({ chat_id: chatId, role: 'assistant', content: result.answer, model, memory_ids: result.memoryIds });
+    return { ...result, chat: listChats().find((item) => item.id === Number(chatId)) };
+  } catch (error) {
+    if (error.message !== 'Stopped.') throw error;
+    return { stopped: true, chat: listChats().find((item) => item.id === Number(chatId)) };
+  } finally { chatControllers.delete(requestId); }
+});
 ipcMain.handle('pending-memories:list', () => getPendingMemories());
 ipcMain.handle('pending-memories:approve', (_event, id, title, content) => {
   const memoryId = approvePendingMemory(id, title, content);

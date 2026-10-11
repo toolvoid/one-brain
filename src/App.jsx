@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import BrainGraph from './components/BrainGraph.jsx';
 import { MAX_IMPORT_ITEMS, isLogLikeChunk, parseImportText } from './lib/importers.js';
+import { isChatModel, memorySourceForProvider } from './lib/chat-models.mjs';
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 const SOURCE_COLORS = {
@@ -190,6 +191,158 @@ function dateLabel(value) {
   return new Date(`${value.replace(' ', 'T')}Z`).toLocaleString();
 }
 
+const CHAT_PROVIDERS = ['openai', 'groq', 'deepseek', 'gemini', 'openrouter'];
+const CHAT_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
+
+function ChatView({ onBack, onOpenMemory, memoryTitles }) {
+  const [settings, setSettings] = useState(null);
+  const [chats, setChats] = useState([]);
+  const [activeId, setActiveId] = useState(null);
+  const [provider, setProvider] = useState('openai');
+  const [model, setModel] = useState('');
+  const [models, setModels] = useState([]);
+  const [modelsUpdatedAt, setModelsUpdatedAt] = useState(null);
+  const [modelError, setModelError] = useState('');
+  const [modelQuery, setModelQuery] = useState('');
+  const [showAllModels, setShowAllModels] = useState(false);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [chatModelPickerOpen, setChatModelPickerOpen] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [grantProvider, setGrantProvider] = useState('');
+  const [grantStatus, setGrantStatus] = useState(null);
+  const [grantSources, setGrantSources] = useState([]);
+  const [savingGrant, setSavingGrant] = useState(false);
+  const [saveEditor, setSaveEditor] = useState(null);
+  const [saveTitle, setSaveTitle] = useState('');
+  const [saveContent, setSaveContent] = useState('');
+  const [requestId, setRequestId] = useState('');
+  const chatRef = useRef(null);
+  const requestChatRef = useRef(null);
+  const activeChat = chats.find((chat) => chat.id === activeId) || null;
+  const availableProviders = CHAT_PROVIDERS.filter((item) => settings?.providerKeyStatus?.[item]);
+  const visibleModels = models.filter((id) => (showAllModels || isChatModel(id)) && id.toLowerCase().includes(modelQuery.toLowerCase()));
+
+  async function refreshChats(selectId) {
+    const next = await window.brain.listChats();
+    setChats(next);
+    if (selectId) setActiveId(selectId);
+  }
+  async function loadModels(nextProvider, refresh = false, preferred = '') {
+    if (!nextProvider) return;
+    setProvider(nextProvider); setModelError(''); setModels([]); setModelsUpdatedAt(null);
+    const remembered = localStorage.getItem(`onebrain-chat-model:${nextProvider}`) || '';
+    try {
+      const result = await window.brain.listChatModels(nextProvider, refresh);
+      setModels(result.ids); setModelsUpdatedAt(result.updatedAt);
+      setModel(preferred && result.ids.includes(preferred) ? preferred : remembered && result.ids.includes(remembered) ? remembered : result.ids.find(isChatModel) || result.ids[0] || '');
+    } catch (reason) { setModelError(reason.message || 'Could not load models.'); setModel(preferred || remembered); }
+  }
+  useEffect(() => {
+    let alive = true;
+    Promise.all([window.brain.getMemoryProxySettings(), window.brain.listChats()]).then(([proxySettings, existing]) => {
+      if (!alive) return;
+      setSettings(proxySettings); setChats(existing);
+      const nextProviders = CHAT_PROVIDERS.filter((item) => proxySettings.providerKeyStatus?.[item]);
+      if (existing[0]) { setActiveId(existing[0].id); setProvider(existing[0].provider); setModel(existing[0].model); void loadModels(existing[0].provider, false, existing[0].model); }
+      else if (nextProviders[0]) void loadModels(nextProviders[0]);
+    }).catch((reason) => { if (alive) setError(reason.message || 'Chat is unavailable.'); });
+    return () => { alive = false; };
+  }, []);
+  useEffect(() => window.brain.onChatChunk(({ requestId: id, chunk }) => {
+    if (id !== chatRef.current) return;
+    const targetChatId = requestChatRef.current;
+    setChats((current) => current.map((chat) => chat.id === targetChatId ? { ...chat,
+      messages: [...chat.messages.slice(0, -1), { ...chat.messages.at(-1), content: `${chat.messages.at(-1)?.content || ''}${chunk}` }] } : chat));
+  }), [activeId]);
+
+  function selectNewModel(value) { setActiveId(null); setModel(value); localStorage.setItem(`onebrain-chat-model:${provider}`, value); }
+  async function createNewChat() {
+    if (!provider || !model.trim()) { setModelError('Choose or enter a model first.'); return; }
+    let grant = await window.brain.getChatGrant(provider);
+    if (!grant) { setGrantProvider(provider); setGrantStatus(null); setGrantSources([]); return; }
+    await openNew(grant, provider);
+  }
+  async function openNew(grant, targetProvider = provider) {
+    const id = await window.brain.createChat(targetProvider, model.trim());
+    if (!grant) await window.brain.saveChatGrant(targetProvider, grantSources);
+    localStorage.setItem(`onebrain-chat-model:${targetProvider}`, model.trim());
+    await refreshChats(id); setError('');
+  }
+  async function saveGrant() {
+    setSavingGrant(true);
+    try {
+      await window.brain.saveChatGrant(grantProvider, grantSources);
+      const providerToContinue = grantProvider;
+      setGrantProvider('');
+      if (grantStatus) { await window.brain.updateChat(grantStatus.id, { use_memory: true }); await refreshChats(grantStatus.id); }
+      else { setProvider(providerToContinue); await openNew(true, providerToContinue); }
+    }
+    catch (reason) { setError(reason.message || 'Could not save provider permissions.'); }
+    finally { setSavingGrant(false); }
+  }
+  async function selectChat(chat) {
+    setActiveId(chat.id); setProvider(chat.provider); setModel(chat.model); setError('');
+    localStorage.setItem(`onebrain-chat-model:${chat.provider}`, chat.model);
+    void loadModels(chat.provider, false, chat.model);
+  }
+  async function changeModel(value) {
+    setModel(value); localStorage.setItem(`onebrain-chat-model:${provider}`, value);
+    if (activeChat) { await window.brain.updateChat(activeChat.id, { model: value }); await refreshChats(activeChat.id); }
+  }
+  async function toggleMemory(value) {
+    if (!activeChat) return;
+    if (value && !(await window.brain.getChatGrant(activeChat.provider))) {
+      setGrantProvider(activeChat.provider); setGrantStatus(activeChat); setGrantSources([]); return;
+    }
+    await window.brain.updateChat(activeChat.id, { use_memory: value }); await refreshChats(activeChat.id);
+  }
+  async function send(event) {
+    event.preventDefault();
+    const text = draft.trim(); if (!text || !activeChat || busy || !model.trim()) return;
+    const id = `${activeChat.id}-${Date.now()}`; chatRef.current = id; requestChatRef.current = activeChat.id; setRequestId(id); setDraft(''); setError(''); setBusy(true);
+    const userMessage = { id, role: 'user', content: text, model };
+    const assistant = { id: `${id}-assistant`, role: 'assistant', content: '', model, memory_ids: [] };
+    setChats((current) => current.map((chat) => chat.id === activeChat.id ? { ...chat, model, title: chat.title === 'New chat' ? text.slice(0, 40) : chat.title, messages: [...chat.messages, userMessage, assistant] } : chat));
+    try {
+      const result = await window.brain.sendChat({ requestId: id, chatId: activeChat.id, text, model,
+        useMemory: Boolean(activeChat.use_memory), suggestMemories: Boolean(activeChat.suggest_memories) });
+      if (result.stopped) { setChats(result.chat ? (await window.brain.listChats()) : []); }
+      else setChats((current) => current.map((chat) => chat.id === activeChat.id ? result.chat : chat));
+    } catch (reason) { setError(reason.message || 'The provider request failed.'); setChats(await window.brain.listChats()); }
+    finally { setBusy(false); setRequestId(''); chatRef.current = null; requestChatRef.current = null; }
+  }
+  async function stop() { if (requestId) await window.brain.stopChat(requestId); }
+  async function removeChat(chat) {
+    await window.brain.deleteChat(chat.id);
+    const next = await window.brain.listChats(); setChats(next); setActiveId(next[0]?.id || null);
+  }
+  async function renameChat(chat) {
+    const next = window.prompt('Chat title', chat.title);
+    if (next !== null) { await window.brain.updateChat(chat.id, { title: next.trim() || 'New chat' }); await refreshChats(chat.id); }
+  }
+  async function saveMemory() {
+    try { await window.brain.saveChatMemory(saveEditor.source, saveTitle.trim(), saveContent.trim()); setSaveEditor(null); }
+    catch (reason) { setError(reason.message || 'Could not save memory.'); }
+  }
+  const mappedSource = (item) => memorySourceForProvider(item.provider);
+  return <section className="chat-view">
+    <header className="chat-topbar"><button className="back-button" type="button" onClick={onBack}>‹</button><div><h1>Chat</h1><p>Conversations are stored locally in your encrypted database.</p></div></header>
+    <div className="chat-layout"><aside className="chat-list"><div className="chat-new-box"><strong>New chat</strong><label>Provider<select value={provider} onChange={(event) => { setActiveId(null); void loadModels(event.target.value); }}>{availableProviders.map((item) => <option key={item}>{item}</option>)}</select></label>
+      <label>Model{models.length && !modelError ? <div className="model-picker"><button type="button" onClick={() => setModelPickerOpen((value) => !value)}>{model || 'Choose model'} ▾</button>{modelPickerOpen && <div className="model-menu"><input value={modelQuery} onChange={(event) => setModelQuery(event.target.value)} placeholder="Search models" />{visibleModels.map((item) => <button type="button" key={item} onClick={() => { selectNewModel(item); setModelPickerOpen(false); }}>{item}</button>)}{visibleModels.length === 0 && <small>No models match.</small>}</div>}</div> : <input value={model} onChange={(event) => selectNewModel(event.target.value)} placeholder="Type a model id" />}</label>
+      {models.length > 0 && !modelError && <><label className="chat-toggle"><input type="checkbox" checked={showAllModels} onChange={(event) => setShowAllModels(event.target.checked)} />Show all models</label><div className="model-refresh"><button type="button" onClick={() => void loadModels(provider, true)}>Refresh</button><small>{modelsUpdatedAt ? `Updated ${new Date(modelsUpdatedAt).toLocaleString()}` : ''}</small></div></>}
+      {(modelError || error) && <p className="chat-error">{modelError || error}</p>}<button className="chat-create" type="button" onClick={() => void createNewChat()} disabled={!availableProviders.length}>New chat</button></div>
+      <div className="chat-list-items">{chats.map((chat) => <article className={chat.id === activeId ? 'is-active' : ''} key={chat.id}><button type="button" className="chat-select" onClick={() => void selectChat(chat)}><small>{chat.provider}</small><strong>{chat.title}</strong></button><button type="button" title="Rename chat" onClick={() => void renameChat(chat)}>✎</button><button type="button" title="Delete chat" onClick={() => void removeChat(chat)}>×</button></article>)}{chats.length === 0 && <p className="empty-note">No chats yet.</p>}</div></aside>
+      <section className="chat-conversation">{activeChat ? <><header className="chat-controls"><div><span className="chat-provider-badge">{activeChat.provider}</span><input aria-label="Chat title" value={activeChat.title} onChange={(event) => { setChats((items) => items.map((item) => item.id === activeChat.id ? { ...item, title: event.target.value } : item)); }} onBlur={() => void window.brain.updateChat(activeChat.id, { title: activeChat.title })} /></div><label className="chat-toggle"><input type="checkbox" checked={Boolean(activeChat.use_memory)} onChange={(event) => void toggleMemory(event.target.checked)} />Use memory</label><label className="chat-toggle"><input type="checkbox" checked={Boolean(activeChat.suggest_memories)} onChange={async (event) => { await window.brain.updateChat(activeChat.id, { suggest_memories: event.target.checked }); await refreshChats(activeChat.id); }} />Suggest memories after answers</label><label className="chat-model-inline">Model{models.length && !modelError ? <div className="model-picker"><button type="button" onClick={() => setChatModelPickerOpen((value) => !value)}>{activeChat.model} ▾</button>{chatModelPickerOpen && <div className="model-menu"><input value={modelQuery} onChange={(event) => setModelQuery(event.target.value)} placeholder="Search models" />{visibleModels.map((item) => <button type="button" key={item} onClick={() => { void changeModel(item); setChatModelPickerOpen(false); }}>{item}</button>)}</div>}</div> : <input value={model} onChange={(event) => setModel(event.target.value)} onBlur={() => void changeModel(model)} />}</label></header>
+        <div className="chat-messages">{activeChat.messages.map((message) => <article className={`chat-message ${message.role}`} key={message.id}><div className="chat-message-head"><strong>{message.role === 'assistant' ? activeChat.provider : 'You'}</strong>{message.model && <small>{message.model}</small>}</div><p>{message.content}</p><div className="chat-message-actions"><button type="button" onClick={() => { setSaveTitle(''); setSaveContent(message.content); setSaveEditor({ message, source: mappedSource(activeChat.provider) || '' }); }}>Save</button>{message.role === 'assistant' && <details><summary>Memories used ({message.memory_ids?.length || 0})</summary><ul>{message.memory_ids.map((memoryId) => <li key={memoryId}><button type="button" onClick={() => onOpenMemory(memoryId)}>{memoryTitles[memoryId] || `Memory #${memoryId}`}</button></li>)}</ul></details>}</div></article>)}{activeChat.messages.length === 0 && <p className="chat-empty">Send a message to start this conversation.</p>}</div>
+        {error && <p className="chat-error chat-error-line" role="alert">{error}</p>}<form className="chat-compose" onSubmit={(event) => void send(event)}><textarea value={draft} onChange={(event) => setDraft(event.target.value)} rows="3" placeholder="Message" disabled={busy} /><div><small>Sent to {activeChat.provider} using the selected model.</small>{busy && <button type="button" onClick={() => void stop()}>Stop</button>}<button type="submit" disabled={busy || !draft.trim()}>Send</button></div></form>
+      </> : <div className="chat-empty">{availableProviders.length ? 'Choose a chat or create a new one.' : 'Save a provider key in Connect AI to start chatting.'}</div>}</section></div>
+    {grantProvider && <div className="modal-backdrop"><section className="chat-grant-modal"><header><h2>Allow {grantProvider} to read memories?</h2><button type="button" onClick={() => setGrantProvider('')}>×</button></header><p>Memory text you select here may be sent to {grantProvider} when you use memory in Chat. Private memories are never sent.</p>{CHAT_SOURCES.map((source) => <label className="chat-toggle" key={source}><input type="checkbox" checked={grantSources.includes(source)} onChange={(event) => setGrantSources((items) => event.target.checked ? [...items, source] : items.filter((item) => item !== source))} />{source}</label>)}<footer><button type="button" onClick={() => setGrantProvider('')}>Cancel</button><button type="button" disabled={savingGrant} onClick={() => void saveGrant()}>{savingGrant ? 'Saving…' : 'Save permissions'}</button></footer></section></div>}
+    {saveEditor && <div className="modal-backdrop"><form className="chat-grant-modal" onSubmit={(event) => { event.preventDefault(); void saveMemory(); }}><header><h2>Save as memory</h2><button type="button" onClick={() => setSaveEditor(null)}>×</button></header>{!saveEditor.source && <label>Memory source<select value={saveEditor.source} onChange={(event) => setSaveEditor({ ...saveEditor, source: event.target.value })}>{CHAT_SOURCES.map((source) => <option key={source}>{source}</option>)}</select></label>}<label>Title<input value={saveTitle} onChange={(event) => setSaveTitle(event.target.value)} /></label><label>Text<textarea rows="7" value={saveContent} onChange={(event) => setSaveContent(event.target.value)} /></label><footer><button type="button" onClick={() => setSaveEditor(null)}>Cancel</button><button type="submit" disabled={!saveEditor.source || !saveContent.trim()}>Save memory</button></footer></form></div>}
+  </section>;
+}
+
 function connectorPreviewText(edit) {
   if (edit.path.startsWith('Local token for ') || edit.path.startsWith('Secure token for ') || edit.path.startsWith('Copyable setup for ')) return edit.after;
   if (edit.path.endsWith('AGENTS.md') || edit.path.endsWith('GEMINI.md')) {
@@ -284,6 +437,7 @@ function App() {
   const [pendingWriteSource, setPendingWriteSource] = useState(SOURCES[2]);
   const [privacyNoticeOpen, setPrivacyNoticeOpen] = useState(() => window.localStorage.getItem('one-brain-provider-notice-dismissed') !== '1');
   const [insightsOpen, setInsightsOpen] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
   const [insightsData, setInsightsData] = useState(null);
   const [sql, setSql] = useState('SELECT date(ts) AS day, count(*) AS calls FROM events GROUP BY date(ts) ORDER BY day DESC;');
   const [sqlResult, setSqlResult] = useState(null);
@@ -467,6 +621,7 @@ function App() {
   }
 
   async function openInsights() {
+    setChatOpen(false);
     setInsightsOpen(true);
     try { setInsightsData(await window.brain.getInsights()); }
     catch (error) { setInsightsData({}); setSqlResult({ error: error.message || 'Could not load insights.' }); }
@@ -807,8 +962,9 @@ function App() {
     <main className="memory-app">
       <BrainGraph ref={graphRef} memories={memories} counts={counts} links={visibleGraphLinks} dataReady={dataReady} sidebarCollapsed={sidebarCollapsed} linksVisible={linksVisible} onLinksVisibleChange={setLinksVisible} />
       {insightsOpen && <InsightsView data={insightsData} onBack={() => setInsightsOpen(false)} sql={sql} setSql={setSql} runSql={runAnalyticsQuery} sqlResult={sqlResult} sqlRunning={sqlRunning} onResetRetrievalCounts={resetRetrievalCounts} />}
-      <aside className={`memory-panel${sidebarCollapsed ? ' is-collapsed' : ''}`} style={insightsOpen ? { display: 'none' } : undefined}>
-        <header className="sidebar-header"><strong>One Brain</strong><button type="button" onClick={() => { setPendingOpen(true); setConnectOpen(false); void refreshPendingMemories(); }}>Pending ({pendingMemories.length})</button><button type="button" onClick={openInsights}>Insights</button></header>
+      {chatOpen && <ChatView onBack={() => setChatOpen(false)} memoryTitles={Object.fromEntries(memories.map((item) => [item.id, item.title || 'Untitled memory']))} onOpenMemory={(id) => { setChatOpen(false); setInsightsOpen(false); setSelectedId(id); setSidebarCollapsed(false); graphRef.current?.retrieve(id); }} />}
+      <aside className={`memory-panel${sidebarCollapsed ? ' is-collapsed' : ''}`} style={insightsOpen || chatOpen ? { display: 'none' } : undefined}>
+        <header className="sidebar-header"><strong>One Brain</strong><button type="button" onClick={() => { setPendingOpen(true); setConnectOpen(false); void refreshPendingMemories(); }}>Pending ({pendingMemories.length})</button><button type="button" onClick={() => { setInsightsOpen(false); setChatOpen(true); }}>Chat</button><button type="button" onClick={openInsights}>Insights</button></header>
         {pendingOpen ? <><header className="detail-header"><button className="back-button" type="button" onClick={() => setPendingOpen(false)}>‹</button><span>Pending memories</span></header><PendingMemoryInbox items={pendingMemories} onRefresh={refreshPendingMemories} /></> : connectOpen ? (
           <section className="connect-view">
             <header className="detail-header"><button className="back-button" type="button" onClick={() => setConnectOpen(false)}>‹</button><span>Connect AI</span>{suggestions.length > 0 && <button className="header-suggestions" type="button" onClick={() => { setConnectOpen(false); setSuggestionsOpen(true); }}>Suggestions ({suggestions.length})</button>}</header>
@@ -968,7 +1124,7 @@ function App() {
           </>
         )}
       </aside>
-      {!insightsOpen && <button className="sidebar-toggle" type="button" aria-label={sidebarCollapsed ? 'Expand memories sidebar' : 'Collapse memories sidebar'} aria-expanded={!sidebarCollapsed} onClick={() => setSidebarCollapsed((collapsed) => !collapsed)} style={{ left: sidebarCollapsed ? 32 : 'min(360px, 92vw)' }}>{sidebarCollapsed ? '›' : '‹'}</button>}
+      {!insightsOpen && !chatOpen && <button className="sidebar-toggle" type="button" aria-label={sidebarCollapsed ? 'Expand memories sidebar' : 'Collapse memories sidebar'} aria-expanded={!sidebarCollapsed} onClick={() => setSidebarCollapsed((collapsed) => !collapsed)} style={{ left: sidebarCollapsed ? 32 : 'min(360px, 92vw)' }}>{sidebarCollapsed ? '›' : '‹'}</button>}
       {suggestionToast && <button className="suggestion-toast" type="button" onClick={() => { setSuggestionToast(false); setSuggestionsOpen(true); }}>1 possible link found - Review</button>}
 
       {privacyNoticeOpen && createPortal(<div className="modal-backdrop notice-backdrop"><section className="consent-modal" role="dialog" aria-modal="true" aria-labelledby="provider-notice-title"><h2 id="provider-notice-title">Privacy notice</h2><p>When a cloud AI reads a memory through One Brain, that text is sent to that AI's provider.</p><button className="save-button" type="button" onClick={dismissPrivacyNotice}>Got it</button></section></div>, document.body)}
@@ -1024,6 +1180,23 @@ function App() {
         .sidebar-header { display:flex;align-items:center;justify-content:space-between;margin:0 0 13px;padding:0 1px;color:#edf3fc;font-size:14px; }
         .sidebar-header button,.sql-toggle,.run-sql-button { border:1px solid rgba(143,196,255,.25);border-radius:6px;padding:6px 10px;color:#c7e1ff;background:#182a40;font:11px system-ui,sans-serif;cursor:pointer; }
         .insights-view { box-sizing:border-box;position:absolute;z-index:10;inset:0;overflow:auto;padding:24px clamp(18px,4vw,56px) 48px;color:#e8edf7;background:#080d17;font:13px/1.45 system-ui,sans-serif; }
+        .chat-view { box-sizing:border-box;position:absolute;z-index:15;inset:0;display:flex;flex-direction:column;overflow:hidden;color:#e8edf7;background:#080d17;font:13px/1.45 system-ui,sans-serif; }
+        .chat-topbar { display:flex;align-items:center;gap:12px;flex:0 0 auto;padding:13px 20px;border-bottom:1px solid rgba(175,195,224,.14);background:#0b111c; }
+        .chat-topbar h1 { margin:0;font-size:17px; }.chat-topbar p { margin:2px 0 0;color:#8494aa;font-size:10px; }
+        .chat-layout { display:grid;grid-template-columns:minmax(240px,300px) minmax(0,1fr);flex:1;min-height:0; }
+        .chat-list { display:flex;flex-direction:column;min-height:0;overflow:auto;padding:12px;border-right:1px solid rgba(175,195,224,.14);background:#0a101a; }
+        .chat-new-box { display:grid;gap:8px;padding:10px;border:1px solid rgba(175,195,224,.13);border-radius:9px;background:#101927; }.chat-new-box > strong { color:#e6edf7;font-size:12px; }
+        .chat-new-box label,.chat-grant-modal > label { display:grid;gap:4px;color:#aab9cc;font-size:10px; }
+        .chat-new-box input,.chat-new-box select,.chat-model-inline input,.chat-model-inline select,.chat-controls input,.chat-grant-modal input,.chat-grant-modal select,.chat-grant-modal textarea,.model-menu input { box-sizing:border-box;width:100%;min-width:0;border:1px solid #354054;border-radius:6px;padding:7px 8px;color:#edf2fb;background:#111827;font:11px system-ui,sans-serif; }
+        .model-picker { position:relative; }.model-picker > button { width:100%;overflow:hidden;border:1px solid #354054;border-radius:6px;padding:7px 8px;color:#edf2fb;text-align:left;text-overflow:ellipsis;white-space:nowrap;background:#111827;font:11px system-ui,sans-serif;cursor:pointer; }
+        .model-menu { position:absolute;z-index:4;top:calc(100% + 4px);left:0;right:0;display:grid;gap:3px;max-height:220px;overflow:auto;padding:6px;border:1px solid #354054;border-radius:7px;background:#101927;box-shadow:0 10px 24px #0009; }.model-menu button { border:0;border-radius:4px;padding:6px;color:#c9d8e9;text-align:left;background:transparent;font:10px system-ui,sans-serif;cursor:pointer; }.model-menu button:hover { background:#1d3047; }.model-menu small { color:#8494aa; }
+        .chat-toggle { display:flex;align-items:center;gap:6px;color:#aebdd0;font-size:10px; }.chat-toggle input { accent-color:#67b6c6; }
+        .model-refresh { display:flex;align-items:center;justify-content:space-between;gap:6px; }.model-refresh button,.chat-create,.chat-list-items article > button,.chat-message-actions button,.chat-compose button,.chat-grant-modal footer button { border:1px solid rgba(143,196,255,.24);border-radius:6px;padding:6px 8px;color:#c7e1ff;background:#182a40;font:10px system-ui,sans-serif;cursor:pointer; }.model-refresh small { color:#8292a7;font-size:8px; }.chat-create { padding:8px; }.chat-create:disabled,.chat-compose button:disabled { opacity:.5; }
+        .chat-list-items { display:grid;align-content:start;gap:5px;margin-top:11px; }.chat-list-items article { display:flex;align-items:center;gap:4px;padding:5px;border:1px solid transparent;border-radius:7px; }.chat-list-items article.is-active { border-color:rgba(125,180,231,.24);background:#121f30; }.chat-list-items article > button { padding:4px 6px; }.chat-list-items article .chat-select { display:grid;flex:1;min-width:0;border:0;text-align:left;background:transparent; }.chat-select small { color:#8ca4bf;text-transform:capitalize; }.chat-select strong { overflow:hidden;color:#dce7f3;text-overflow:ellipsis;white-space:nowrap;font-size:10px;font-weight:550; }
+        .chat-conversation { display:flex;flex-direction:column;min-width:0;min-height:0;padding:0 22px 15px; }.chat-controls { display:flex;align-items:center;gap:13px;flex-wrap:wrap;padding:12px 0;border-bottom:1px solid rgba(175,195,224,.12); }.chat-controls > div { display:flex;align-items:center;gap:7px;flex:1;min-width:170px; }.chat-controls > div > input { border:0;background:transparent;font-size:13px; }.chat-provider-badge { flex:none;border:1px solid rgba(105,179,220,.25);border-radius:999px;padding:4px 7px;color:#a7d7ee;background:#142635;font-size:9px;text-transform:capitalize; }.chat-model-inline { display:grid;gap:3px;min-width:150px;color:#9fb0c5;font-size:9px; }
+        .chat-messages { display:flex;flex:1;flex-direction:column;align-items:stretch;gap:12px;overflow:auto;padding:16px 2px; }.chat-message { max-width:min(850px,94%);padding:11px 13px;border:1px solid rgba(175,195,224,.14);border-radius:10px;background:#101927; }.chat-message.user { align-self:flex-end;background:#122131; }.chat-message.assistant { align-self:flex-start; }.chat-message-head { display:flex;justify-content:space-between;gap:14px;color:#cbd9e9;font-size:10px; }.chat-message-head small { color:#8292a7;font-size:9px; }.chat-message p { margin:7px 0;color:#e1e8f1;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere; }.chat-message-actions { display:flex;align-items:center;gap:9px; }.chat-message-actions details { color:#a9c8e5;font-size:10px; }.chat-message-actions summary { cursor:pointer; }.chat-message-actions ul { margin:5px 0;padding-left:16px; }.chat-message-actions li button { border:0;padding:3px;color:#b5d5f0;background:transparent;font:10px system-ui,sans-serif;text-align:left;cursor:pointer; }
+        .chat-compose { display:grid;gap:7px;max-width:900px;width:100%;margin:0 auto; }.chat-compose textarea { box-sizing:border-box;width:100%;resize:vertical;border:1px solid #354054;border-radius:9px;padding:11px;color:#edf2fb;background:#111827;font:12px/1.5 system-ui,sans-serif; }.chat-compose > div { display:flex;align-items:center;justify-content:flex-end;gap:8px; }.chat-compose small { margin-right:auto;color:#8191a6;font-size:9px; }.chat-compose button { min-width:54px; }.chat-empty { margin:auto;color:#8595aa;text-align:center; }.chat-error { margin:0;color:#ffaaa7;font-size:10px;overflow-wrap:anywhere; }.chat-error-line { max-width:900px;width:100%;margin:0 auto 7px; }
+        .chat-grant-modal { display:grid;gap:10px;width:min(430px,94vw);padding:17px;border:1px solid rgba(175,195,224,.19);border-radius:11px;background:#101927;box-shadow:0 20px 70px #0009; }.chat-grant-modal header,.chat-grant-modal footer { display:flex;align-items:center;justify-content:space-between;gap:9px; }.chat-grant-modal h2 { margin:0;color:#e5edf8;font-size:15px; }.chat-grant-modal header > button { border:0;color:#b7c5d7;background:transparent;font-size:20px;cursor:pointer; }.chat-grant-modal p { margin:0;color:#a9b8cb;font-size:11px; }.chat-grant-modal footer { justify-content:flex-end;margin-top:5px; }
         .insights-header { display:flex;align-items:center;gap:14px;margin:0 auto 22px;max-width:1500px; }
         .insights-header h1 { margin:0;color:#edf3fc;font-size:22px; }
         .insights-header p { margin:3px 0 0;color:#8494aa;font-size:11px; }

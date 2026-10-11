@@ -54,6 +54,7 @@ async function exerciseProxy({ dryRun }) {
     getMemoryForClient: () => ({ memory: { id: 42, source: 'codex', title: 'Preference', content: 'Prefers concise answers.' } }),
     recordProxyEvent: (value) => { event = value; },
     addPendingMemory: async () => {},
+    listenPort: 0,
     providerUrls: { openai: 'http://mock-upstream' },
     fetchImpl: async (_url, init) => {
       sentBody = JSON.parse(init.body);

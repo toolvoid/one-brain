@@ -56,6 +56,21 @@ contextBridge.exposeInMainWorld('brain', {
   updateMemoryProxySettings: (values) => ipcRenderer.invoke('memory-proxy:update-settings', values),
   saveProviderKey: (provider, key) => ipcRenderer.invoke('memory-proxy:save-key', provider, key),
   deleteProviderKey: (provider) => ipcRenderer.invoke('memory-proxy:delete-key', provider),
+  listChatModels: (provider, refresh = false) => ipcRenderer.invoke('chat:models', provider, refresh),
+  getChatGrant: (provider) => ipcRenderer.invoke('chat:grant', provider),
+  saveChatGrant: (provider, sources) => ipcRenderer.invoke('chat:grant-save', provider, sources),
+  listChats: () => ipcRenderer.invoke('chat:list'),
+  createChat: (provider, model) => ipcRenderer.invoke('chat:create', provider, model),
+  updateChat: (id, patch) => ipcRenderer.invoke('chat:update', id, patch),
+  deleteChat: (id) => ipcRenderer.invoke('chat:delete', id),
+  sendChat: (payload) => ipcRenderer.invoke('chat:send', payload),
+  stopChat: (requestId) => ipcRenderer.invoke('chat:stop', requestId),
+  saveChatMemory: (source, title, content) => ipcRenderer.invoke('chat:save-memory', source, title, content),
+  onChatChunk: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('chat:chunk', listener);
+    return () => ipcRenderer.removeListener('chat:chunk', listener);
+  },
   listPendingMemories: () => ipcRenderer.invoke('pending-memories:list'),
   approvePendingMemory: (id, title, content) => ipcRenderer.invoke('pending-memories:approve', id, title, content),
   rejectPendingMemory: (id) => ipcRenderer.invoke('pending-memories:reject', id),

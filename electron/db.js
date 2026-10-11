@@ -164,19 +164,79 @@ function authenticateClientToken(token) {
 
 function getProxyClientProfile(client) {
   const name = String(client || '').trim();
-  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) return null;
+  if (!/^[a-z0-9][a-z0-9:-]{0,63}$/.test(name)) return null;
   const profile = getDatabase().prepare('SELECT client, write_source, status, verified FROM client_profiles WHERE client = ?').get(name);
   if (!profile) return null;
   profile.allowedSources = getDatabase().prepare("SELECT read_source FROM client_grants WHERE client = ? AND status = 'allow'").all(name).map((row) => row.read_source);
   return profile;
 }
 
+function getChatGrant(provider) {
+  const client = `chat:${String(provider || '')}`;
+  const profile = getDatabase().prepare('SELECT client, write_source, status FROM client_profiles WHERE client = ?').get(client);
+  if (!profile) return null;
+  profile.allowedSources = getDatabase().prepare("SELECT read_source FROM client_grants WHERE client = ? AND status = 'allow'").all(client).map((row) => row.read_source);
+  profile.grants = Object.fromEntries(MEMORY_SOURCES.map((source) => [source,
+    getDatabase().prepare('SELECT status FROM client_grants WHERE client = ? AND read_source = ?').get(client, source)?.status || 'deny']));
+  return profile;
+}
+
+function saveChatGrant(provider, readSources) {
+  ensureWritable();
+  const client = `chat:${String(provider || '')}`;
+  const allowed = new Set((Array.isArray(readSources) ? readSources : []).filter((source) => MEMORY_SOURCES.includes(source)));
+  const db = getDatabase();
+  const save = db.transaction(() => {
+    db.prepare(`INSERT INTO client_profiles (client, write_source, status, verified) VALUES (?, NULL, 'approved', 1)
+      ON CONFLICT(client) DO UPDATE SET status = 'approved'`).run(client);
+    const grant = db.prepare(`INSERT INTO client_grants (client, read_source, status) VALUES (?, ?, ?)
+      ON CONFLICT(client, read_source) DO UPDATE SET status = excluded.status`);
+    for (const source of MEMORY_SOURCES) grant.run(client, source, allowed.has(source) ? 'allow' : 'deny');
+  });
+  save();
+  return getChatGrant(provider);
+}
+
+function listChats() {
+  return getDatabase().prepare('SELECT * FROM chats ORDER BY id DESC').all().map((chat) => ({
+    ...chat,
+    messages: getDatabase().prepare('SELECT id, chat_id, role, content, model, memory_ids, created_at FROM chat_messages WHERE chat_id = ? ORDER BY id').all(chat.id)
+      .map((message) => ({ ...message, memory_ids: JSON.parse(message.memory_ids || '[]') }))
+  }));
+}
+
+function createChat(provider, model) {
+  ensureWritable();
+  const result = getDatabase().prepare("INSERT INTO chats (provider, model, title) VALUES (?, ?, 'New chat')").run(provider, model);
+  return Number(result.lastInsertRowid);
+}
+
+function updateChat(id, patch = {}) {
+  ensureWritable();
+  if (patch.title !== undefined) getDatabase().prepare('UPDATE chats SET title = ? WHERE id = ?').run(String(patch.title).slice(0, 200), Number(id));
+  if (patch.model !== undefined) getDatabase().prepare('UPDATE chats SET model = ? WHERE id = ?').run(String(patch.model).slice(0, 200), Number(id));
+  if (patch.provider !== undefined) getDatabase().prepare('UPDATE chats SET provider = ? WHERE id = ?').run(String(patch.provider), Number(id));
+  if (patch.use_memory !== undefined) getDatabase().prepare('UPDATE chats SET use_memory = ? WHERE id = ?').run(patch.use_memory ? 1 : 0, Number(id));
+  if (patch.suggest_memories !== undefined) getDatabase().prepare('UPDATE chats SET suggest_memories = ? WHERE id = ?').run(patch.suggest_memories ? 1 : 0, Number(id));
+  return true;
+}
+
+function appendChatMessage({ chat_id, role, content, model = null, memory_ids = [] }) {
+  ensureWritable();
+  const result = getDatabase().prepare('INSERT INTO chat_messages (chat_id, role, content, model, memory_ids) VALUES (?, ?, ?, ?, ?)')
+    .run(Number(chat_id), role, String(content), model, JSON.stringify(memory_ids.map(Number).filter(Number.isInteger)));
+  return Number(result.lastInsertRowid);
+}
+
+function deleteChat(id) { ensureWritable(); return getDatabase().prepare('DELETE FROM chats WHERE id = ?').run(Number(id)).changes > 0; }
+
 function recordProxyEvent(event = {}, memoryIds = []) {
   try {
     const db = getDatabase();
     const result = db.prepare(`INSERT INTO events (kind, tool, client, provider, query, result_count, memories_injected, estimated_tokens_added, latency_ms, upstream_status, ok, error, verified)
-      VALUES ('proxy_call', 'memory_proxy', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 1)`)
+      VALUES ('proxy_call', 'memory_proxy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`)
       .run(String(event.client || '').slice(0, 120), String(event.provider || '').slice(0, 32),
+        event.query === '' ? '' : null,
         Math.max(0, Number(event.memories_injected) || 0), Math.max(0, Number(event.memories_injected) || 0),
         Math.max(0, Number(event.estimated_tokens_added) || 0), Math.max(0, Math.round(event.latency_ms || 0)),
         Number.isInteger(event.upstream_status) ? event.upstream_status : null, event.ok ? 1 : 0,
@@ -731,6 +791,24 @@ function getDatabase() {
         last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         verified INTEGER NOT NULL DEFAULT 0,
         reported_name TEXT
+      );
+      CREATE TABLE IF NOT EXISTS chats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        title TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        use_memory INTEGER NOT NULL DEFAULT 1,
+        suggest_memories INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        model TEXT,
+        memory_ids TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TRIGGER IF NOT EXISTS memories_fts_insert AFTER INSERT ON memories BEGIN
         INSERT INTO memories_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
@@ -1573,4 +1651,4 @@ function countBySource() {
     }, {});
 }
 
-module.exports = { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, recordProxyEvent, getPendingMemories, addPendingMemory, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
+module.exports = { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, recordProxyEvent, getPendingMemories, addPendingMemory, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
