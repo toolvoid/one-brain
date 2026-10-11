@@ -6,6 +6,7 @@ const os = require('os');
 const { createHash, randomBytes, timingSafeEqual } = require('crypto');
 const { Worker } = require('node:worker_threads');
 const { INSIGHT_QUERIES } = require('./analytics-queries');
+const { JOIN_ALL_MIN } = require('../src/lib/link-constants.json');
 const MEMORY_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 
 let database;
@@ -655,12 +656,17 @@ function getDatabase() {
   if (!database || !databaseSchemaReady) {
     if (!database) database = new Database(path.join(app.getPath('userData'), 'onebrain.db'));
     database.pragma('foreign_keys = ON');
+    database.pragma('journal_mode = WAL');
     database.exec(`
       CREATE TABLE IF NOT EXISTS imports (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         source TEXT NOT NULL,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         count INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        id TEXT PRIMARY KEY,
+        applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS memories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -678,6 +684,7 @@ function getDatabase() {
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         score REAL,
         reason TEXT,
+        user_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(user_confirmed IN (0, 1)),
         UNIQUE(a_id, b_id)
       )
       ;
@@ -828,20 +835,27 @@ function getDatabase() {
       END;
     `);
 
-    const eventColumns = new Set(database.prepare('PRAGMA table_info(events)').all().map((column) => column.name));
-    if (!eventColumns.has('verified')) database.exec('ALTER TABLE events ADD COLUMN verified INTEGER');
-    if (!eventColumns.has('reported_name')) database.exec('ALTER TABLE events ADD COLUMN reported_name TEXT');
-    if (!eventColumns.has('provider')) database.exec('ALTER TABLE events ADD COLUMN provider TEXT');
-    if (!eventColumns.has('memories_injected')) database.exec('ALTER TABLE events ADD COLUMN memories_injected INTEGER');
-    if (!eventColumns.has('estimated_tokens_added')) database.exec('ALTER TABLE events ADD COLUMN estimated_tokens_added INTEGER');
-    if (!eventColumns.has('upstream_status')) database.exec('ALTER TABLE events ADD COLUMN upstream_status INTEGER');
-    const profileColumns = new Set(database.prepare('PRAGMA table_info(client_profiles)').all().map((column) => column.name));
-    if (!profileColumns.has('verified')) database.exec('ALTER TABLE client_profiles ADD COLUMN verified INTEGER NOT NULL DEFAULT 0');
-    if (!profileColumns.has('reported_name')) database.exec('ALTER TABLE client_profiles ADD COLUMN reported_name TEXT');
+    const migrate = (id, fn) => database.transaction(() => {
+      if (database.prepare('SELECT 1 FROM schema_migrations WHERE id = ?').get(id)) return;
+      fn();
+      database.prepare('INSERT INTO schema_migrations(id) VALUES (?)').run(id);
+    })();
+    migrate('event-profile-columns-v1', () => {
+      const eventColumns = new Set(database.prepare('PRAGMA table_info(events)').all().map((column) => column.name));
+      if (!eventColumns.has('verified')) database.exec('ALTER TABLE events ADD COLUMN verified INTEGER');
+      if (!eventColumns.has('reported_name')) database.exec('ALTER TABLE events ADD COLUMN reported_name TEXT');
+      if (!eventColumns.has('provider')) database.exec('ALTER TABLE events ADD COLUMN provider TEXT');
+      if (!eventColumns.has('memories_injected')) database.exec('ALTER TABLE events ADD COLUMN memories_injected INTEGER');
+      if (!eventColumns.has('estimated_tokens_added')) database.exec('ALTER TABLE events ADD COLUMN estimated_tokens_added INTEGER');
+      if (!eventColumns.has('upstream_status')) database.exec('ALTER TABLE events ADD COLUMN upstream_status INTEGER');
+      const profileColumns = new Set(database.prepare('PRAGMA table_info(client_profiles)').all().map((column) => column.name));
+      if (!profileColumns.has('verified')) database.exec('ALTER TABLE client_profiles ADD COLUMN verified INTEGER NOT NULL DEFAULT 0');
+      if (!profileColumns.has('reported_name')) database.exec('ALTER TABLE client_profiles ADD COLUMN reported_name TEXT');
+    });
 
     const linkColumns = new Set(database.prepare('PRAGMA table_info(links)').all().map((column) => column.name));
     const linkSql = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'links'").get()?.sql || '';
-    if (!linkColumns.has('score') || !linkColumns.has('reason') || !/semantic/.test(linkSql)) {
+    if (!database.prepare('SELECT 1 FROM schema_migrations WHERE id = ?').get('links-table-v2') && (!linkColumns.has('score') || !linkColumns.has('reason') || !linkColumns.has('user_confirmed') || !/semantic/.test(linkSql))) {
       const scoreColumn = linkColumns.has('score') ? 'score' : 'NULL';
       const reasonColumn = linkColumns.has('reason') ? 'reason' : 'NULL';
       database.exec('BEGIN IMMEDIATE');
@@ -855,21 +869,23 @@ function getDatabase() {
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             score REAL,
             reason TEXT,
+            user_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(user_confirmed IN (0, 1)),
             UNIQUE(a_id, b_id)
           );
-          INSERT INTO links_migrated (id, a_id, b_id, kind, created_at, score, reason)
-          SELECT id, a_id, b_id, kind, created_at, ${scoreColumn}, ${reasonColumn} FROM links;
+          INSERT INTO links_migrated (id, a_id, b_id, kind, created_at, score, reason, user_confirmed)
+          SELECT id, a_id, b_id, kind, created_at, ${scoreColumn}, ${reasonColumn}, ${linkColumns.has('user_confirmed') ? 'user_confirmed' : "CASE WHEN kind = 'manual' THEN 1 ELSE 0 END"} FROM links;
           DROP TABLE links;
           ALTER TABLE links_migrated RENAME TO links;
         `);
+        database.prepare('INSERT INTO schema_migrations(id) VALUES (?)').run('links-table-v2');
         database.exec('COMMIT');
       } catch (error) {
         database.exec('ROLLBACK');
         throw error;
       }
-    }
+    } else database.prepare('INSERT OR IGNORE INTO schema_migrations(id) VALUES (?)').run('links-table-v2');
 
-    const migrateSemanticLinks = database.transaction(() => {
+    migrate('semantic-link-conversion-v1', () => {
       database.prepare(`
         INSERT OR IGNORE INTO link_suggestions (a_id, b_id, score, status)
         SELECT l.a_id, l.b_id, l.score, 'pending'
@@ -880,14 +896,18 @@ function getDatabase() {
             WHERE s.a_id = l.a_id AND s.b_id = l.b_id AND s.status = 'rejected'
           )
       `).run(SUGGEST_MIN, AUTO_MIN);
-      database.prepare("DELETE FROM links WHERE kind = 'semantic' AND (score IS NULL OR score < ?)").run(AUTO_MIN);
+      // Legacy links are durable; this migration only backfills suggestions.
     });
-    migrateSemanticLinks();
+    migrate('link-user-confirmed-v1', () => {
+      database.prepare("UPDATE links SET user_confirmed = 1 WHERE kind = 'manual'").run();
+    });
 
-    const memoryColumns = new Set(database.prepare('PRAGMA table_info(memories)').all().map((column) => column.name));
-    if (!memoryColumns.has('private')) database.exec('ALTER TABLE memories ADD COLUMN private INTEGER NOT NULL DEFAULT 0 CHECK(private IN (0, 1))');
-    if (!memoryColumns.has('content_hash')) database.exec('ALTER TABLE memories ADD COLUMN content_hash TEXT');
-    if (!memoryColumns.has('import_id')) database.exec('ALTER TABLE memories ADD COLUMN import_id INTEGER REFERENCES imports(id) ON DELETE CASCADE');
+    migrate('memory-columns-v1', () => {
+      const memoryColumns = new Set(database.prepare('PRAGMA table_info(memories)').all().map((column) => column.name));
+      if (!memoryColumns.has('private')) database.exec('ALTER TABLE memories ADD COLUMN private INTEGER NOT NULL DEFAULT 0 CHECK(private IN (0, 1))');
+      if (!memoryColumns.has('content_hash')) database.exec('ALTER TABLE memories ADD COLUMN content_hash TEXT');
+      if (!memoryColumns.has('import_id')) database.exec('ALTER TABLE memories ADD COLUMN import_id INTEGER REFERENCES imports(id) ON DELETE CASCADE');
+    });
     database.exec('CREATE INDEX IF NOT EXISTS memories_import_id_idx ON memories(import_id)');
 
     const backfillHashes = database.transaction(() => {
@@ -906,25 +926,37 @@ function getDatabase() {
         if (row.content_hash !== hash) update.run(hash, row.id);
       }
     });
-    backfillHashes();
+    migrate('memory-content-hashes-v1', backfillHashes);
     database.exec('CREATE UNIQUE INDEX IF NOT EXISTS memories_source_content_hash_idx ON memories(source, content_hash)');
 
-    database.prepare("DELETE FROM events WHERE ts < datetime('now', '-90 days')").run();
+    migrate('events-retention-v1', () => database.prepare("DELETE FROM events WHERE ts < datetime('now', '-90 days')").run());
 
-    const migrated = database.prepare('SELECT value FROM brain_meta WHERE key = ?').get('memories_fts_backfilled');
-    if (!migrated) {
-      const backfill = database.transaction(() => {
+    migrate('memories-fts-backfill-v1', () => {
+      const migrated = database.prepare('SELECT value FROM brain_meta WHERE key = ?').get('memories_fts_backfilled');
+      if (!migrated) {
         database.exec('INSERT INTO memories_fts(rowid, title, content) SELECT id, title, content FROM memories');
         database.prepare('INSERT INTO brain_meta(key, value) VALUES (?, ?)').run('memories_fts_backfilled', '1');
-      });
-      backfill();
-    }
+      }
+    });
     database.prepare("INSERT OR IGNORE INTO brain_meta(key, value) VALUES ('retrieval_counts_warning_since', date('now'))").run();
     loadCaches(database);
     databaseSchemaReady = true;
   }
 
   return database;
+}
+
+function closeDatabaseForTest() {
+  if (database?.open) database.close();
+  database = null;
+  databaseSchemaReady = false;
+  cachesLoaded = false;
+  vectorCache = new Map();
+  memoryCache = new Map();
+  embeddingQueue = [];
+  embeddingQueueRunning = false;
+  embeddingJobs = new Map();
+  cancelledEmbeddingIds.clear();
 }
 
 function normalizeTitle(title) {
@@ -1079,7 +1111,6 @@ function configureEmbeddingProvider(provider, model, { onProgress = () => {}, on
   `).all(model).map((row) => row.id);
   const mismatched = db.prepare('SELECT memory_id FROM embeddings WHERE model != ?').all(model).map((row) => row.memory_id);
   if (mismatched.length) {
-    db.prepare("DELETE FROM links WHERE kind = 'semantic'").run();
     for (const id of mismatched) vectorCache.delete(id);
     onLinksChanged({ type: 'semantic-model-refresh' });
   }
@@ -1516,7 +1547,7 @@ function deleteConversationParts(memoryId) {
 
 function listLinks() {
   return getDatabase().prepare(`
-    SELECT links.id, links.a_id, links.b_id, links.kind, links.created_at, links.score, links.reason,
+    SELECT links.id, links.a_id, links.b_id, links.kind, links.created_at, links.score, links.reason, links.user_confirmed,
       a.title AS a_title, a.source AS a_source,
       b.title AS b_title, b.source AS b_source
     FROM links
@@ -1540,7 +1571,8 @@ function createLink(aId, bId) {
 
   const create = db.transaction(() => {
     db.prepare('DELETE FROM link_suggestions WHERE a_id = ? AND b_id = ?').run(lowId, highId);
-    return db.prepare('INSERT OR IGNORE INTO links (a_id, b_id, kind) VALUES (?, ?, \'manual\')').run(lowId, highId);
+    return db.prepare(`INSERT INTO links (a_id, b_id, kind, user_confirmed) VALUES (?, ?, 'manual', 1)
+      ON CONFLICT(a_id, b_id) DO UPDATE SET kind = 'manual', user_confirmed = 1`).run(lowId, highId);
   });
   const result = create();
   return result.changes > 0;
@@ -1585,22 +1617,35 @@ function listRejected() {
 }
 
 function acceptSuggestion(id) {
+  return acceptSuggestions([id]) > 0;
+}
+
+function acceptSuggestions(ids) {
   ensureWritable();
   const db = getDatabase();
   const accept = db.transaction(() => {
-    const suggestion = db.prepare("SELECT a_id, b_id, score FROM link_suggestions WHERE id = ? AND status = 'pending'").get(Number(id));
-    if (!suggestion) return false;
-    db.prepare('DELETE FROM link_suggestions WHERE a_id = ? AND b_id = ?').run(suggestion.a_id, suggestion.b_id);
-    db.prepare("INSERT OR IGNORE INTO links (a_id, b_id, kind, score, reason) VALUES (?, ?, 'semantic', ?, ?)")
-      .run(suggestion.a_id, suggestion.b_id, suggestion.score, `similar meaning (${Number(suggestion.score).toFixed(2)})`);
-    return true;
+    let accepted = 0;
+    for (const id of ids) {
+      const suggestion = db.prepare("SELECT a_id, b_id, score FROM link_suggestions WHERE id = ? AND status = 'pending'").get(Number(id));
+      if (!suggestion) continue;
+      db.prepare('DELETE FROM link_suggestions WHERE a_id = ? AND b_id = ?').run(suggestion.a_id, suggestion.b_id);
+      db.prepare(`INSERT INTO links (a_id, b_id, kind, score, reason, user_confirmed) VALUES (?, ?, 'semantic', ?, ?, 1)
+        ON CONFLICT(a_id, b_id) DO UPDATE SET user_confirmed = 1`).run(suggestion.a_id, suggestion.b_id, suggestion.score, `similar meaning (${Number(suggestion.score).toFixed(2)})`);
+      accepted++;
+    }
+    return accepted;
   });
   const accepted = accept();
   if (accepted) {
-    getDatabase().prepare("INSERT INTO suggestion_decision_stats(status, total) VALUES ('accepted', 1) ON CONFLICT(status) DO UPDATE SET total = total + 1").run();
-    recordEvent({ kind: 'suggestion_accepted', tool: 'accept_suggestion', result_count: 1 });
+    getDatabase().prepare("INSERT INTO suggestion_decision_stats(status, total) VALUES ('accepted', ?) ON CONFLICT(status) DO UPDATE SET total = total + excluded.total").run(accepted);
+    recordEvent({ kind: 'suggestion_accepted', tool: 'accept_suggestion', result_count: accepted });
   }
   return accepted;
+}
+
+function joinAllSuggestions() {
+  const ids = getDatabase().prepare("SELECT id FROM link_suggestions WHERE status = 'pending' AND score > ? ORDER BY score DESC, id").all(JOIN_ALL_MIN).map((row) => row.id);
+  return acceptSuggestions(ids);
 }
 
 function rejectSuggestion(id) {
@@ -1657,4 +1702,4 @@ function countBySource() {
     }, {});
 }
 
-module.exports = { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, recordProxyEvent, getPendingMemories, addPendingMemory, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
+module.exports = { initializeDatabase, closeDatabaseForTest, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, recordProxyEvent, getPendingMemories, addPendingMemory, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, JOIN_ALL_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };

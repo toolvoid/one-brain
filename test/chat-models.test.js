@@ -31,3 +31,11 @@ test('graph link controls classify title-matched, manual and semantic links and 
   assert.deepEqual(visibleGraphLinks(links, { titleMatched: false, manual: true, semantic: true }).map((link) => link.kind), ['manual', 'semantic']);
   assert.deepEqual(visibleGraphLinks(links, { titleMatched: false, manual: false, semantic: false }), []);
 });
+
+test('turning any hidden graph link kind back on retriggers edge drawing', async () => {
+  const { linksJustEnabled } = await import('../src/lib/graph-links.mjs');
+  assert.equal(linksJustEnabled({ titleMatched: false, manual: false, semantic: false }, { titleMatched: true, manual: true, semantic: true }), true);
+  assert.equal(linksJustEnabled({ titleMatched: true, manual: true, semantic: false }, { titleMatched: true, manual: true, semantic: true }), true);
+  assert.equal(linksJustEnabled({ titleMatched: true, manual: true, semantic: true }, { titleMatched: true, manual: true, semantic: true }), false);
+  assert.equal(linksJustEnabled({ titleMatched: true, manual: true, semantic: true }, { titleMatched: false, manual: false, semantic: false }), false);
+});

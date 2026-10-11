@@ -4,6 +4,8 @@ import BrainGraph from './components/BrainGraph.jsx';
 import { MAX_IMPORT_ITEMS, isLogLikeChunk, parseImportText } from './lib/importers.js';
 import { isChatModel, memorySourceForProvider } from './lib/chat-models.mjs';
 import { DEFAULT_LINK_VISIBILITY, graphLinkCounts, visibleGraphLinks } from './lib/graph-links.mjs';
+import { JOIN_ALL_MIN } from './lib/link-constants.json';
+import { runLinkMutation } from './lib/link-actions.mjs';
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 const SOURCE_COLORS = {
@@ -485,6 +487,7 @@ function App() {
   const [suggestionsOpen, setSuggestionsOpen] = useState(false);
   const [rejectedOpen, setRejectedOpen] = useState(false);
   const [suggestionToast, setSuggestionToast] = useState(false);
+  const [linkErrorToast, setLinkErrorToast] = useState('');
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [sourceFilter, setSourceFilter] = useState('all');
@@ -942,15 +945,21 @@ function App() {
 
   async function handleLink(memoryId) {
     if (!selectedMemory || String(memoryId) === String(selectedMemory.id)) return;
-    await window.brain.createLink(selectedMemory.id, memoryId);
-    await refreshData();
-    setPickerOpen(false);
-    setPickerQuery('');
+    const succeeded = await runLinkMutation(async () => {
+      if (!window.brain?.createLink) throw new Error('Linking is unavailable. Restart One Brain and try again.');
+      await window.brain.createLink(selectedMemory.id, memoryId);
+    }, refreshData, (error) => setLinkErrorToast(error.message || 'Could not create this link.'));
+    if (succeeded) {
+      setPickerOpen(false);
+      setPickerQuery('');
+    }
   }
 
   async function handleJoinSuggestion(id) {
-    await window.brain.acceptSuggestion(id);
-    await refreshData();
+    await runLinkMutation(async () => {
+      if (!window.brain?.acceptSuggestion) throw new Error('Suggestions are unavailable. Restart One Brain and try again.');
+      await window.brain.acceptSuggestion(id);
+    }, refreshData, (error) => setLinkErrorToast(error.message || 'Could not accept this suggestion.'));
   }
 
   async function handleRejectSuggestion(id) {
@@ -964,9 +973,10 @@ function App() {
   }
 
   async function handleJoinAboveThreshold() {
-    const ids = suggestions.filter((item) => Number(item.score) > 0.6).map((item) => item.id);
-    for (const id of ids) await window.brain.acceptSuggestion(id);
-    await refreshData();
+    await runLinkMutation(async () => {
+      if (!window.brain?.joinAllSuggestions) throw new Error('Suggestions are unavailable. Restart One Brain and try again.');
+      await window.brain.joinAllSuggestions();
+    }, refreshData, (error) => setLinkErrorToast(error.message || 'Could not join suggestions.'));
   }
 
   async function handleDismissAllSuggestions() {
@@ -1119,7 +1129,7 @@ function App() {
 
   return (
     <main className="memory-app">
-      <BrainGraph ref={graphRef} memories={memories} counts={counts} links={graphLinks} linkCounts={graphLinkCountValues} linkVisibility={linkVisibility} onLinkVisibilityChange={setLinkVisibility} fitRevision={graphFitRevision} dataReady={dataReady} sidebarCollapsed={sidebarCollapsed} onMemoryClick={openDetail} />
+      <BrainGraph ref={graphRef} memories={memories} links={graphLinks} allLinks={links} counts={counts} linkCounts={graphLinkCountValues} linkVisibility={linkVisibility} onLinkVisibilityChange={setLinkVisibility} fitRevision={graphFitRevision} dataReady={dataReady} sidebarCollapsed={sidebarCollapsed} onMemoryClick={openDetail} />
     {insightsOpen && (insightsData ? <InsightsView data={insightsData} onBack={() => { setInsightsOpen(false); setGraphFitRevision((value) => value + 1); }} sql={sql} setSql={setSql} runSql={runAnalyticsQuery} sqlResult={sqlResult} sqlRunning={sqlRunning} onResetRetrievalCounts={resetRetrievalCounts} /> : <section className="insights-view"><header className="insights-header"><button className="back-button" type="button" onClick={() => { setInsightsOpen(false); setGraphFitRevision((value) => value + 1); }}>‹</button><div><h1>Insights</h1><p>Local activity and retrieval analytics</p></div></header><ChannelNotice channel="insights" loading={insightsLoading} error={insightsLoadError} onRetry={() => void openInsights()} /></section>)}
       {chatOpen && <ChatView onBack={() => { setChatOpen(false); setGraphFitRevision((value) => value + 1); }} onManageProviders={() => { setChatOpen(false); openConnectSettings(); }} memoryTitles={Object.fromEntries(memories.map((item) => [item.id, item.title || 'Untitled memory']))} onOpenMemory={(id) => { setChatOpen(false); setInsightsOpen(false); setSelectedId(id); setSidebarCollapsed(false); focusMemory(id); }} />}
       <aside className={`memory-panel${sidebarCollapsed ? ' is-collapsed' : ''}`} style={insightsOpen || chatOpen ? { display: 'none' } : undefined}>
@@ -1172,7 +1182,7 @@ function App() {
             <ChannelNotice channel="suggestions" loading={channelStates.suggestions === 'loading'} error={channelStates.suggestions === 'error'} onRetry={() => void refreshData().catch(() => {})} />
             <ChannelNotice channel="rejected links" loading={channelStates['rejected links'] === 'loading'} error={channelStates['rejected links'] === 'error'} onRetry={() => void refreshData().catch(() => {})} />
             <div className="suggestion-actions">
-              <button type="button" onClick={handleJoinAboveThreshold}>Join all above 0.6</button>
+              <button type="button" onClick={handleJoinAboveThreshold}>Join all above {JOIN_ALL_MIN.toFixed(1)}</button>
               <button type="button" onClick={handleDismissAllSuggestions}>Dismiss all</button>
             </div>
             <div className="suggestion-list">
@@ -1284,6 +1294,7 @@ function App() {
       </aside>
       {!insightsOpen && !chatOpen && <button className="sidebar-toggle" type="button" aria-label={sidebarCollapsed ? 'Expand memories sidebar' : 'Collapse memories sidebar'} aria-expanded={!sidebarCollapsed} onClick={() => setSidebarCollapsed((collapsed) => !collapsed)} style={{ left: sidebarCollapsed ? 32 : 'min(360px, 92vw)' }}>{sidebarCollapsed ? '›' : '‹'}</button>}
       {suggestionToast && <button className="suggestion-toast" type="button" onClick={() => { setSuggestionToast(false); setSuggestionsOpen(true); }}>1 possible link found - Review</button>}
+      {linkErrorToast && <button className="suggestion-toast" role="alert" type="button" onClick={() => setLinkErrorToast('')}>{linkErrorToast} · Dismiss</button>}
 
       {privacyNoticeOpen && createPortal(<div className="modal-backdrop notice-backdrop"><section className="consent-modal" role="dialog" aria-modal="true" aria-labelledby="provider-notice-title"><h2 id="provider-notice-title">Privacy notice</h2><p>When a cloud AI reads a memory through One Brain, that text is sent to that AI's provider.</p><button className="save-button" type="button" onClick={dismissPrivacyNotice}>Got it</button></section></div>, document.body)}
 

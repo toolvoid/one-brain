@@ -14,13 +14,27 @@ test('graph fit math encloses the hub, anchors and memory positions with a fitte
   assert.ok(fit.distance <= 110);
 });
 
-test('memory link arcs use 24 quadratic segments and bow away from the hub and other anchors', async () => {
-  const { linkArcPoints } = await import('../src/lib/graph-math.mjs');
-  const arc = linkArcPoints([-3, 0, 0], [3, 0, 0], [0, 0, 0], 24, 9, [[0, 0, 12]]);
-  assert.equal(arc.length, 25);
-  assert.deepEqual(arc[0], [-3, 0, 0]);
-  assert.deepEqual(arc.at(-1), [3, 0, 0]);
-  const middle = arc[12];
-  assert.ok(Math.hypot(...middle) > 2, 'the arc should not pass through the hub');
-  assert.ok(Math.hypot(middle[0], middle[1], middle[2] - 12) > 3.5, 'the arc should bow away from the other anchor');
+test('memory links are a single straight segment between their endpoint nodes', async () => {
+  const { straightLinkPoints } = await import('../src/lib/graph-math.mjs');
+  const start = [-3, 0, 0], end = [3, 4, 6];
+  const points = straightLinkPoints(start, end);
+  assert.equal(points.length, 2);
+  assert.deepEqual(points, [start, end]);
+});
+
+test('link edge itself grows from its start node to its end node without a particle', async () => {
+  const { lineDrawPoints, linkLineDrawState } = await import('../src/lib/graph-math.mjs');
+  const start = [-3, 1, 2], end = [3, 7, 8];
+  assert.deepEqual(lineDrawPoints(start, end, 0), [start, start]);
+  assert.deepEqual(lineDrawPoints(start, end, 0.5), [start, [0, 4, 5]]);
+  assert.deepEqual(lineDrawPoints(start, end, 1), [start, end]);
+  assert.deepEqual(lineDrawPoints(start, end, 5), [start, end]);
+  const atDrawEnd = linkLineDrawState(0.1, 900);
+  const justSettling = linkLineDrawState(0.1, 901);
+  const settled = linkLineDrawState(0.1, 1300);
+  assert.equal(atDrawEnd.progress, 1);
+  assert.equal(justSettling.done, false);
+  assert.ok(Math.abs(justSettling.alpha - atDrawEnd.alpha) < 0.01, 'opacity should not drop at the end of the draw');
+  assert.ok(Math.abs(settled.alpha - 0.1) < 1e-9);
+  assert.equal(settled.done, true);
 });

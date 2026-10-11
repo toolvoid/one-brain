@@ -50,6 +50,8 @@ test('chat grants, stored memory ids, memory source, and chat deletion use the l
     const savedPendingId = db.approvePendingMemory(candidate.id, 'Gemini fact', 'Synthetic Gemini durable fact.');
     assert.equal(db.listMemories().find((item) => item.id === savedPendingId).source, 'gemini');
     const memory = db.addMemory({ source: 'chatgpt', title: 'Saved from Chat', content: 'Synthetic saved answer.' }, { event: false });
+    assert.equal(db.createLink(memory.id, savedPendingId), true);
+    assert.equal(db.listLinks().some((link) => link.a_id === Math.min(memory.id, savedPendingId) && link.b_id === Math.max(memory.id, savedPendingId)), true);
     const chatId = db.createChat('openai', 'mock-chat-model');
     db.appendChatMessage({ chat_id: chatId, role: 'assistant', content: memory.content, model: 'mock-chat-model', memory_ids: [memory.id] });
     const chat = db.listChats()[0];
@@ -61,6 +63,7 @@ test('chat grants, stored memory ids, memory source, and chat deletion use the l
     const rawDb = new Database(path.join(userData, 'onebrain.db'), { readonly: true, fileMustExist: true });
     rawDb.pragma("cipher = 'sqlcipher'"); rawDb.pragma('legacy = 4'); rawDb.key(key);
     assert.equal(rawDb.prepare('SELECT count(*) AS n FROM chat_messages WHERE chat_id = ?').get(chatId).n, 1);
+    assert.equal(rawDb.prepare('SELECT count(*) AS n FROM links WHERE (a_id = ? AND b_id = ?) OR (a_id = ? AND b_id = ?)').get(Math.min(memory.id, savedPendingId), Math.max(memory.id, savedPendingId), Math.max(memory.id, savedPendingId), Math.min(memory.id, savedPendingId)).n, 1);
     assert.equal(db.deleteChat(chatId), true);
     assert.equal(rawDb.prepare('SELECT count(*) AS n FROM chat_messages WHERE chat_id = ?').get(chatId).n, 0);
     rawDb.close();

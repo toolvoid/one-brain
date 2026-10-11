@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld('brain', {
   deleteLink: (id) => ipcRenderer.invoke('links:delete', id),
   listSuggestions: () => ipcRenderer.invoke('suggestions:list'),
   acceptSuggestion: (id) => ipcRenderer.invoke('suggestions:accept', id),
+  joinAllSuggestions: () => ipcRenderer.invoke('suggestions:join-all'),
   rejectSuggestion: (id) => ipcRenderer.invoke('suggestions:reject', id),
   listRejected: () => ipcRenderer.invoke('suggestions:list-rejected'),
   restoreRejected: (id) => ipcRenderer.invoke('suggestions:restore', id),

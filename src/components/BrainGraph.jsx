@@ -5,7 +5,8 @@ import { CSS2DObject, CSS2DRenderer } from 'three/addons/renderers/CSS2DRenderer
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
-import { fitCameraToPoints, linkArcPoints } from '../lib/graph-math.mjs';
+import { fitCameraToPoints, lineDrawPoints, linkLineDrawState, straightLinkPoints } from '../lib/graph-math.mjs';
+import { linksJustEnabled } from '../lib/graph-links.mjs';
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 const COLORS = {
@@ -17,6 +18,8 @@ const ANCHORS = {
   gemini: [-12, 0, 0], groq: [0, -12, 0], deepseek: [0, 0, -12]
 };
 const HUB = new THREE.Vector3(0, 0, 0);
+const LINK_LINE_DRAW_DURATION = 900;
+const LINK_LINE_SETTLE_DURATION = 400;
 
 function hashPosition(id, source) {
   let seed = 2166136261;
@@ -86,8 +89,10 @@ const LINE_FRAGMENT = `
   void main() { gl_FragColor = vec4(vColor, vAlpha); }
 `;
 
-const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], counts = {}, linkCounts = {}, linkVisibility = {}, onLinkVisibilityChange = () => {}, fitRevision = 0, sidebarCollapsed = false, dataReady = false, onMemoryClick = () => {} }, ref) {
+const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], allLinks = links, counts = {}, linkCounts = {}, linkVisibility = {}, onLinkVisibilityChange = () => {}, fitRevision = 0, sidebarCollapsed = false, dataReady = false, onMemoryClick = () => {} }, ref) {
   const hostRef = useRef(null);
+  const initialLinkRevealDoneRef = useRef(false);
+  const previousLinkVisibilityRef = useRef(linkVisibility);
   const onMemoryClickRef = useRef(onMemoryClick);
   onMemoryClickRef.current = onMemoryClick;
   const apiRef = useRef({ retrieve: () => false, focus: () => false });
@@ -254,6 +259,28 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
       const total = kinds.reduce((sum, [key]) => sum + (Number(counts?.[key]) || 0), 0);
       linksControl.querySelector('.brain-link-cap').textContent = total > 3000 ? 'Semantic links are automatically hidden above 3,000 total links.' : '';
     };
+    host.__brainGraphRevealLinks = () => {
+      events = events.filter((event) => event.kind !== 'link');
+      const startedAt = performance.now();
+      let sequence = 0;
+      for (const edge of edgeMeta) {
+        if (!edge.memoryLink) continue;
+        const link = currentLinks.find((item) => String(item.id ?? `${item.a_id}-${item.b_id}`) === edge.key.slice(5));
+        if (!link) continue;
+        const aMemory = currentMemories.find((item) => String(item.id) === String(link.a_id));
+        const bMemory = currentMemories.find((item) => String(item.id) === String(link.b_id));
+        if (!aMemory || !bMemory) continue;
+        const a = hashPosition(aMemory.id, aMemory.source);
+        const b = hashPosition(bMemory.id, bMemory.source);
+        const drawStartedAt = startedAt + Math.min(sequence * 35, 840);
+        edgeDraws.set(edge.key, { start: a, end: b, startedAt: drawStartedAt, duration: LINK_LINE_DRAW_DURATION, settleDuration: LINK_LINE_SETTLE_DURATION });
+        if (sequence < 32) events.push({
+          kind: 'link', linkId: edge.key.slice(5), aId: edge.linkMemoryIds[0], bId: edge.linkMemoryIds[1],
+          source: bMemory.source || 'chatgpt', startedAt: drawStartedAt + LINK_LINE_DRAW_DURATION
+        });
+        sequence += 1;
+      }
+    };
     const legend = document.createElement('details');
     legend.className = 'brain-legend';
     legend.innerHTML = '<summary>Legend</summary><div><i class="brain-legend-structural"></i><span>Belongs to AI or hub</span></div><div><i class="brain-legend-link"></i><span>Linked memories</span></div>';
@@ -263,7 +290,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
       const memoryLink = key.startsWith('link:');
       edgeMeta.push({ key, a: a.clone(), b: b.clone(), points: linkDetails?.points || [a.toArray(), b.toArray()], color: new THREE.Color(color), alpha, glow, memoryLink, ...linkDetails });
     }
-    function rebuild(nextMemories, nextLinks, nextCounts, animateChanges) {
+    function rebuild(nextMemories, nextLinks, nextCounts, animateChanges, knownLinks = nextLinks) {
       const nextMemoryIds = new Set(nextMemories.map((memory) => String(memory.id)));
       const memoryLayout = JSON.stringify(nextMemories.map((memory) => [String(memory.id), memory.source]));
       const shouldFit = !initialized || memoryLayout !== previousMemoryLayout;
@@ -321,8 +348,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
         const id = String(link.id ?? `${ka}-${kb}`);
         const aPos = hashPosition(a.id, a.source);
         const bPos = hashPosition(b.id, b.source);
-        const obstacles = SOURCES.filter((source) => source !== a.source && source !== b.source).map((source) => ANCHORS[source]);
-        const points = linkArcPoints(aPos.toArray(), bPos.toArray(), [0, 0, 0], 24, 9, obstacles);
+        const points = straightLinkPoints(aPos.toArray(), bPos.toArray());
         makeEdge(`link:${id}`, aPos, bPos, '#ffffff', 0.1, 0, { points, linkKind: link.kind, linkScore: link.score, linkMemoryIds: [ka, kb] });
       }
       edgeMeta.forEach((e, i) => edgeIndex.set(e.key, i));
@@ -394,13 +420,15 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
           if (!previousLinkIds.has(id)) {
             const a = byId.get(String(link.a_id)); const b = byId.get(String(link.b_id));
             if (!a || !b) continue;
-            events.push({ kind: 'link', aId: String(a.id), bId: String(b.id), linkId: id, linkKind: link.kind, startedAt: now });
+            const edgeKey = `link:${id}`;
+            edgeDraws.set(edgeKey, { start: hashPosition(a.id, a.source), end: hashPosition(b.id, b.source), startedAt: now, duration: LINK_LINE_DRAW_DURATION, settleDuration: LINK_LINE_SETTLE_DURATION });
+            events.push({ kind: 'link', aId: String(a.id), bId: String(b.id), linkId: id, linkKind: link.kind, source: b.source, startedAt: now + LINK_LINE_DRAW_DURATION });
           }
         }
       }
       previousMemoryIds = new Set(nextMemories.map((m) => String(m.id)));
       previousMemoryLayout = memoryLayout;
-      previousLinkIds = new Set(nextLinks.map((link) => String(link.id ?? `${link.a_id}-${link.b_id}`)));
+      previousLinkIds = new Set(knownLinks.map((link) => String(link.id ?? `${link.a_id}-${link.b_id}`)));
       if (shouldFit && !manualOrbitPaused) fitView(true);
     }
 
@@ -431,8 +459,8 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
     // Start with valid GPU attributes before the first animation frame; the first data snapshot
     // establishes the baseline and should not animate every memory already in the database.
     rebuild([], [], {}, false);
-    host.__brainGraphRebuild = (nextMemories, nextLinks, nextCounts) => {
-      rebuild(nextMemories, nextLinks, nextCounts, initialized);
+    host.__brainGraphRebuild = (nextMemories, nextLinks, nextCounts, knownLinks) => {
+      rebuild(nextMemories, nextLinks, nextCounts, initialized, knownLinks);
       initialized = true;
     };
 
@@ -578,16 +606,13 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
         const i = edgeIndex.get(key);
         if (i === undefined) { edgeDraws.delete(key); continue; }
         const segment = edgeMeta[i].segmentStart;
-        const t = Math.min(1, (now - draw.startedAt) / draw.duration);
-        const b = draw.start.clone().lerp(draw.end, t);
-        if (t < 1) {
-          draw.start.toArray(lineGeometry.attributes.position.array, segment * 6);
-          b.toArray(lineGeometry.attributes.position.array, segment * 6 + 3);
-        } else {
-          draw.start.toArray(lineGeometry.attributes.position.array, segment * 6);
-          draw.end.toArray(lineGeometry.attributes.position.array, segment * 6 + 3);
-        }
-        if (t >= 1) edgeDraws.delete(key);
+        const elapsed = now - draw.startedAt;
+        const linkState = edgeMeta[i].memoryLink ? linkLineDrawState(edgeMeta[i].alpha, elapsed, draw.duration, draw.settleDuration) : null;
+        const progress = linkState ? linkState.progress : Math.max(0, Math.min(1, elapsed / draw.duration));
+        const [start, end] = lineDrawPoints(draw.start.toArray(), draw.end.toArray(), progress);
+        new THREE.Vector3(...start).toArray(lineGeometry.attributes.position.array, segment * 6);
+        new THREE.Vector3(...end).toArray(lineGeometry.attributes.position.array, segment * 6 + 3);
+        if (linkState ? linkState.done : progress >= 1) edgeDraws.delete(key);
       }
       const lineGlow = lineGeometry.attributes.lineGlow.array;
       const lineColors = lineGeometry.attributes.baseColor.array;
@@ -599,11 +624,15 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
           edge.color.toArray(lineColors, segment * 6);
           edge.color.toArray(lineColors, segment * 6 + 3);
           let alpha = edge.alpha;
-          if (hoveredMemoryId !== null) {
+          const activeDraw = edgeDraws.get(edge.key);
+          const drawState = activeDraw && edge.memoryLink ? linkLineDrawState(edge.alpha, now - activeDraw.startedAt, activeDraw.duration, activeDraw.settleDuration) : null;
+          if (drawState) alpha = drawState.alpha;
+          else if (activeDraw) alpha = now < activeDraw.startedAt ? 0 : now < activeDraw.startedAt + activeDraw.duration ? 0.65 : edge.alpha;
+          if (hoveredMemoryId !== null && !(drawState && drawState.alpha === 0)) {
             const ownMemoryEdge = edge.key === `memory:${hoveredMemoryId}` || edge.key === `anchor:${hoveredMemorySource}`;
             const ownLinkEdge = edge.memoryLink && edge.linkMemoryIds.includes(hoveredMemoryId);
             alpha = ownMemoryEdge ? 0.8 : ownLinkEdge ? 0.6 : edge.alpha * 0.4;
-          } else if (hoveredLinkIndex >= 0) alpha = edgeIndex.get(edge.key) === hoveredLinkIndex ? 0.6 : edge.alpha * 0.4;
+          } else if (hoveredLinkIndex >= 0 && !(drawState && drawState.alpha === 0)) alpha = edgeIndex.get(edge.key) === hoveredLinkIndex ? 0.6 : edge.alpha * 0.4;
           lineAlpha[2 * segment] = lineAlpha[2 * segment + 1] = alpha;
         }
       });
@@ -625,10 +654,8 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
           const i = edgeIndex.get(`memory:${id}`);
           if (i !== undefined) brightenEdge(edgeMeta[i], 0.35 * strength);
         }
-        if (event.kind !== 'link') {
-          const anchorIndex = edgeIndex.get(`anchor:${event.source}`);
-          if (anchorIndex !== undefined) brightenEdge(edgeMeta[anchorIndex], 0.4 * strength);
-        }
+        const anchorIndex = edgeIndex.get(`anchor:${event.source}`);
+        if (anchorIndex !== undefined) brightenEdge(edgeMeta[anchorIndex], 0.4 * strength);
         if (event.kind === 'link') {
           const i = edgeMeta.findIndex((edge) => edge.key.startsWith('link:') && (edge.key === `link:${event.linkId}`));
           if (i >= 0) brightenEdge(edgeMeta[i], 0.35 * strength);
@@ -706,6 +733,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
       delete host.__brainGraphResize;
       delete host.__brainGraphFit;
       delete host.__brainGraphLinkState;
+      delete host.__brainGraphRevealLinks;
       for (const obj of Object.values(labelObjects)) obj.remove();
       host.replaceChildren();
     };
@@ -730,9 +758,21 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], c
 
   // Keep the latest data available to the persistent renderer and rebuild only on data changes.
   useEffect(() => {
-    const graph = hostRef.current?.__brainGraphRebuild;
-    if (graph && dataReady) graph(memories, links, counts);
-  }, [memories, links, counts, dataReady]);
+    const host = hostRef.current;
+    const graph = host?.__brainGraphRebuild;
+    if (graph && dataReady) {
+      graph(memories, links, counts, allLinks);
+      if (!initialLinkRevealDoneRef.current) {
+        host.__brainGraphRevealLinks?.();
+        initialLinkRevealDoneRef.current = true;
+      }
+    }
+  }, [memories, links, allLinks, counts, dataReady]);
+
+  useEffect(() => {
+    if (linksJustEnabled(previousLinkVisibilityRef.current, linkVisibility)) hostRef.current?.__brainGraphRevealLinks?.();
+    previousLinkVisibilityRef.current = linkVisibility;
+  }, [linkVisibility]);
 
   return <div ref={hostRef} className="brain-graph" style={{ position: 'absolute', inset: 0, overflow: 'hidden' }} />;
 });

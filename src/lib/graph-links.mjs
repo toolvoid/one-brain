@@ -1,5 +1,9 @@
 export const DEFAULT_LINK_VISIBILITY = Object.freeze({ titleMatched: true, manual: true, semantic: true });
 
+export function linksJustEnabled(previous = {}, next = {}) {
+  return Object.keys(DEFAULT_LINK_VISIBILITY).some((kind) => Boolean(next[kind]) && !Boolean(previous[kind]));
+}
+
 export function graphLinkCounts(links) {
   const rows = Array.isArray(links) ? links : [];
   return {
