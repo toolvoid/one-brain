@@ -6,6 +6,7 @@ const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { z } = require('zod/v4');
 const { addMemory, getMcpClientProfile, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, recordEvent } = require('./db');
+const { INSTRUCTIONS } = require('./connectors');
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -19,7 +20,7 @@ function notifyRenderer(channel, payload) {
 }
 
 function createMcpServer(clientName = null) {
-  const server = new McpServer({ name: 'one-brain', version: '1.0.0' });
+  const server = new McpServer({ name: 'one-brain', version: '1.0.0', instructions: INSTRUCTIONS });
   const registerTrackedTool = (name, definition, handler) => server.registerTool(name, definition, async (args) => {
     const startedAt = Date.now();
     const client = server.server.getClientVersion?.()?.name || clientName || null;

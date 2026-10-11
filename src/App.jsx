@@ -47,6 +47,28 @@ function dateLabel(value) {
   return new Date(`${value.replace(' ', 'T')}Z`).toLocaleString();
 }
 
+function connectorPreviewText(edit) {
+  if (edit.path.endsWith('AGENTS.md') || edit.path.endsWith('GEMINI.md')) {
+    const match = edit.after.match(/<!-- ONE-BRAIN:BEGIN -->[\s\S]*?<!-- ONE-BRAIN:END -->/);
+    return match ? match[0] : 'Remove the marked One Brain instruction block.';
+  }
+  if (edit.path.endsWith('config.toml')) {
+    const match = edit.after.match(/^\[mcp_servers\.one-brain\][\s\S]*?(?=^\s*\[|$(?![\s\S]))/m);
+    if (!match) return 'Remove the [mcp_servers.one-brain] section.';
+    return match[0].split('\n').filter((line) => /^\s*(?:\[mcp_servers\.one-brain\]|command\s*=|args\s*=)/.test(line)).join('\n').replace(/Bearer\s+\S+/gi, 'Bearer [redacted]');
+  }
+  if (edit.path.endsWith('mcp.json') || edit.path.endsWith('settings.json')) {
+    try {
+      const data = JSON.parse(edit.after || '{}');
+      const entry = data.servers?.['one-brain'] ?? data.mcpServers?.['one-brain'];
+      if (!entry) return 'Remove the one-brain entry.';
+      const safe = Object.fromEntries(['command', 'args'].filter((key) => Object.hasOwn(entry, key)).map((key) => [key, entry[key]]));
+      return JSON.stringify({ 'one-brain': safe }, null, 2).replace(/Bearer\s+\S+/gi, 'Bearer [redacted]');
+    } catch { return 'Remove the one-brain entry.'; }
+  }
+  return 'No managed change.';
+}
+
 function normalizeImportedContent(content) {
   return String(content || '').normalize('NFKC').replace(/\r\n?/g, '\n').replace(/\s+/g, ' ').trim().toLowerCase();
 }
@@ -121,6 +143,9 @@ function App() {
   const [sqlResult, setSqlResult] = useState(null);
   const [sqlRunning, setSqlRunning] = useState(false);
   const [mcpConfig, setMcpConfig] = useState(null);
+  const [connectorCards, setConnectorCards] = useState([]);
+  const [connectorAction, setConnectorAction] = useState(null);
+  const [connectorSnippet, setConnectorSnippet] = useState(null);
   const [copied, setCopied] = useState('');
   const graphRef = useRef(null);
   const searchRequest = useRef(0);
@@ -171,8 +196,49 @@ function App() {
     return savedClients;
   }
 
+  async function refreshConnectors() {
+    const rows = await window.brain.listConnectors();
+    setConnectorCards(rows);
+    return rows;
+  }
+
+  async function previewConnector(client) {
+    const files = await window.brain.previewConnector(client);
+    setConnectorSnippet(null);
+    setConnectorAction({ operation: 'connect', client, files });
+  }
+
+  async function previewDisconnectConnector(client) {
+    const files = await window.brain.previewDisconnectConnector(client);
+    setConnectorSnippet(null);
+    setConnectorAction({ operation: 'disconnect', client, files });
+  }
+
+  async function confirmConnectorAction() {
+    if (!connectorAction) return;
+    if (connectorAction.operation === 'connect') await window.brain.connectConnector(connectorAction.client);
+    else await window.brain.disconnectConnector(connectorAction.client);
+    setConnectorAction(null);
+    await Promise.all([refreshConnectors(), refreshClients()]);
+  }
+
+  async function showConnectorSnippet(client, operation = 'connect') {
+    const snippet = operation === 'connect'
+      ? await window.brain.getConnectorSnippet(client)
+      : (client === 'claude-code' ? 'claude mcp remove one-brain' : 'In Claude Desktop settings, remove only the "one-brain" entry under "mcpServers".');
+    setConnectorSnippet({ client, operation, snippet });
+    setConnectorAction(null);
+  }
+
+  async function copyConnectorSnippet(client) {
+    const snippet = await window.brain.getConnectorSnippet(client);
+    await copyText(snippet, `connector-${client}`);
+    setConnectorSnippet({ client, operation: 'connect', snippet });
+  }
+
   function openConnectSettings() {
     setConnectOpen(true);
+    void refreshConnectors();
     void refreshClients().then((rows) => {
       const pending = rows.find((client) => client.status === 'pending');
       if (pending && !pendingClient) {
@@ -542,17 +608,6 @@ function App() {
   }, [importParsed, importSource, memories]);
 
   const resultMemory = (id) => memories.find((memory) => String(memory.id) === String(id));
-  const claudeDesktopConfig = mcpConfig ? JSON.stringify({
-    mcpServers: {
-      'one-brain': {
-        command: 'node',
-        args: [mcpConfig.stdioScript],
-        env: { ONE_BRAIN_USER_DATA: mcpConfig.userDataPath }
-      }
-    }
-  }, null, 2) : '';
-  const claudeCodeCommand = mcpConfig ? `claude mcp add --transport http one-brain ${mcpConfig.endpoint} --header "Authorization: Bearer ${mcpConfig.token}"` : '';
-  const codexConfig = mcpConfig ? `[mcp_servers.one-brain]\ncommand = "node"\nargs = [${JSON.stringify(mcpConfig.stdioScript)}]\nenv = { ONE_BRAIN_USER_DATA = ${JSON.stringify(mcpConfig.userDataPath)} }` : '';
 
   async function copyText(value, label) {
     try {
@@ -584,10 +639,18 @@ function App() {
               <h1>One Brain MCP</h1>
               <p className="connect-hint">Your local MCP server is ready for AI clients on this device.</p>
               <label className="connect-field">Endpoint<code>{mcpConfig.endpoint}</code></label>
-              <div className="token-row"><span>Bearer token</span><button type="button" onClick={() => copyText(mcpConfig.token, 'token')}>{copied === 'token' ? 'Copied' : 'Copy token'}</button></div>
-              <section className="config-section"><h2>Claude Desktop</h2><p>Add this under <code>mcpServers</code> in Claude Desktop config.</p><pre>{claudeDesktopConfig}</pre><button type="button" onClick={() => copyText(claudeDesktopConfig, 'desktop')}>{copied === 'desktop' ? 'Copied' : 'Copy config'}</button></section>
-              <section className="config-section"><h2>Claude Code</h2><pre>{claudeCodeCommand}</pre><button type="button" onClick={() => copyText(claudeCodeCommand, 'claude')}>{copied === 'claude' ? 'Copied' : 'Copy command'}</button></section>
-              <section className="config-section"><h2>Codex CLI</h2><p>Add this to <code>~/.codex/config.toml</code>.</p><pre>{codexConfig}</pre><button type="button" onClick={() => copyText(codexConfig, 'codex')}>{copied === 'codex' ? 'Copied' : 'Copy config'}</button></section>
+              <section className="clients-settings">
+                <header><h2>Connect AI</h2><button type="button" onClick={() => { void refreshConnectors(); }}>Refresh</button></header>
+                {connectorCards.map((client) => <article className="connector-card" key={client.id}>
+                  <div className="client-heading"><strong>{client.name}</strong><span className={`client-status ${client.status}`}>{client.status}</span></div>
+                  <small>Last seen {dateLabel(client.lastSeen) || '—'}</small>
+                  {client.kind === 'managed' ? <div className="connector-actions">
+                    <button type="button" onClick={() => void previewConnector(client.id)}>Connect</button>
+                    <button type="button" onClick={() => void previewDisconnectConnector(client.id)}>Disconnect</button>
+                  </div> : <div className="connector-actions"><button type="button" onClick={() => void showConnectorSnippet(client.id)}>Connect</button><button type="button" onClick={() => void showConnectorSnippet(client.id, 'disconnect')}>Disconnect</button><button type="button" onClick={() => void copyConnectorSnippet(client.id)}>Copy</button></div>}
+                  {connectorSnippet?.client === client.id && <div className="connector-snippet"><strong>{connectorSnippet.operation === 'connect' ? 'Copy into the client' : 'Remove One Brain from the client'}</strong><pre>{connectorSnippet.snippet}</pre><button type="button" onClick={() => copyText(connectorSnippet.snippet, `connector-${client.id}`)}>{copied === `connector-${client.id}` ? 'Copied' : 'Copy snippet'}</button></div>}
+                </article>)}
+              </section>
             </> : <p className="empty-note">Starting the local MCP server...</p>}
             <section className="clients-settings">
               <header><h2>Connected AIs</h2><button type="button" onClick={() => { void refreshClients(); }}>Refresh</button></header>
@@ -725,6 +788,8 @@ function App() {
       {suggestionToast && <button className="suggestion-toast" type="button" onClick={() => { setSuggestionToast(false); setSuggestionsOpen(true); }}>1 possible link found - Review</button>}
 
       {privacyNoticeOpen && createPortal(<div className="modal-backdrop notice-backdrop"><section className="consent-modal" role="dialog" aria-modal="true" aria-labelledby="provider-notice-title"><h2 id="provider-notice-title">Privacy notice</h2><p>When a cloud AI reads a memory through One Brain, that text is sent to that AI's provider.</p><button className="save-button" type="button" onClick={dismissPrivacyNotice}>Got it</button></section></div>, document.body)}
+
+      {connectorAction && createPortal(<div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setConnectorAction(null); }}><section className="connector-confirm" role="dialog" aria-modal="true" aria-labelledby="connector-confirm-title"><header><h2 id="connector-confirm-title">Confirm {connectorAction.operation}</h2><button type="button" aria-label="Close" onClick={() => setConnectorAction(null)}>×</button></header><p>Review the One Brain changes for {connectorCards.find((item) => item.id === connectorAction.client)?.name || connectorAction.client}.</p><div className="connector-preview-list">{connectorAction.files.map((edit) => <article key={edit.path}><strong>{edit.path}</strong><small>{edit.changed ? 'Will change' : 'Already up to date'}</small><pre>{connectorPreviewText(edit)}</pre></article>)}</div><footer><button type="button" className="cancel-button" onClick={() => setConnectorAction(null)}>Cancel</button><button type="button" className="save-button" onClick={() => void confirmConnectorAction()}>Confirm {connectorAction.operation}</button></footer></section></div>, document.body)}
 
       {pendingClient && !privacyNoticeOpen && createPortal(<div className="modal-backdrop"><section className="consent-modal" role="dialog" aria-modal="true" aria-labelledby="client-consent-title"><header><h2 id="client-consent-title">Approve connected AI</h2></header><p><strong>{pendingClient}</strong> is waiting to connect.</p><fieldset><legend>May read these sources</legend>{SOURCES.map((source) => <label className="consent-source" key={source}><input type="checkbox" checked={pendingReadSources.includes(source)} onChange={(event) => setPendingReadSources((current) => event.target.checked ? [...current, source] : current.filter((item) => item !== source))} />{source}</label>)}</fieldset><label className="consent-write-source">Write memories as<select value={pendingWriteSource} onChange={(event) => setPendingWriteSource(event.target.value)}>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label><footer><button type="button" className="client-block" onClick={handleBlockClient}>Block</button><button type="button" className="save-button" onClick={handleApproveClient}>Approve</button></footer></section></div>, document.body)}
 
@@ -912,6 +977,23 @@ function App() {
         .clients-settings > header { display:flex;align-items:center;justify-content:space-between; }
         .clients-settings > header h2 { margin:0;color:#dce6f2;font-size:12px; }
         .clients-settings > header button { border:1px solid rgba(143,196,255,.22);border-radius:6px;padding:5px 8px;color:#c7e1ff;background:#182a40;font:10px system-ui,sans-serif;cursor:pointer; }
+        .connector-card { display:grid;gap:7px;margin-top:10px;padding:10px;border:1px solid rgba(175,195,224,.14);border-radius:8px;background:rgba(20,29,43,.45); }
+        .connector-card > small { color:#8d9bb0;font-size:9px; }
+        .connector-actions { display:flex;gap:6px; }
+        .connector-actions button,.connector-snippet button { border:1px solid rgba(143,196,255,.22);border-radius:6px;padding:5px 8px;color:#c7e1ff;background:#182a40;font:10px system-ui,sans-serif;cursor:pointer; }
+        .connector-snippet { display:grid;gap:6px; }
+        .connector-snippet strong { color:#aab9cd;font-size:10px; }
+        .connector-confirm { box-sizing:border-box;display:grid;gap:12px;width:min(680px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto;padding:18px;border:1px solid rgba(175,195,224,.22);border-radius:12px;background:#0c1421;box-shadow:0 20px 70px rgba(0,0,0,.48); }
+        .connector-confirm header,.connector-confirm footer { display:flex;align-items:center;justify-content:space-between;gap:8px; }
+        .connector-confirm h2 { margin:0;color:#e9f0fb;font-size:16px; }
+        .connector-confirm header button { border:0;color:#9aa9bc;background:transparent;font:22px system-ui,sans-serif;cursor:pointer; }
+        .connector-confirm > p { margin:0;color:#b8c7da;font-size:12px; }
+        .connector-preview-list { display:grid;gap:10px; }
+        .connector-preview-list article { display:grid;gap:5px;min-width:0; }
+        .connector-preview-list strong { overflow-wrap:anywhere;color:#dce6f2;font:10px ui-monospace,monospace; }
+        .connector-preview-list small { color:#92a3b8;font-size:9px; }
+        .connector-preview-list pre,.connector-snippet pre { max-height:190px;overflow:auto;margin:0;padding:9px;border:1px solid rgba(175,195,224,.13);border-radius:6px;color:#c7d4e5;background:#080e18;font:10px/1.45 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text; }
+        .connector-confirm footer { justify-content:flex-end; }
         .client-card { display:grid;gap:8px;margin-top:10px;padding:10px;border:1px solid rgba(175,195,224,.14);border-radius:8px;background:rgba(20,29,43,.45); }
         .client-heading { display:flex;justify-content:space-between;gap:8px;color:#e1eaf6;font-size:11px; }
         .client-heading strong { overflow-wrap:anywhere; }
