@@ -125,7 +125,7 @@ function EvaluationPanel() {
 
   const percent = (value) => `${(Number(value || 0) * 100).toFixed(1)}%`;
   const delta = (value) => value == null ? '—' : `${value > 0 ? '+' : ''}${(Number(value) * 100).toFixed(1)}%`;
-  const modeName = (mode) => ({ hybrid: 'Hybrid', 'fts-only': 'FTS only', 'semantic-only': 'Semantic only' })[mode] || mode;
+  const modeName = (mode) => ({ hybrid: 'Hybrid', 'fts-only': 'FTS only', 'semantic-only': 'Semantic only', 'extension-search': 'Extension search' })[mode] || mode;
 
   return <section className="insight-card evaluation-panel">
     <header><h2>Retrieval evaluation</h2><button className="run-sql-button" type="button" onClick={() => void run()} disabled={running || cases.every((item) => item.stale)}>{running ? 'Running…' : 'Run evaluation'}</button></header>
@@ -808,6 +808,14 @@ function App() {
     await refreshSearch();
   }
 
+  async function handleNoSuggestToggle(memory) {
+    try {
+      await window.brain.setMemoryNoSuggest(memory.id, !memory.no_suggest);
+      await refreshData();
+      await refreshSearch();
+    } catch (reason) { setDataLoadError(reason.message || 'Could not update memory suggestions.'); }
+  }
+
   async function handleMoveMemory(memory, source) {
     if (!source || source === memory.source) return;
     try {
@@ -1298,6 +1306,7 @@ function App() {
               <label className="move-source-action">Move to source<select aria-label="Move memory to source" value={selectedMemory.source} onChange={(event) => void handleMoveMemory(selectedMemory, event.target.value)}>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label>
               <button type="button" onClick={() => graphRef.current?.retrieve(selectedMemory.id)}>Retrieve</button>
               <button type="button" aria-pressed={Boolean(selectedMemory.private)} onClick={() => handlePrivateToggle(selectedMemory)}>{selectedMemory.private ? '🔒 Private · turn off' : 'Mark private'}</button>
+              <button type="button" aria-pressed={Boolean(selectedMemory.no_suggest)} onClick={() => void handleNoSuggestToggle(selectedMemory)}>{selectedMemory.no_suggest ? 'Never suggest · on' : 'Never suggest'}</button>
               <button type="button" className="danger-button" onClick={() => handleDelete(selectedMemory.id)}>Delete</button>
               {conversationPartCount >= 2 && / \(part \d+\/\d+\)$/.test(selectedMemory.title || '') && <button type="button" className="danger-button" onClick={handleDeleteConversationParts}>Delete all {conversationPartCount} parts of this chat</button>}
             </div>

@@ -9,12 +9,25 @@ const test = require('node:test');
 const { BODY_LIMIT, createExtApi, localHost } = require('../electron/ext-api');
 const { createMemoryProxy } = require('../electron/memory-proxy');
 const { createClientToken, hashToken, tokenPath } = require('../electron/client-tokens');
+const { contentHash } = require('../electron/ext-chat');
 
-async function harness({ clock = () => Date.now(), importText } = {}) {
+async function harness({ clock = () => Date.now() } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'one-brain-ext-test-'));
   let tick = clock;
   const tokens = new Map(), profiles = new Map(), events = [], retrieved = [], added = [], memories = [];
-  let tokenCounter = 0;
+  let tokenCounter = 0, nextMemoryId = 101, nextImportId = 1;
+  const imports = new Map();
+  const saveImported = (items, importId, markPrivate) => {
+    let inserted = 0, skipped = 0; const insertedIds = [];
+    for (const item of items) {
+      const hash = contentHash(item.content);
+      if (memories.some((memory) => memory.source === item.source && memory.contentHash === hash)) { skipped++; continue; }
+      const saved = { ...item, id: nextMemoryId++, private: Boolean(markPrivate), no_suggest: false, contentHash: hash, importId };
+      memories.push(saved); insertedIds.push(saved.id); inserted++;
+      if (imports.has(importId)) imports.get(importId).count++;
+    }
+    return { inserted, skipped, insertedIds };
+  };
   const api = createExtApi({ userDataPath: directory, now: () => tick(),
     authenticateClientToken: (token) => tokens.get(token)?.active ? { client: tokens.get(token).client } : null,
     getClientProfile: (client) => profiles.get(client) || null,
@@ -26,10 +39,17 @@ async function harness({ clock = () => Date.now(), importText } = {}) {
     revokeToken: (client) => { for (const item of tokens.values()) if (item.client === client) item.active = false; },
     isTokenActive: (client) => [...tokens.values()].some((item) => item.client === client && item.active),
     searchMemoriesForClient: async () => ({ memories: memories.slice() }),
-    addMemory: (memory) => { const saved = { ...memory, id: memories.length + 101, private: false }; memories.push(saved); return saved; },
+    getMemoryForClient: (id, profile) => { const memory = memories.find((item) => item.id === Number(id)); return { memory: memory && !memory.private && profile.allowedSources.includes(memory.source) ? memory : null }; },
+    setMemoryNoSuggest: (id, value) => { const memory = memories.find((item) => item.id === Number(id)); if (!memory) return false; memory.no_suggest = Boolean(value); return true; },
+    addMemory: (memory) => { const saved = { ...memory, id: nextMemoryId++, private: false }; memories.push(saved); return saved; },
+    createImport: (source, chatKey, extensionClient) => { const id = nextImportId++; imports.set(id, { id, source, chatKey, extensionClient, count: 0 }); return id; },
+    importMemories: saveImported,
+    finishImport: (id) => { const batch = imports.get(id); if (!batch?.count) { imports.delete(id); return null; } return batch; },
+    getExtensionChatSave: (chatKey, extensionClient) => { const batches = [...imports.values()].filter((batch) => batch.chatKey === chatKey && batch.extensionClient === extensionClient && batch.count > 0); return { saved: batches.length > 0, imports: batches, hashes: memories.filter((memory) => batches.some((batch) => batch.id === memory.importId)).map((memory) => memory.contentHash) }; },
+    undoExtensionChatSave: (id, extensionClient) => { const batch = imports.get(id); if (!batch || batch.extensionClient !== extensionClient) return { removed: false, memoryIds: [] }; const rows = memories.filter((item) => item.importId === id); for (let index = memories.length - 1; index >= 0; index--) if (memories[index].importId === id) memories.splice(index, 1); imports.delete(id); return { removed: true, memoryIds: rows.map((item) => item.id) }; },
     recordProxyEvent: (event, ids) => events.push({ ...event, ids }),
     emitRetrieved: (ids) => retrieved.push(...ids), emitAdded: (id) => added.push(id),
-    ...(importText ? { importText } : {})
+    emitRemoved: (id) => added.push(-id)
   });
   const proxy = createMemoryProxy({ userDataPath: directory, extensionApi: api });
   const server = http.createServer((req, res) => { void proxy.handle(req, res); });
@@ -90,6 +110,9 @@ test('pairing and extension requests enforce the paired origin and loopback host
   assert.equal(localHost('127.0.0.1:3738'), true);
   response = await h.request('/ext/ping', { token });
   assert.equal(response.status, 200);
+  const ping = await response.json();
+  assert.equal(ping.apiVersion, '1.1.0');
+  assert.equal(ping.appVersion, '1.1.0');
   assert.equal(response.headers.get('access-control-allow-origin'), h.origin);
 });
 
@@ -113,7 +136,7 @@ test('save forces the source from the paired site and search excludes private re
   const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
   const token = await h.pair();
   h.profiles.get('ext:chatgpt').allowedSources = ['chatgpt'];
-  h.memories.push({ id: 1, source: 'chatgpt', title: 'Synthetic public', content: 'Synthetic fixture body', private: false }, { id: 2, source: 'chatgpt', title: 'Synthetic private', content: 'Synthetic private fixture body', private: true }, { id: 3, source: 'claude', title: 'Synthetic ungranted', content: 'Synthetic ungranted fixture body', private: false });
+  h.memories.push({ id: 1, source: 'chatgpt', title: 'Synthetic public', content: 'Synthetic fixture body', private: false, score: 0.9 }, { id: 2, source: 'chatgpt', title: 'Synthetic private', content: 'Synthetic private fixture body', private: true, score: 0.88 }, { id: 3, source: 'claude', title: 'Synthetic ungranted', content: 'Synthetic ungranted fixture body', private: false, score: 0.85 });
   let response = await h.request('/ext/search', { method: 'POST', token, body: { query: 'synthetic' } });
   let result = await response.json();
   assert.equal(response.status, 200);
@@ -127,6 +150,20 @@ test('save forces the source from the paired site and search excludes private re
   assert.equal(h.added.at(-1), result.id);
   assert.ok(h.events.every((event) => event.query === ''));
   assert.ok(h.events.every((event) => !JSON.stringify(event).includes('Synthetic fixture body')));
+});
+
+test('extension panel can mark an allowed memory never-suggest and search then excludes it', async (t) => {
+  const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
+  const token = await h.pair();
+  h.memories.push({ id: 11, source: 'chatgpt', title: 'Synthetic memory', content: 'Synthetic fixture body', private: false, no_suggest: false, score: 0.9 });
+  let response = await h.request('/ext/search', { method: 'POST', token, body: { query: 'Synthetic fixture', limit: 5 } });
+  let result = await response.json();
+  assert.deepEqual(result.memories.map((item) => item.id), [11]);
+  response = await h.request('/ext/no-suggest', { method: 'POST', token, body: { id: 11, noSuggest: true } });
+  assert.equal(response.status, 200);
+  response = await h.request('/ext/search', { method: 'POST', token, body: { query: 'Synthetic fixture', limit: 5 } });
+  result = await response.json();
+  assert.deepEqual(result.memories, []);
 });
 
 test('extension token is limited to thirty requests per minute', async (t) => {
@@ -144,19 +181,47 @@ test('extension API rejects request bodies larger than two megabytes', async (t)
   assert.equal(response.status, 413);
 });
 
-test('save-chat reuses importer log filtering and forces the paired site source', async (t) => {
-  let importerArgs;
-  const h = await harness({ importText: async (...args) => { importerArgs = args; return { items: [{ title: 'Imported chunk', content: args[0] }], total: 1 }; } });
+test('chat save filters synthetic messages, offers only-new, deduplicates, and undoes one import', async (t) => {
+  const h = await harness();
   t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
   const token = await h.pair('gemini');
-  const response = await h.request('/ext/save-chat', { method: 'POST', site: 'gemini', token, body: {
-    site: 'gemini', title: 'Synthetic Gemini chat', includeAssistant: false,
-    messages: [{ role: 'user', text: 'Synthetic user content for the importer fixture.' }, { role: 'assistant', text: 'Assistant fixture must not be included.' }]
-  } });
-  const result = await response.json();
-  assert.equal(result.source, 'gemini');
-  assert.equal(importerArgs[2], false);
-  assert.equal(importerArgs[3], true);
-  assert.equal(h.memories.at(-1).source, 'gemini');
-  assert.ok(!importerArgs[0].includes('Assistant fixture must not be included.'));
+  const chatKey = 'a'.repeat(64);
+  const body = { site: 'gemini', chatKey, title: 'Synthetic Gemini chat', source: 'claude', include: 'my-messages', split: 'exchange', options: { skipLogs: true, skipSecrets: true }, messages: [
+    { id: 'u1', role: 'user', text: 'Synthetic first user turn with enough fixture text.' },
+    { id: 'a1', role: 'assistant', text: 'Synthetic assistant response is omitted.' },
+    { id: 'u2', role: 'user', text: 'password=synthetic-secret-that-must-never-be-returned' },
+    { id: 'u3', role: 'user', text: 'Synthetic second user turn with new fixture content.' }
+  ] };
+  let response = await h.request('/ext/preview-chat', { method: 'POST', site: 'gemini', token, body });
+  let result = await response.json();
+  assert.equal(result.count, 2);
+  assert.equal(result.skippedSecrets, 1);
+  assert.ok(!JSON.stringify(result).includes('synthetic-secret'));
+  const unscreened = await h.request('/ext/preview-chat', { method: 'POST', site: 'gemini', token, body: { ...body, options: { skipSecrets: false, skipLogs: false }, messages: [body.messages[2]] } });
+  const redactedPreview = await unscreened.json();
+  assert.ok(!JSON.stringify(redactedPreview).includes('synthetic-secret'));
+  response = await h.request('/ext/save-chat', { method: 'POST', site: 'gemini', token, body: { ...body, messages: [body.messages[0]] } });
+  result = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(result.source, 'claude');
+  assert.equal(result.inserted, 1);
+  assert.equal(h.memories.at(-1).source, 'claude');
+  const importId = result.importId;
+  response = await h.request('/ext/chat-save-state', { method: 'POST', site: 'gemini', token, body: { chatKey } });
+  assert.equal((await response.json()).saved, true);
+  response = await h.request('/ext/save-chat', { method: 'POST', site: 'gemini', token, body: { ...body, messages: [body.messages[0], body.messages[3]] } });
+  assert.equal(response.status, 409);
+  response = await h.request('/ext/save-chat', { method: 'POST', site: 'gemini', token, body: { ...body, onlyNew: true, messages: [body.messages[0], body.messages[3]] } });
+  result = await response.json();
+  assert.equal(result.inserted, 1);
+  assert.equal(result.skippedDuplicates, 1);
+  const nextImport = result.importId;
+  response = await h.request('/ext/undo-chat', { method: 'POST', site: 'gemini', token, body: { importId: nextImport } });
+  assert.equal(response.status, 200);
+  assert.equal(h.memories.some((item) => item.importId === nextImport), false);
+  response = await h.request('/ext/undo-chat', { method: 'POST', site: 'gemini', token, body: { importId } });
+  assert.equal(response.status, 200);
+  assert.equal(h.memories.some((item) => item.importId === importId), false);
+  assert.ok(h.events.every((event) => event.query === ''));
+  assert.ok(h.events.every((event) => !JSON.stringify(event).includes('synthetic-secret')));
 });

@@ -2,17 +2,25 @@
 
 const ONE_BRAIN_API_DEFAULT = 'http://127.0.0.1:3738';
 const ONE_BRAIN_SITES = ['chatgpt', 'claude', 'gemini'];
+const ONE_BRAIN_MIN_API_VERSION = '1.1.0';
+const ONE_BRAIN_DEFAULT_PHRASES = ['remember', 'do you remember', 'last time', 'earlier', 'previously', 'about me', 'my memory', 'one brain', 'yaad', 'yaad hai', 'pichli baar', 'pehle', 'mere baare mein', 'meri memory', 'maine bataya tha', 'mera project', 'mera naam'];
 const extensionApi = globalThis.browser || globalThis.chrome;
+
+function versionAtLeast(value, minimum) {
+  const a = String(value || '').split('.').map((part) => Number(part) || 0), b = String(minimum || '').split('.').map((part) => Number(part) || 0);
+  for (let index = 0; index < Math.max(a.length, b.length); index++) { if ((a[index] || 0) !== (b[index] || 0)) return (a[index] || 0) > (b[index] || 0); }
+  return true;
+}
 
 async function storageGet(key) { return (await extensionApi.storage.local.get(key))[key]; }
 async function storageSet(value) { await extensionApi.storage.local.set(value); }
-async function extensionRequest(path, { token, method = 'GET', body, endpoint } = {}) {
+async function extensionRequest(path, { token, method = 'GET', body, endpoint, timeoutMs = 3000 } = {}) {
   const savedEndpoint = endpoint || await storageGet('oneBrainEndpoint') || ONE_BRAIN_API_DEFAULT;
   if (!/^http:\/\/127\.0\.0\.1:\d{1,5}$/.test(savedEndpoint)) throw new Error('Use a 127.0.0.1 One Brain API address.');
   const port = Number(savedEndpoint.slice(savedEndpoint.lastIndexOf(':') + 1));
   if (port < 1 || port > 65535) throw new Error('Use a valid 127.0.0.1 API port.');
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 3000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   let response;
   try {
     response = await fetch(`${savedEndpoint}${path}`, {
@@ -22,19 +30,25 @@ async function extensionRequest(path, { token, method = 'GET', body, endpoint } 
     });
   } finally { clearTimeout(timeout); }
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw Object.assign(new Error(data.error || `One Brain request failed (${response.status}).`), { status: response.status });
+  if (!response.ok) throw Object.assign(new Error(data.error || `One Brain request failed (${response.status}).`), { status: response.status, data });
   return data;
 }
 
 async function settingsFor(site) {
   const all = await storageGet('oneBrainSettings') || {};
-  return all[site] || { enabled: true, showButtons: true, suggestOnSend: false, autoSaveMessages: false };
+  return { enabled: true, showButtons: true, suggestOnSend: false, autoSaveMessages: false, memoryMode: 'off', memoryPhrases: ONE_BRAIN_DEFAULT_PHRASES, insertWithoutAsking: false, tokenBudget: 1500, contextFormat: 'context', ...(all[site] || {}) };
 }
 
 async function statusFor(site) {
   const tokens = await storageGet('oneBrainTokens') || {};
   if (!tokens[site]) return { site, paired: false, running: true, status: 'unpaired' };
-  try { return { site, paired: true, running: true, ...(await extensionRequest('/ext/ping', { token: tokens[site] })) }; }
+  try {
+    const ping = await extensionRequest('/ext/ping', { token: tokens[site] });
+    const updateOneBrain = !versionAtLeast(ping.apiVersion, ONE_BRAIN_MIN_API_VERSION);
+    const extensionVersion = extensionApi.runtime.getManifest?.().version || '0.0.0';
+    const updateExtension = !versionAtLeast(extensionVersion, ping.minExtensionVersion || '0.0.0');
+    return { site, paired: true, running: true, ...ping, updateOneBrain, updateExtension, minApiVersion: ONE_BRAIN_MIN_API_VERSION };
+  }
   catch (error) {
     if (error.status === 401) {
       delete tokens[site]; await storageSet({ oneBrainTokens: tokens });
@@ -48,6 +62,12 @@ async function statusFor(site) {
 extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const work = (async () => {
     if (message?.type === 'get-settings' && ONE_BRAIN_SITES.includes(message.site)) return settingsFor(message.site);
+    if (message?.type === 'get-chat-state' && /^[a-f\d]{64}$/i.test(String(message.chatKey || ''))) return (await storageGet('oneBrainChatStates') || {})[message.chatKey] || { enabled: true, excludeIds: [] };
+    if (message?.type === 'set-chat-state' && /^[a-f\d]{64}$/i.test(String(message.chatKey || ''))) {
+      const all = await storageGet('oneBrainChatStates') || {};
+      all[message.chatKey] = { enabled: message.state?.enabled !== false, excludeIds: Array.isArray(message.state?.excludeIds) ? message.state.excludeIds.slice(0, 500) : [] };
+      await storageSet({ oneBrainChatStates: all }); return { ok: true };
+    }
     if (message?.type === 'get-status') return Promise.all(ONE_BRAIN_SITES.map(statusFor));
     if (message?.type === 'get-self-check') return (await storageGet('oneBrainSelfChecks') || {})[message.site] || null;
     if (message?.type === 'get-endpoint') return await storageGet('oneBrainEndpoint') || ONE_BRAIN_API_DEFAULT;
@@ -59,7 +79,7 @@ extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
     if (message?.type === 'set-site-settings' && ONE_BRAIN_SITES.includes(message.site)) {
       const all = await storageGet('oneBrainSettings') || {};
-      all[message.site] = { enabled: Boolean(message.settings?.enabled), showButtons: Boolean(message.settings?.showButtons), suggestOnSend: Boolean(message.settings?.suggestOnSend), autoSaveMessages: Boolean(message.settings?.autoSaveMessages) };
+      all[message.site] = { ...await settingsFor(message.site), ...(message.settings || {}), enabled: Boolean(message.settings?.enabled), showButtons: Boolean(message.settings?.showButtons), memoryMode: ['off', 'ask', 'auto'].includes(message.settings?.memoryMode) ? message.settings.memoryMode : 'off', memoryPhrases: Array.isArray(message.settings?.memoryPhrases) ? message.settings.memoryPhrases.map((item) => String(item).trim().slice(0, 60)).filter(Boolean).slice(0, 60) : ONE_BRAIN_DEFAULT_PHRASES, insertWithoutAsking: Boolean(message.settings?.insertWithoutAsking), tokenBudget: Math.max(100, Math.min(1500, Number(message.settings?.tokenBudget) || 1500)), contextFormat: message.settings?.contextFormat === 'bullet' ? 'bullet' : 'context' };
       await storageSet({ oneBrainSettings: all });
       return { ok: true };
     }
@@ -91,8 +111,33 @@ extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       if (!tokens[message.site]) throw new Error('Pair this site with One Brain first.');
       const query = String(message.query || '').trim().slice(0, 4000);
       if (!query) return { ok: true, memories: [] };
-      const result = await extensionRequest('/ext/search', { method: 'POST', token: tokens[message.site], body: { query, limit: 5 } });
+      const result = await extensionRequest('/ext/search', { method: 'POST', token: tokens[message.site], body: { query, limit: 5, minScore: Number(message.minScore) || 0.015, excludeIds: Array.isArray(message.excludeIds) ? message.excludeIds.slice(0, 500) : [] } });
       return { ok: true, memories: (result.memories || []).slice(0, 5) };
+    }
+    if (message?.type === 'mark-no-suggest' && ONE_BRAIN_SITES.includes(message.site)) {
+      const tokens = await storageGet('oneBrainTokens') || {};
+      if (!tokens[message.site]) throw new Error('Pair this site with One Brain first.');
+      return { ok: true, ...(await extensionRequest('/ext/no-suggest', { method: 'POST', token: tokens[message.site], body: { id: Number(message.id), noSuggest: true } })) };
+    }
+    if (message?.type === 'chat-save-state' && ONE_BRAIN_SITES.includes(message.site)) {
+      const tokens = await storageGet('oneBrainTokens') || {};
+      if (!tokens[message.site]) throw new Error('Pair this site with One Brain first.');
+      return { ok: true, ...(await extensionRequest('/ext/chat-save-state', { method: 'POST', token: tokens[message.site], body: { chatKey: String(message.chatKey || '') } })) };
+    }
+    if (message?.type === 'save-chat' && ONE_BRAIN_SITES.includes(message.site)) {
+      const tokens = await storageGet('oneBrainTokens') || {};
+      if (!tokens[message.site]) throw new Error('Pair this site with One Brain first.');
+      return { ok: true, ...(await extensionRequest('/ext/save-chat', { method: 'POST', token: tokens[message.site], body: message.payload || {}, timeoutMs: 60000 })) };
+    }
+    if (message?.type === 'preview-chat' && ONE_BRAIN_SITES.includes(message.site)) {
+      const tokens = await storageGet('oneBrainTokens') || {};
+      if (!tokens[message.site]) throw new Error('Pair this site with One Brain first.');
+      return { ok: true, ...(await extensionRequest('/ext/preview-chat', { method: 'POST', token: tokens[message.site], body: message.payload || {}, timeoutMs: 60000 })) };
+    }
+    if (message?.type === 'undo-chat-save' && ONE_BRAIN_SITES.includes(message.site)) {
+      const tokens = await storageGet('oneBrainTokens') || {};
+      if (!tokens[message.site]) throw new Error('Pair this site with One Brain first.');
+      return { ok: true, ...(await extensionRequest('/ext/undo-chat', { method: 'POST', token: tokens[message.site], body: { importId: Number(message.importId) } })) };
     }
     if (message?.type === 'auto-save-sent-message' && ONE_BRAIN_SITES.includes(message.site)) {
       const tokens = await storageGet('oneBrainTokens') || {};
@@ -101,6 +146,6 @@ extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
     throw new Error('Unsupported extension action.');
   })();
-  work.then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.status ? error.message : (error.message || 'One Brain is not running.') }));
+  work.then(sendResponse).catch((error) => sendResponse({ ok: false, ...(error.data || {}), error: error.status ? error.message : (error.message || 'One Brain is not running.') }));
   return true;
 });

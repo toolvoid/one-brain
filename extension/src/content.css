@@ -2,7 +2,9 @@
 .one-brain-extension-ui[hidden] { display:none!important; }
 .one-brain-extension-save { margin:6px!important; padding:4px 9px!important; border:1px solid #6385a8!important; border-radius:6px!important; color:#eef6ff!important; background:#173452!important; cursor:pointer!important; }
 .one-brain-add-memory { margin:4px 6px!important; padding:4px 9px!important; border:1px solid #6385a8!important; border-radius:6px!important; color:#eef6ff!important; background:#173452!important; cursor:pointer!important; }
-.one-brain-extension-menu { position:fixed!important; right:16px!important; bottom:16px!important; padding:8px 12px!important; border:1px solid #6385a8!important; border-radius:8px!important; color:#eef6ff!important; background:#173452!important; box-shadow:0 4px 18px #0008!important; cursor:pointer!important; }
+.one-brain-extension-menu,.one-brain-chat-toggle { position:fixed!important; right:16px!important; padding:8px 12px!important; border:1px solid #6385a8!important; border-radius:8px!important; color:#eef6ff!important; background:#173452!important; box-shadow:0 4px 18px #0008!important; cursor:pointer!important; }
+.one-brain-extension-menu { bottom:16px!important; }
+.one-brain-chat-toggle { bottom:58px!important; }
 .one-brain-extension-toast { position:fixed!important; z-index:2147483647!important; right:16px!important; bottom:62px!important; padding:9px 12px!important; border:1px solid #426b91!important; border-radius:8px!important; color:#eff7ff!important; background:#102237!important; font:12px system-ui,sans-serif!important; }
 .one-brain-extension-toast[data-error="true"] { border-color:#b45151!important; background:#381d24!important; }
 .one-brain-extension-modal { position:fixed!important; z-index:2147483647!important; inset:0!important; display:grid!important; place-items:center!important; padding:18px!important; background:#060b13aa!important; }
@@ -25,3 +27,21 @@
 .one-brain-result-copy strong { color:#eaf1fa!important; }
 .one-brain-result-copy > span { color:#b7c7db!important; white-space:pre-wrap!important; overflow-wrap:anywhere!important; }
 .one-brain-result-score { color:#93a8bf!important; font-variant-numeric:tabular-nums!important; }
+.one-brain-result-copy small { color:#8296ad!important; text-transform:capitalize!important; }
+.one-brain-memory-actions { grid-column:3 / 5!important; display:flex!important; justify-content:flex-end!important; gap:5px!important; }
+.one-brain-memory-actions button,.one-brain-chat-save-dialog button { padding:4px 7px!important; font-size:11px!important; }
+.one-brain-extension-context-controls { display:grid!important; grid-template-columns:1fr auto!important; align-items:center!important; gap:8px!important; }
+.one-brain-extension-context-controls input[type="range"] { accent-color:#71b5f5!important; }
+.one-brain-extension-context-controls select,.one-brain-chat-save-dialog select,.one-brain-chat-save-dialog input:not([type="checkbox"]) { min-width:0!important; padding:7px!important; border:1px solid #3c4e65!important; border-radius:6px!important; color:#f2f7ff!important; background:#091321!important; }
+.one-brain-chat-save-dialog { width:min(680px,95vw)!important; }
+.one-brain-chat-save-dialog > section { display:flex!important; align-items:center!important; gap:8px!important; padding:0!important; border:0!important; }
+.one-brain-chat-save-dialog [data-load-progress] { color:#9fb3c9!important; }
+.one-brain-chat-save-dialog label { display:grid!important; grid-template-columns:minmax(125px,auto) minmax(0,1fr)!important; align-items:center!important; }
+.one-brain-chat-save-dialog label:has(input[type="checkbox"]) { display:flex!important; gap:7px!important; }
+.one-brain-chat-save-dialog input[type="checkbox"] { width:auto!important; accent-color:#72b8f6!important; }
+.one-brain-chat-picks { display:grid!important; max-height:180px!important; overflow:auto!important; gap:3px!important; }
+.one-brain-chat-picks label { display:grid!important; grid-template-columns:auto minmax(0,1fr)!important; gap:7px!important; align-items:center!important; }
+.one-brain-chat-picks span { overflow:hidden!important; text-overflow:ellipsis!important; white-space:nowrap!important; }
+.one-brain-save-progress { height:5px!important; overflow:hidden!important; border-radius:4px!important; background:#26374b!important; }
+.one-brain-save-progress i { display:block!important; width:12%!important; height:100%!important; background:#65a7ff!important; animation:one-brain-save-progress 1.2s ease-in-out infinite!important; }
+@keyframes one-brain-save-progress { 50% { width:88%!important; } }

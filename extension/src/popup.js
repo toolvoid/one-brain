@@ -37,10 +37,10 @@
       const head = document.createElement('div'); head.className = 'connection-head';
       const name = document.createElement('strong'); name.textContent = status.site;
       const label = document.createElement('span'); label.className = 'status';
-      label.textContent = !status.running ? 'One Brain is not running' : status.status === 'approved' ? 'Connected' : status.status === 'pending' ? 'Waiting for approval' : status.paired ? status.status : 'Not paired';
+      label.textContent = !status.running ? 'One Brain is not running' : status.updateOneBrain ? 'Update One Brain' : status.updateExtension ? 'Update the extension' : status.status === 'approved' ? 'Connected' : status.status === 'pending' ? 'Waiting for approval' : status.paired ? status.status : 'Not paired';
       head.append(name, label); card.append(head);
       const current = await message({ type: 'get-settings', site: status.site });
-      for (const [key, text, defaultValue] of [['enabled', 'Enable', true], ['showButtons', 'Show buttons', true], ['suggestOnSend', 'Suggest on send', false], ['autoSaveMessages', 'Auto-save my messages', false]]) {
+      for (const [key, text, defaultValue] of [['enabled', 'Enable', true], ['showButtons', 'Show buttons', true], ['autoSaveMessages', 'Auto-save my messages', false]]) {
         const wrapper = document.createElement('label'); const input = document.createElement('input'); input.type = 'checkbox'; input.checked = current[key] ?? defaultValue;
         input.addEventListener('change', async () => {
           const settings = { ...current, [key]: input.checked };
@@ -50,6 +50,20 @@
         });
         wrapper.append(input, document.createTextNode(text)); card.append(wrapper);
       }
+      const modeLabel = document.createElement('label'); modeLabel.append(document.createTextNode('Memory suggestions'));
+      const mode = document.createElement('select');
+      for (const [value, text] of [['off', 'Off'], ['ask', 'Ask'], ['auto', 'Auto when I mention memory']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; mode.append(option); }
+      mode.value = current.memoryMode || 'off';
+      mode.addEventListener('change', async () => { const settings = { ...current, memoryMode: mode.value }; const result = await message({ type: 'set-site-settings', site: status.site, settings }); if (result?.ok) Object.assign(current, settings); else mode.value = current.memoryMode || 'off'; });
+      modeLabel.append(mode); card.append(modeLabel);
+      const phrasesLabel = document.createElement('label'); phrasesLabel.append(document.createTextNode('Memory phrases (one per line)'));
+      const phrases = document.createElement('textarea'); phrases.rows = 4; phrases.value = (current.memoryPhrases || []).join('\n');
+      const savePhrases = document.createElement('button'); savePhrases.type = 'button'; savePhrases.textContent = 'Save phrases';
+      savePhrases.addEventListener('click', async () => { const settings = { ...current, memoryPhrases: phrases.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean) }; const result = await message({ type: 'set-site-settings', site: status.site, settings }); if (result?.ok) Object.assign(current, settings); });
+      phrasesLabel.append(phrases); card.append(phrasesLabel, savePhrases);
+      const quiet = document.createElement('label'); const quietInput = document.createElement('input'); quietInput.type = 'checkbox'; quietInput.checked = Boolean(current.insertWithoutAsking);
+      quietInput.addEventListener('change', async () => { const settings = { ...current, insertWithoutAsking: quietInput.checked }; const result = await message({ type: 'set-site-settings', site: status.site, settings }); if (result?.ok) Object.assign(current, settings); else quietInput.checked = !quietInput.checked; });
+      quiet.append(quietInput, document.createTextNode('Insert without asking (Auto only)')); card.append(quiet);
       if (status.paired) {
         const footer = document.createElement('footer'); const unpair = document.createElement('button'); unpair.textContent = 'Unpair';
         unpair.addEventListener('click', async () => { unpair.disabled = true; const result = await message({ type: 'unpair', site: status.site }); if (!result?.ok) { label.textContent = result?.error || 'Unpair failed'; unpair.disabled = false; } else await refresh(); });

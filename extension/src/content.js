@@ -5,15 +5,30 @@
   const API = globalThis.browser || globalThis.chrome;
   const adapter = SITE && globalThis.OneBrainAdapters?.[SITE];
   const editorTools = globalThis.OneBrainEditorInsertion;
-  if (!SITE || !API || !adapter || !editorTools) return;
+  const searchIntent = globalThis.OneBrainSearchIntent;
+  if (!SITE || !API || !adapter || !editorTools || !searchIntent) return;
 
   const askBackground = (payload) => API.runtime.sendMessage(payload);
-  const DEFAULTS = { enabled: true, showButtons: true, suggestOnSend: false, autoSaveMessages: false };
+  const DEFAULTS = { enabled: true, showButtons: true, suggestOnSend: false, autoSaveMessages: false, memoryMode: 'off', memoryPhrases: searchIntent.DEFAULT_MEMORY_PHRASES, insertWithoutAsking: false, tokenBudget: 1500, contextFormat: 'context' };
   let config = { ...DEFAULTS };
   let modal = null;
   let lastInsertedBlock = '';
   let pendingSends = [];
+  let chatState = { enabled: true, excludeIds: [] };
+  let chatKeyValue = '';
+  let chatRoutePath = location.pathname;
+  let autoTimer = null;
+  const insertedDrafts = new Set();
   const sourceColors = { chatgpt: '#65a7ff', claude: '#d79a63', gemini: '#8c7bf0', groq: '#75c88a', deepseek: '#4ca8be', openai: '#65a7ff' };
+
+  async function getChatKey() {
+    if (chatKeyValue) return chatKeyValue;
+    const conversationId = location.pathname.split('/').filter(Boolean).at(-1) || 'unknown';
+    const bytes = new TextEncoder().encode(`${SITE}\u0000${conversationId}`);
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    chatKeyValue = [...new Uint8Array(digest)].map((part) => part.toString(16).padStart(2, '0')).join('');
+    return chatKeyValue;
+  }
 
   function toast(message, isError = false) {
     let node = document.querySelector('.one-brain-extension-toast');
@@ -22,6 +37,18 @@
     node.dataset.error = String(isError);
     clearTimeout(node._hideTimer);
     node._hideTimer = setTimeout(() => node.remove(), 3800);
+  }
+
+  function toastWithUndo(message, undo) {
+    let node = document.querySelector('.one-brain-extension-toast');
+    if (!node) { node = document.createElement('div'); node.className = 'one-brain-extension-toast one-brain-extension-ui'; document.body.append(node); }
+    node.replaceChildren(document.createTextNode(message));
+    const button = document.createElement('button'); button.type = 'button'; button.textContent = 'Undo';
+    button.addEventListener('click', () => { clearTimeout(node._hideTimer); if (undo()) toast('Insertion undone.'); else toast('Draft changed; insertion was left as-is.', true); });
+    node.append(' ', button);
+    node.dataset.error = 'false';
+    clearTimeout(node._hideTimer);
+    node._hideTimer = setTimeout(() => node.remove(), 3000);
   }
 
   function readText(element) {
@@ -67,6 +94,10 @@
     editor.insertAdjacentElement('afterend', button);
   }
 
+  function recentUserMessages() {
+    return adapter.getMessages().filter((message) => ['user', 'human'].includes(message.role)).slice(-2).map(({ element }) => readText(element).slice(0, 300));
+  }
+
   function refreshButtons() {
     menu.hidden = !config.enabled || !config.showButtons;
     if (!config.enabled || !config.showButtons) document.querySelectorAll('.one-brain-extension-save').forEach((button) => button.remove());
@@ -104,22 +135,27 @@
   function closeSuggestionPanel() { modal?.remove(); modal = null; }
 
   async function openSuggestions(trigger) {
-    const draft = draftText();
-    const query = draft || readText(adapter.getLastAssistantMessage()?.element);
+    const editor = adapter.getInputElement();
+    const originalDraft = editorTools.editorText(editor);
+    const draft = originalDraft.trim();
+    const query = searchIntent.buildSearchQuery(draft, recentUserMessages());
     if (!query) { toast('Write a draft or wait for a message before searching.', true); return; }
+    if (!chatState.enabled) { if (trigger === 'manual') toast('Memory suggestions are off for this chat.'); return; }
     closeSuggestionPanel();
     modal = document.createElement('section');
     modal.className = 'one-brain-extension-modal one-brain-suggestion-overlay one-brain-extension-ui';
     modal.innerHTML = `<div class="one-brain-extension-dialog one-brain-suggestions"><h2>One Brain context</h2><p class="one-brain-extension-estimate">Searching…</p><div class="one-brain-extension-results"></div><footer><button type="button" data-cancel>Cancel</button><button type="button" data-insert disabled>Insert</button></footer></div>`;
     const panel = modal;
+    if (trigger === 'auto') { panel.querySelector('[data-cancel]').textContent = 'Skip'; panel.querySelector('[data-insert]').textContent = 'Insert (Enter)'; }
     panel.querySelector('[data-cancel]').addEventListener('click', closeSuggestionPanel);
     document.body.append(panel);
     let result;
-    try { result = await askBackground({ type: 'search-memories', site: SITE, query, limit: 5 }); }
+    try { result = await askBackground({ type: 'search-memories', site: SITE, query, limit: 5, excludeIds: chatState.excludeIds || [] }); }
     catch { result = { ok: false, error: 'Could not search One Brain.' }; }
     if (modal !== panel || !panel.isConnected) return;
-    if (!result?.ok) {
-      panel.querySelector('.one-brain-extension-estimate').textContent = result?.error || 'Could not search One Brain.';
+    if (!searchIntent.canShowSearchResult(result)) {
+      closeSuggestionPanel();
+      if (trigger === 'manual') toast(result?.error || 'Could not search One Brain.', true);
       return;
     }
     const memories = (result.memories || []).slice(0, 5);
@@ -127,40 +163,69 @@
     root.replaceChildren();
     if (!memories.length) panel.querySelector('.one-brain-extension-estimate').textContent = 'No matching memories. Your draft is unchanged.';
     for (const memory of memories) {
-      const row = document.createElement('label'); row.className = 'one-brain-extension-result';
-      const checkbox = document.createElement('input'); checkbox.type = 'checkbox';
+      const row = document.createElement('div'); row.className = 'one-brain-extension-result'; row.dataset.memoryId = String(memory.id);
+      const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = trigger === 'auto';
       const dot = document.createElement('span'); dot.className = 'one-brain-source-dot'; dot.style.backgroundColor = sourceColors[memory.source] || '#8a9aac'; dot.setAttribute('aria-label', String(memory.source || 'source'));
       const body = document.createElement('span'); body.className = 'one-brain-result-copy';
       const title = document.createElement('strong'); title.textContent = String(memory.title || 'Untitled memory');
       const snippet = document.createElement('span'); snippet.textContent = String(memory.snippet || '');
-      body.append(title, snippet);
+      const reason = document.createElement('small'); reason.textContent = String(memory.reason || '');
+      body.append(title, snippet, reason);
       const score = document.createElement('span'); score.className = 'one-brain-result-score'; score.textContent = Number.isFinite(Number(memory.score)) ? Number(memory.score).toFixed(2) : '—';
-      row.append(checkbox, dot, body, score); root.append(row);
+      const actions = document.createElement('div'); actions.className = 'one-brain-memory-actions';
+      const irrelevant = document.createElement('button'); irrelevant.type = 'button'; irrelevant.textContent = 'Not relevant';
+      irrelevant.addEventListener('click', async () => {
+        const previous = chatState.excludeIds || [];
+        chatState.excludeIds = [...new Set([...previous, String(memory.id)])].slice(-500);
+        try { const saved = await askBackground({ type: 'set-chat-state', chatKey: await getChatKey(), state: chatState }); if (!saved?.ok) throw new Error(); row.remove(); updateSelection(); }
+        catch { chatState.excludeIds = previous; toast('Could not update this chat’s exclusions.', true); }
+      });
+      const never = document.createElement('button'); never.type = 'button'; never.textContent = 'Never suggest';
+      never.addEventListener('click', async () => { try { const changed = await askBackground({ type: 'mark-no-suggest', site: SITE, id: memory.id }); if (!changed?.ok) throw new Error(); row.remove(); updateSelection(); } catch { toast('Could not update this memory.', true); } });
+      actions.append(irrelevant, never);
+      row.append(checkbox, dot, body, score, actions); root.append(row);
       checkbox.addEventListener('change', updateSelection);
     }
     const insert = panel.querySelector('[data-insert]');
+    const slider = document.createElement('input'); slider.type = 'range'; slider.min = '100'; slider.max = '1500'; slider.step = '50'; slider.value = String(config.tokenBudget || 1500); slider.setAttribute('aria-label', 'Context token budget');
+    const format = document.createElement('select'); for (const [value, label] of [['context', 'Context block'], ['bullet', 'Bullet list']]) { const option = document.createElement('option'); option.value = value; option.textContent = label; format.append(option); } format.value = config.contextFormat || 'context';
+    const controls = document.createElement('div'); controls.className = 'one-brain-extension-context-controls'; controls.append(slider, format); root.after(controls);
     function updateSelection() {
-      const selected = [...root.querySelectorAll('.one-brain-extension-result input:checked')].map((checkbox) => memories[Array.from(root.querySelectorAll('.one-brain-extension-result input')).indexOf(checkbox)]);
-      const block = editorTools.composeBlock(selected);
+      const selectedRows = [...root.querySelectorAll('.one-brain-extension-result')].filter((row) => row.querySelector('input[type="checkbox"]')?.checked);
+      const selected = selectedRows.map((row) => memories.find((item) => String(item.id) === row.dataset.memoryId)).filter(Boolean);
+      const block = editorTools.composeBlock(selected, { maxTokens: Number(slider.value), format: format.value });
       const estimate = selected.length ? editorTools.contextEstimate(block) : 0;
-      const exceeds = block.length > editorTools.MAX_CONTEXT_CHARS;
-      panel.querySelector('.one-brain-extension-estimate').textContent = `${estimate} token estimate · limit ~1,500`;
+      const exceeds = estimate > Number(slider.value);
+      panel.querySelector('.one-brain-extension-estimate').textContent = `${estimate} / ${slider.value} token estimate`;
       insert.disabled = selected.length === 0 || exceeds;
-      insert.textContent = trigger === 'send' ? 'Insert into draft' : 'Insert';
       insert.dataset.block = exceeds ? '' : block;
+      insert.dataset.selected = JSON.stringify(selected.map((item) => ({ id: item.id, source: item.source, title: item.title, text: item.snippet })));
     }
     updateSelection();
-    insert.addEventListener('click', () => {
-      const editor = adapter.getInputElement();
+    slider.addEventListener('input', updateSelection); format.addEventListener('change', updateSelection);
+    async function insertSelected({ automatic = false } = {}) {
+      const current = adapter.getInputElement();
+      if (!current || editorTools.editorText(current) !== originalDraft) { closeSuggestionPanel(); toast('Draft changed; no context was inserted.'); return false; }
       const block = insert.dataset.block;
-      if (!editor || !block) { toast('The message editor is unavailable.', true); return; }
-      if (editor.matches('textarea, input')) editorTools.insertTextarea(editor, block);
-      else editorTools.insertContentEditable(editor, block);
+      if (!block) { toast('Choose one or more results within the token budget.', true); return false; }
+      const draftKey = `${await getChatKey()}:${await crypto.subtle.digest('SHA-256', new TextEncoder().encode(originalDraft)).then((bytes) => [...new Uint8Array(bytes)].map((part) => part.toString(16).padStart(2, '0')).join(''))}`;
+      if (insertedDrafts.has(draftKey)) return false;
+      const previousText = editorTools.editorText(current);
+      if (current.matches('textarea, input')) editorTools.insertTextarea(current, block);
+      else editorTools.insertContentEditable(current, block);
       lastInsertedBlock = block;
-      editor.focus();
+      insertedDrafts.add(draftKey);
+      const insertedText = editorTools.editorText(current);
+      current.focus();
       closeSuggestionPanel();
-      toast('Context inserted. Review it, then send when ready.');
-    });
+      if (automatic) {
+        toastWithUndo('Context inserted. Undo', () => editorTools.undoInsertion(current, previousText, insertedText));
+      } else toast('Context inserted. Review it, then send when ready.');
+      return true;
+    }
+    insert.addEventListener('click', () => { void insertSelected(); });
+    panel._oneBrainInsertSelected = insertSelected;
+    if (trigger === 'auto' && config.insertWithoutAsking && memories.length) void insertSelected({ automatic: true });
   }
 
   function isEditorTarget(target) {
@@ -177,11 +242,6 @@
     if (sendKey && !isEditorTarget(event.target)) return;
     const editor = adapter.getInputElement();
     let outgoing = cleanOutgoingText(editorTools.editorText(editor));
-    if (config.suggestOnSend && outgoing.trim()) {
-      event.preventDefault(); event.stopImmediatePropagation?.();
-      void openSuggestions('send');
-      return;
-    }
     if (config.autoSaveMessages && outgoing.trim().length >= 40 && !looksLikeLog(outgoing)) {
       pendingSends.push({ text: outgoing, expires: Date.now() + 30000 });
       setTimeout(confirmSentMessages, 0);
@@ -208,16 +268,191 @@
     refreshButtons();
   }
 
+  async function loadChatState() {
+    try { chatState = { enabled: true, excludeIds: [], ...(await askBackground({ type: 'get-chat-state', chatKey: await getChatKey() }) || {}) }; }
+    catch { chatState = { enabled: false, excludeIds: [] }; }
+    refreshMenuLabels();
+  }
+
+  async function syncChatRoute() {
+    if (location.pathname === chatRoutePath) return;
+    chatRoutePath = location.pathname;
+    chatKeyValue = '';
+    chatState = { enabled: true, excludeIds: [] };
+    refreshMenuLabels();
+    await loadChatState();
+  }
+
+  function scheduleIntentSearch(event) {
+    if (event.isComposing || !config.enabled || !chatState.enabled || !['ask', 'auto'].includes(config.memoryMode)) return;
+    clearTimeout(autoTimer);
+    const editor = adapter.getInputElement();
+    const snapshot = editorTools.editorText(editor);
+    if (!searchIntent.detectMemoryIntent(snapshot, config.memoryPhrases || searchIntent.DEFAULT_MEMORY_PHRASES)) return;
+    autoTimer = setTimeout(() => {
+      if (adapter.getInputElement() !== editor || editorTools.editorText(editor) !== snapshot) return;
+      if (lastInsertedBlock && snapshot.startsWith(`${lastInsertedBlock}\n\n`)) return;
+      void openSuggestions(config.memoryMode === 'auto' ? 'auto' : 'ask');
+    }, 1200);
+  }
+
+  function readChatMessages() {
+    return adapter.getMessages().map(({ element, role }, index) => {
+      const rawTimestamp = element.getAttribute('data-timestamp') || element.querySelector('time')?.dateTime || '';
+      const numericTimestamp = Number(rawTimestamp);
+      return {
+        id: element.getAttribute('data-message-id') || element.getAttribute('data-testid') || `${role}-${index}`,
+        role: ['human', 'user'].includes(role) ? 'user' : ['assistant', 'model'].includes(role) ? 'assistant' : role,
+        text: readText(element),
+        ts: numericTimestamp || (rawTimestamp ? Date.parse(rawTimestamp) : null) || null,
+        element
+      };
+    }).filter((message) => message.text && ['user', 'assistant'].includes(message.role));
+  }
+
+  function looksLikeSecret(text) {
+    return /\b(?:api[_ -]?key|(?:(?:access|refresh|auth)[_ -]?)?token|password|passwd|secret|client[_ -]?secret)\s*[:=]\s*\S+|\b(?:sk-[A-Za-z0-9_-]{12,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|sk_live_[A-Za-z0-9]{12,})\b|\bAuthorization\s*:\s*Bearer\s+\S+|\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{12,})\b|-----BEGIN [A-Z ]*PRIVATE KEY-----|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\b/i.test(String(text || ''));
+  }
+
+  async function loadFullChat(panel, status, cancelState) {
+    const progress = panel.querySelector('[data-load-progress]');
+    let stableRounds = 0;
+    for (let step = 0; step < 80 && !cancelState.cancelled && stableRounds < 2; step++) {
+      const before = adapter.getMessages().length;
+      const button = adapter.getLoadOlderButton?.();
+      if (!button || button.disabled) break;
+      button.scrollIntoView?.({ block: 'start' });
+      button.click();
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      const after = adapter.getMessages().length;
+      stableRounds = after > before ? 0 : stableRounds + 1;
+      progress.textContent = `Loaded ${after} messages · step ${step + 1}`;
+    }
+    progress.textContent = cancelState.cancelled ? 'Loading cancelled.' : `Loaded ${adapter.getMessages().length} messages.`;
+    status.textContent = '';
+  }
+
+  async function openChatSaveDialog() {
+    closeSuggestionPanel();
+    modal?.remove();
+    const key = await getChatKey();
+    let state = { saved: false };
+    try { state = await askBackground({ type: 'chat-save-state', site: SITE, chatKey: key }) || state; } catch {}
+    if (!state.ok && state.error) { toast(state.error, true); return; }
+    modal = document.createElement('section');
+    modal.className = 'one-brain-extension-modal one-brain-extension-ui';
+    modal.innerHTML = `<div class="one-brain-extension-dialog one-brain-chat-save-dialog"><h2>Save this chat</h2>
+      <section class="one-brain-load-controls"><button type="button" data-load>Load full chat</button><button type="button" data-cancel-load>Cancel loading</button><span data-load-progress></span></section>
+      <label>Title<input data-title maxlength="160"></label><label>Source<select data-source></select></label>
+      <label>Scope<select data-scope><option value="whole">Whole chat</option><option value="from">From the selected message on</option><option value="pick">Pick messages</option></select></label>
+      <label data-from-label hidden>Start at<select data-from></select></label><div data-pick-actions hidden><button type="button" data-select-all>Select all</button><button type="button" data-select-none>Select none</button></div><div data-pick class="one-brain-chat-picks" hidden></div>
+      <label>Include<select data-include><option value="my-messages">My messages only</option><option value="both">My messages + assistant replies</option><option value="both-truncated">Both, assistant replies cut to 600 characters</option></select></label>
+      <label>Split<select data-split><option value="exchange">By exchange</option><option value="topic">By topic</option><option value="fixed">Fixed size (~1,200 characters)</option><option value="one">One memory</option></select></label>
+      <p data-one-warning hidden>One memory keeps the whole chat in a single record. Search embeddings cover only the beginning of long text; a split is recommended.</p>
+      <label><input type="checkbox" data-skip-logs checked>Skip log-like text</label><label><input type="checkbox" data-skip-secrets checked>Skip text that looks like secrets</label><label><input type="checkbox" data-private>Mark all as private</label>
+      <div data-preview hidden></div><div data-save-progress class="one-brain-save-progress" hidden><i></i></div>
+      <footer><button type="button" data-cancel>Cancel</button><button type="button" data-preview-button>Preview</button><button type="button" data-save hidden>Save</button><button type="button" data-only-new hidden>Save only new messages</button></footer></div>`;
+    const panel = modal;
+    document.body.append(panel);
+    const source = panel.querySelector('[data-source]');
+    for (const value of ['chatgpt', 'claude', 'gemini', 'codex', 'groq', 'deepseek']) { const option = document.createElement('option'); option.value = value; option.textContent = value; source.append(option); }
+    source.value = SITE;
+    const titleInput = panel.querySelector('[data-title]');
+    titleInput.value = String(document.title || `Saved ${SITE} chat`).replace(/\s*[|–-]\s*(ChatGPT|Claude|Gemini).*$/i, '').slice(0, 160);
+    const startsAt = panel.querySelector('[data-from]');
+    const picks = panel.querySelector('[data-pick]');
+    function renderMessageSelectors() {
+      const list = readChatMessages();
+      startsAt.replaceChildren(); picks.replaceChildren();
+      list.forEach((message, index) => {
+        const hiddenText = looksLikeSecret(message.text) ? '[secret-looking text hidden]' : message.text.split(/\r?\n/, 1)[0].slice(0, 100);
+        const option = document.createElement('option'); option.value = String(index); option.textContent = `${message.role}: ${hiddenText}`; startsAt.append(option);
+        const label = document.createElement('label'); const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = true; checkbox.value = String(index);
+        const preview = document.createElement('span'); preview.textContent = `${message.role}: ${looksLikeSecret(message.text) ? '[secret-looking text hidden]' : message.text.slice(0, 120)}`;
+        label.append(checkbox, preview); picks.append(label);
+      });
+    }
+    renderMessageSelectors();
+    panel.querySelector('[data-scope]').addEventListener('change', (event) => { panel.querySelector('[data-from-label]').hidden = event.target.value !== 'from'; picks.hidden = event.target.value !== 'pick'; panel.querySelector('[data-pick-actions]').hidden = event.target.value !== 'pick'; });
+    panel.querySelector('[data-select-all]').addEventListener('click', () => picks.querySelectorAll('input[type="checkbox"]').forEach((item) => { item.checked = true; }));
+    panel.querySelector('[data-select-none]').addEventListener('click', () => picks.querySelectorAll('input[type="checkbox"]').forEach((item) => { item.checked = false; }));
+    panel.querySelector('[data-split]').addEventListener('change', (event) => { panel.querySelector('[data-one-warning]').hidden = event.target.value !== 'one'; });
+    const loadStatus = panel.querySelector('[data-load-progress]');
+    const cancelState = { cancelled: false };
+    panel.querySelector('[data-load]').addEventListener('click', () => { cancelState.cancelled = false; void loadFullChat(panel, loadStatus, cancelState).then(renderMessageSelectors); });
+    panel.querySelector('[data-cancel-load]').addEventListener('click', () => { cancelState.cancelled = true; });
+    panel.querySelector('[data-cancel]').addEventListener('click', () => { cancelState.cancelled = true; panel.remove(); if (modal === panel) modal = null; });
+    const preview = panel.querySelector('[data-preview]');
+    const saveButton = panel.querySelector('[data-save]'), newButton = panel.querySelector('[data-only-new]');
+    function selectedMessages() {
+      const all = readChatMessages(); const scope = panel.querySelector('[data-scope]').value;
+      if (scope === 'from') return all.slice(Number(startsAt.value) || 0);
+      if (scope === 'pick') { const selected = new Set([...picks.querySelectorAll('input:checked')].map((item) => Number(item.value))); return all.filter((_item, index) => selected.has(index)); }
+      return all;
+    }
+    function inspectPayload() {
+      const include = panel.querySelector('[data-include]').value;
+      let messages = selectedMessages().filter((item) => include !== 'my-messages' || item.role === 'user').map(({ id, role, text, ts }) => ({ id, role, text: role === 'assistant' && include === 'both-truncated' ? text.slice(0, 600) : text, ts }));
+      const skipSecrets = panel.querySelector('[data-skip-secrets]').checked;
+      const skipLogs = panel.querySelector('[data-skip-logs]').checked;
+      let skippedSecrets = 0, skippedLogs = 0;
+      messages = messages.filter((item) => { if (skipSecrets && looksLikeSecret(item.text)) { skippedSecrets++; return false; } if (skipLogs && looksLikeLog(item.text)) { skippedLogs++; return false; } return true; });
+      return { messages, skippedSecrets, skippedLogs };
+    }
+    function payload(onlyNew) {
+      const { messages } = inspectPayload();
+      return { site: SITE, chatKey: key, title: titleInput.value.trim(), source: source.value, messages, include: panel.querySelector('[data-include]').value, split: panel.querySelector('[data-split]').value, onlyNew, options: { skipLogs: panel.querySelector('[data-skip-logs]').checked, skipSecrets: panel.querySelector('[data-skip-secrets]').checked, markPrivate: panel.querySelector('[data-private]').checked } };
+    }
+    async function showPreview() {
+      preview.replaceChildren(); preview.hidden = false;
+      const summary = document.createElement('p'); summary.textContent = 'Preparing a safe preview…'; preview.append(summary);
+      try {
+        const result = await askBackground({ type: 'preview-chat', site: SITE, payload: payload(false) });
+        if (!result?.ok) throw new Error(result?.error || 'Could not prepare the chat preview.');
+        preview.replaceChildren();
+        const details = document.createElement('p'); details.textContent = `${result.count} memories · ${result.totalChars.toLocaleString()} characters · skipped ${result.skippedLogs} log chunks, ${result.skippedSecrets} secret-looking chunks${result.savedBefore ? ` · ${result.skippedDuplicates} already saved` : ''}`;
+        preview.append(details);
+        (result.firstLines || []).forEach((text) => { const line = document.createElement('p'); line.textContent = text; preview.append(line); });
+        saveButton.hidden = false; newButton.hidden = !state.saved;
+      } catch (error) { preview.replaceChildren(); const failure = document.createElement('p'); failure.textContent = error?.message || 'Could not prepare the chat preview.'; preview.append(failure); saveButton.hidden = true; newButton.hidden = true; }
+    }
+    panel.querySelector('[data-preview-button]').addEventListener('click', showPreview);
+    async function save(onlyNew) {
+      const data = payload(onlyNew);
+      if (!data.messages.length) { toast('No messages remain after the selected filters.', true); return; }
+      const progress = panel.querySelector('[data-save-progress]'); progress.hidden = false; saveButton.disabled = true; newButton.disabled = true;
+      try {
+        const result = await askBackground({ type: 'save-chat', site: SITE, payload: data });
+        if (result?.code === 'chat_already_saved') { state.saved = true; saveButton.disabled = false; newButton.disabled = false; newButton.hidden = false; toast('Choose “Save only new messages” to skip previously saved content.'); return; }
+        if (!result?.ok) throw new Error(result?.error || 'Chat save failed.');
+        progress.querySelector('i').style.width = '100%';
+        panel.querySelector('.one-brain-chat-save-dialog').innerHTML = `<h2>Chat saved</h2><p data-summary></p><button type="button" data-undo>Undo this save</button><footer><button type="button" data-close>Close</button></footer>`;
+        panel.querySelector('[data-summary]').textContent = `${result.inserted} memories saved · ${result.skippedDuplicates} duplicates · ${result.skippedLogs} log chunks · ${result.skippedSecrets} secret-looking chunks skipped.`;
+        if (!result.importId) panel.querySelector('[data-undo]').remove();
+        else panel.querySelector('[data-undo]').addEventListener('click', async () => { const undone = await askBackground({ type: 'undo-chat-save', site: SITE, importId: result.importId }); if (undone?.ok) { panel.querySelector('[data-summary]').textContent = 'This chat save was undone.'; panel.querySelector('[data-undo]').remove(); } else toast('Could not undo this chat save.', true); });
+        panel.querySelector('[data-close]').addEventListener('click', () => { panel.remove(); if (modal === panel) modal = null; });
+      } catch (error) { toast(error?.message || 'Chat save failed.', true); saveButton.disabled = false; newButton.disabled = false; }
+    }
+    saveButton.addEventListener('click', () => { void save(false); });
+    newButton.addEventListener('click', () => { void save(true); });
+  }
+
   const menu = document.createElement('button');
-  menu.type = 'button'; menu.className = 'one-brain-extension-ui one-brain-extension-menu'; menu.textContent = 'Save chat';
-  menu.addEventListener('click', () => {
-    const messages = adapter.getMessages().map(({ element, role }) => ({ role, text: readText(element) })).filter((item) => item.text && ['user', 'human', 'assistant', 'model'].includes(item.role));
-    const userMessages = messages.filter((item) => item.role === 'user' || item.role === 'human');
-    openConfirmation({ kind: 'chat', text: userMessages.map((item) => `user: ${item.text}`).join('\n\n'), messages });
+  menu.type = 'button'; menu.className = 'one-brain-extension-ui one-brain-extension-menu'; menu.textContent = 'Save this chat';
+  menu.addEventListener('click', () => { void openChatSaveDialog(); });
+  const chatMemoryToggle = document.createElement('button'); chatMemoryToggle.type = 'button'; chatMemoryToggle.className = 'one-brain-extension-ui one-brain-chat-toggle';
+  chatMemoryToggle.addEventListener('click', async () => {
+    const previous = chatState.enabled; chatState.enabled = !previous;
+    try { const saved = await askBackground({ type: 'set-chat-state', chatKey: await getChatKey(), state: chatState }); if (!saved?.ok) throw new Error(); refreshMenuLabels(); }
+    catch { chatState.enabled = previous; refreshMenuLabels(); toast('Could not update this chat’s memory setting.', true); }
   });
+  function refreshMenuLabels() { chatMemoryToggle.textContent = `Memory for this chat: ${chatState.enabled ? 'on' : 'off'}`; }
+  document.documentElement.append(chatMemoryToggle);
   document.documentElement.append(menu);
   document.addEventListener('keydown', sendIntent, true);
   document.addEventListener('click', sendIntent, true);
+  document.addEventListener('input', scheduleIntentSearch, true);
+  window.addEventListener('popstate', () => { void syncChatRoute(); });
 
   API.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === 'adapter-self-check') { sendResponse({ site: SITE, matched: adapter.selfCheck() }); return false; }
@@ -232,6 +467,7 @@
   });
 
   void loadConfig();
+  void loadChatState();
   void askBackground({ type: 'adapter-self-check-report', site: SITE, matched: adapter.selfCheck() });
-  adapter.observe(() => { refreshButtons(); confirmSentMessages(); });
+  adapter.observe(() => { refreshButtons(); confirmSentMessages(); void syncChatRoute(); });
 })();

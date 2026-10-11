@@ -1,18 +1,22 @@
 'use strict';
 
 (() => {
-  const HEADER = 'Context from my One Brain (background, may be outdated):';
-  const MAX_CONTEXT_CHARS = 6000;
+  const HEADER = 'Context from my One Brain (background, may be outdated). Also use your own memory of me and our past chats, and tell me if they conflict:';
+  const MAX_CONTEXT_TOKENS = 1500;
+  const MAX_CONTEXT_CHARS = MAX_CONTEXT_TOKENS * 4;
 
   function editorText(editor) {
-    return String(editor?.value ?? editor?.innerText ?? editor?.textContent ?? '');
+    if (editor && /^(?:TEXTAREA|INPUT)$/.test(editor.tagName || '')) return String(editor.value || '');
+    return String(editor?.innerText ?? editor?.textContent ?? '');
   }
 
-  function composeBlock(memories, maxChars = MAX_CONTEXT_CHARS) {
-    let block = HEADER;
+  function composeBlock(memories, { maxTokens = MAX_CONTEXT_TOKENS, format = 'context' } = {}) {
+    const header = format === 'bullet' ? HEADER : HEADER;
+    let block = header;
+    const maxChars = Math.max(4, Math.floor(Number(maxTokens) || MAX_CONTEXT_TOKENS) * 4);
     for (const memory of memories) {
-      const row = `\n- [${String(memory.source || 'memory')}] ${String(memory.title || 'Untitled memory')}: ${String(memory.snippet || '').replace(/\s+/g, ' ').trim()}`;
-      if (block.length + row.length > maxChars) continue;
+      const marker = format === 'bullet' ? '- ' : '';
+      const row = `\n${marker}[${String(memory.source || 'memory')}] ${String(memory.title || 'Untitled memory')}: ${String(memory.text ?? memory.snippet ?? '').replace(/\s+/g, ' ').trim()}`;
       block += row;
     }
     return block;
@@ -58,7 +62,23 @@
     return value;
   }
 
-  const api = Object.freeze({ HEADER, MAX_CONTEXT_CHARS, editorText, composeBlock, contextEstimate, nextEditorText, insertTextarea, insertContentEditable });
+  function replaceEditor(editor, value) {
+    const text = String(value || '');
+    if (/^(?:TEXTAREA|INPUT)$/.test(editor.tagName || '')) {
+      const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(editor), 'value')?.set;
+      if (setter) setter.call(editor, text); else editor.value = text;
+    } else editor.textContent = text;
+    editor.dispatchEvent(inputEvent(text));
+    return text;
+  }
+
+  function undoInsertion(editor, previousText, insertedText) {
+    if (!editor || editorText(editor) !== String(insertedText)) return false;
+    replaceEditor(editor, previousText);
+    return true;
+  }
+
+  const api = Object.freeze({ HEADER, MAX_CONTEXT_TOKENS, MAX_CONTEXT_CHARS, editorText, composeBlock, contextEstimate, nextEditorText, insertTextarea, insertContentEditable, replaceEditor, undoInsertion });
   if (typeof module !== 'undefined') module.exports = api;
   if (typeof globalThis !== 'undefined') globalThis.OneBrainEditorInsertion = api;
 })();

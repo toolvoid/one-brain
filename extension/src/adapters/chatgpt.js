@@ -5,7 +5,8 @@ const OneBrainChatGPTSelectors = Object.freeze({
   assistant: ['[data-message-author-role="assistant"]', '[data-testid*="assistant"]', '[aria-label*="assistant message" i]'],
   user: ['[data-message-author-role="user"]'],
   composer: ['#prompt-textarea', 'textarea[placeholder]', '[contenteditable="true"][role="textbox"]', '[aria-label*="message" i]'],
-  sendButton: ['[data-testid="send-button"]', 'button[aria-label*="send" i]', 'button[data-testid*="send" i]', '[role="button"][aria-label*="send" i]']
+  sendButton: ['[data-testid="send-button"]', 'button[aria-label*="send" i]', 'button[data-testid*="send" i]', '[role="button"][aria-label*="send" i]'],
+  loadOlder: ['button[aria-label*="load older" i]', 'button[aria-label*="load more" i]', '[data-testid*="load-older" i]', '[role="button"][aria-label*="load older" i]']
 });
 
 const OneBrainChatGPTAdapter = {
@@ -18,6 +19,7 @@ const OneBrainChatGPTAdapter = {
   },
   getInputElement(root = document) { for (const selector of OneBrainChatGPTSelectors.composer) { const element = root.querySelector(selector); if (element) return element; } return null; },
   getSendButton(root = document) { for (const selector of OneBrainChatGPTSelectors.sendButton) { const element = root.querySelector(selector); if (element) return element; } return null; },
+  getLoadOlderButton(root = document) { for (const selector of OneBrainChatGPTSelectors.loadOlder) { const element = root.querySelector(selector); if (element) return element; } return null; },
   getLastAssistantMessage(root = document) { return this.getMessages(root).filter((message) => message.role === 'assistant').at(-1) || null; },
   observe(callback, root = document.body) { const observer = new MutationObserver(callback); if (root) observer.observe(root, { childList: true, subtree: true }); return () => observer.disconnect(); },
   selfCheck(root = document) { return Object.fromEntries(Object.entries(OneBrainChatGPTSelectors).map(([name, selectors]) => [name, selectors.find((selector) => root.querySelectorAll(selector).length > 0) || null])); }

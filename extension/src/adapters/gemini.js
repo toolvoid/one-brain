@@ -5,7 +5,8 @@ const OneBrainGeminiSelectors = Object.freeze({
   assistant: ['[data-message-author-role="assistant"]', '.model-response-text', '[data-testid*="model-response"]', '[aria-label*="model response" i]'],
   user: ['.user-query', '[data-message-author-role="user"]'],
   composer: ['[contenteditable="true"][role="textbox"]', 'textarea[placeholder]', '[aria-label*="prompt" i]', '[aria-label*="message" i]'],
-  sendButton: ['button[aria-label*="send" i]', '[data-testid*="send" i]', 'button[aria-label*="submit" i]']
+  sendButton: ['button[aria-label*="send" i]', '[data-testid*="send" i]', 'button[aria-label*="submit" i]'],
+  loadOlder: ['button[aria-label*="load older" i]', 'button[aria-label*="load more" i]', '[data-testid*="load-older" i]']
 });
 
 const OneBrainGeminiAdapter = {
@@ -18,6 +19,7 @@ const OneBrainGeminiAdapter = {
   },
   getInputElement(root = document) { for (const selector of OneBrainGeminiSelectors.composer) { const element = root.querySelector(selector); if (element) return element; } return null; },
   getSendButton(root = document) { for (const selector of OneBrainGeminiSelectors.sendButton) { const element = root.querySelector(selector); if (element) return element; } return null; },
+  getLoadOlderButton(root = document) { for (const selector of OneBrainGeminiSelectors.loadOlder) { const element = root.querySelector(selector); if (element) return element; } return null; },
   getLastAssistantMessage(root = document) { return this.getMessages(root).filter((message) => message.role === 'assistant').at(-1) || null; },
   observe(callback, root = document.body) { const observer = new MutationObserver(callback); if (root) observer.observe(root, { childList: true, subtree: true }); return () => observer.disconnect(); },
   selfCheck(root = document) { return Object.fromEntries(Object.entries(OneBrainGeminiSelectors).map(([name, selectors]) => [name, selectors.find((selector) => root.querySelectorAll(selector).length > 0) || null])); }

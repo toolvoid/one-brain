@@ -3,8 +3,12 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { createHash, randomInt } = require('node:crypto');
+const { rankExtensionResults } = require('./ext-search');
+const { splitChatMessages, contentHash, looksSecret } = require('./ext-chat');
 
 const SITES = Object.freeze({ chatgpt: 'chatgpt', claude: 'claude', gemini: 'gemini' });
+const API_VERSION = '1.1.0';
+const MIN_EXTENSION_VERSION = '1.1.0';
 const BODY_LIMIT = 2 * 1024 * 1024;
 const WINDOW_MS = 60_000;
 const REQUEST_LIMIT = 30;
@@ -31,7 +35,9 @@ function createExtApi(options) {
   const {
     userDataPath, authenticateClientToken, getClientProfile, getMcpClientProfile,
     createToken, revokeToken, searchMemoriesForClient, addMemory, recordProxyEvent, isTokenActive = () => true,
-    emitRetrieved = () => {}, emitAdded = () => {}, now = Date.now,
+    emitRetrieved = () => {}, emitAdded = () => {}, emitRemoved = () => {}, now = Date.now, getEmbeddingVector = () => null,
+    setMemoryNoSuggest = () => false, getMemoryForClient = () => ({ memory: null }), createImport, importMemories, finishImport, getExtensionChatSave, undoExtensionChatSave,
+    embedText, appVersion = require('../package.json').version,
     importText = async (...args) => (await import('../src/lib/importers.js')).parseImportText(...args)
   } = options;
   const originsPath = path.join(userDataPath, 'extension-origins.json');
@@ -95,6 +101,26 @@ function createExtApi(options) {
 
   function log(client, { ok, count = 0, error = null, latency = 0 } = {}, memoryIds = []) {
     try { recordProxyEvent({ client, provider: 'extension', query: '', memories_injected: count, latency_ms: latency, ok, error }, memoryIds); } catch {}
+  }
+
+  async function prepareChatSave(body, site, client) {
+    if (body.site !== site || !Array.isArray(body.messages) || body.messages.length > 1000) throw Object.assign(new Error('A valid site and message list are required.'), { status: 400 });
+    const chatKey = String(body.chatKey || '');
+    if (!/^[a-f\d]{64}$/i.test(chatKey)) throw Object.assign(new Error('A valid chat key is required.'), { status: 400 });
+    const source = String(body.source || site);
+    if (!['chatgpt', 'claude', 'gemini', 'codex', 'groq', 'deepseek'].includes(source)) throw Object.assign(new Error('Choose a valid memory source.'), { status: 400 });
+    const existing = typeof getExtensionChatSave === 'function' ? getExtensionChatSave(chatKey, client) : { saved: false, hashes: [], imports: [] };
+    const include = body.include || (body.includeAssistant ? 'both' : 'my-messages');
+    const split = ['exchange', 'topic', 'fixed', 'one'].includes(body.split) ? body.split : 'exchange';
+    const options = body.options && typeof body.options === 'object' ? body.options : {};
+    const rawTitle = String(body.title || `Saved ${site} chat`).slice(0, 160);
+    const safeTitle = looksSecret(rawTitle) ? `Saved ${site} chat` : rawTitle;
+    const parsed = await splitChatMessages({ messages: body.messages.filter((message) => message && typeof message.text === 'string'), include, split, title: safeTitle, skipLogs: options.skipLogs !== false, skipSecrets: options.skipSecrets !== false, embedText });
+    let items = parsed.items.map((item) => ({ ...item, source }));
+    const priorHashes = new Set(existing.hashes || []);
+    const oldDuplicates = items.filter((item) => priorHashes.has(contentHash(item.content))).length;
+    if (existing.saved && body.onlyNew === true) items = items.filter((item) => !priorHashes.has(contentHash(item.content)));
+    return { chatKey, source, options, existing, items, skippedLogs: parsed.skippedLogs, skippedSecrets: parsed.skippedSecrets, oldDuplicates, include, split };
   }
 
   async function pair(req, res, origin) {
@@ -187,7 +213,7 @@ function createExtApi(options) {
 
     if (req.method === 'GET' && url.pathname === '/ext/ping') {
       log(identity.client, { ok: true, latency: now() - started });
-      return sendJson(res, 200, { ok: true, site, status: profile.status }, origin);
+      return sendJson(res, 200, { ok: true, site, status: profile.status, appVersion, apiVersion: API_VERSION, minExtensionVersion: MIN_EXTENSION_VERSION }, origin);
     }
     if (req.method === 'POST' && url.pathname === '/ext/unpair') {
       await revokeSite(site);
@@ -198,15 +224,21 @@ function createExtApi(options) {
       const body = await readJson(req);
       const query = String(body.query || '').trim().slice(0, 4000);
       const limit = Math.max(1, Math.min(10, Math.floor(Number(body.limit) || 5)));
-      const result = query ? await searchMemoriesForClient(query, 'all', limit, profile) : { memories: [] };
-      const memories = (result.memories || []).filter((memory) => !memory.private && profile.allowedSources?.includes(memory.source)).map((memory) => ({
-        id: memory.id, source: memory.source, title: memory.title || 'Untitled memory',
-        snippet: String(memory.content || '').replace(/\s+/g, ' ').trim().slice(0, 240),
-        score: Number.isFinite(Number(memory.score)) ? Number(memory.score) : 0
-      }));
+      const excludeIds = Array.isArray(body.excludeIds) ? body.excludeIds.slice(0, 500) : [];
+      const minScore = body.minScore == null ? 0.015 : Math.max(0, Math.min(1, Number(body.minScore) || 0));
+      const result = query ? await searchMemoriesForClient(query, 'all', Math.min(50, limit * 10), profile) : { memories: [] };
+      const memories = await rankExtensionResults({ query, memories: (result.memories || []).filter((memory) => !memory.private && !memory.no_suggest && profile.allowedSources?.includes(memory.source)), limit, minScore, excludeIds, getVector: getEmbeddingVector });
       emitRetrieved(memories.map((memory) => memory.id));
       log(identity.client, { ok: true, count: memories.length, latency: now() - started }, memories.map((memory) => memory.id));
       return sendJson(res, 200, { memories }, origin);
+    }
+    if (req.method === 'POST' && url.pathname === '/ext/no-suggest') {
+      const body = await readJson(req);
+      const id = Number(body.id);
+      const access = id > 0 ? getMemoryForClient(id, profile) : { memory: null };
+      const result = Boolean(access.memory && setMemoryNoSuggest(id, body.noSuggest !== false));
+      log(identity.client, { ok: Boolean(result), count: result ? 1 : 0, error: result ? null : 'memory_not_found', latency: now() - started });
+      return sendJson(res, result ? 200 : 404, result ? { ok: true, noSuggest: body.noSuggest !== false } : { error: 'Memory could not be updated.' }, origin);
     }
     if (req.method === 'POST' && url.pathname === '/ext/save') {
       const body = await readJson(req);
@@ -220,27 +252,56 @@ function createExtApi(options) {
       log(identity.client, { ok: true, count: memory?.id == null ? 0 : 1, latency: now() - started }, memory?.id == null ? [] : [memory.id]);
       return sendJson(res, 200, { ok: true, id: memory?.id ?? null, source: site }, origin);
     }
+    if (req.method === 'POST' && url.pathname === '/ext/chat-save-state') {
+      const body = await readJson(req);
+      const chatKey = String(body.chatKey || '');
+      if (!/^[a-f\d]{64}$/i.test(chatKey) || typeof getExtensionChatSave !== 'function') return sendJson(res, 400, { error: 'A valid chat key is required.' }, origin);
+      const state = getExtensionChatSave(chatKey, identity.client);
+      return sendJson(res, 200, { saved: Boolean(state.saved), saves: (state.imports || []).map(({ id, count, created_at }) => ({ id, count, created_at })) }, origin);
+    }
+    if (req.method === 'POST' && url.pathname === '/ext/undo-chat') {
+      const body = await readJson(req);
+      const importId = Number(body.importId);
+      const result = Number.isInteger(importId) && typeof undoExtensionChatSave === 'function' ? undoExtensionChatSave(importId, identity.client) : { removed: false, memoryIds: [] };
+      if (result.removed) for (const id of result.memoryIds || []) emitRemoved(id);
+      log(identity.client, { ok: Boolean(result.removed), count: 0, error: result.removed ? null : 'import_not_found', latency: now() - started });
+      return sendJson(res, result.removed ? 200 : 404, result.removed ? { ok: true, undone: true } : { error: 'This chat save was not found.' }, origin);
+    }
+    if (req.method === 'POST' && url.pathname === '/ext/preview-chat') {
+      const body = await readJson(req);
+      const prepared = await prepareChatSave(body, site, identity.client);
+      const items = prepared.items;
+      const preview = { count: items.length, totalChars: items.reduce((sum, item) => sum + item.content.length, 0),
+        firstLines: items.slice(0, 5).map((item) => `${looksSecret(item.title) ? '[secret-looking title hidden]' : item.title}: ${looksSecret(item.content.split(/\r?\n/, 1)[0]) ? '[secret-looking content hidden]' : item.content.split(/\r?\n/, 1)[0].slice(0, 180)}`),
+        skippedLogs: prepared.skippedLogs, skippedSecrets: prepared.skippedSecrets, skippedDuplicates: prepared.oldDuplicates,
+        savedBefore: prepared.existing.saved };
+      log(identity.client, { ok: true, count: preview.count, latency: now() - started });
+      return sendJson(res, 200, preview, origin);
+    }
     if (req.method === 'POST' && url.pathname === '/ext/save-chat') {
       const body = await readJson(req);
-      if (body.site !== site || !Array.isArray(body.messages) || body.messages.length > 1000) {
-        log(identity.client, { ok: false, error: 'invalid_chat', latency: now() - started });
-        return sendJson(res, 400, { error: 'A valid site and message list are required.' }, origin);
-      }
-      const includeAssistant = body.includeAssistant === true;
-      const messages = body.messages.filter((message) => message && typeof message.text === 'string' &&
-        (message.role === 'user' || message.role === 'human' || (includeAssistant && ['assistant', 'model'].includes(message.role))));
-      const transcript = messages.map((message) => `${message.role}: ${message.text}`).join('\n\n');
-      const parsed = await importText(transcript, 'Browser chat.txt', false, true);
-      if (!parsed.items?.length) {
+      if (typeof createImport !== 'function' || typeof importMemories !== 'function' || typeof finishImport !== 'function') return sendJson(res, 503, { error: 'Chat import is unavailable.' }, origin);
+      const prepared = await prepareChatSave(body, site, identity.client);
+      if (prepared.existing.saved && body.onlyNew !== true) return sendJson(res, 409, { error: 'This chat was saved before.', code: 'chat_already_saved', previousSaves: prepared.existing.imports.length }, origin);
+      const items = prepared.items;
+      const skippedDuplicates = prepared.existing.saved && body.onlyNew === true ? prepared.oldDuplicates : 0;
+      if (!items.length) {
         log(identity.client, { ok: true, latency: now() - started });
-        return sendJson(res, 200, { ok: true, inserted: 0, ids: [] }, origin);
+        return sendJson(res, 200, { ok: true, inserted: 0, skippedDuplicates, skippedLogs: prepared.skippedLogs, skippedSecrets: prepared.skippedSecrets, ids: [], importId: null }, origin);
       }
-      const baseTitle = String(body.title || `Saved ${site} chat`).trim().slice(0, 160) || `Saved ${site} chat`;
-      const memories = parsed.items.map((item) => addMemory({ source: site, title: item.title === 'Browser chat' ? baseTitle : `${baseTitle}${parsed.items.length > 1 ? ` (part ${parsed.items.indexOf(item) + 1}/${parsed.items.length})` : ''}`, content: item.content }, { handAdded: true }));
-      const ids = memories.map((memory) => memory.id).filter((id) => id != null);
-      for (const id of ids) emitAdded(id);
-      log(identity.client, { ok: true, count: ids.length, latency: now() - started }, ids);
-      return sendJson(res, 200, { ok: true, inserted: ids.length, ids, source: site }, origin);
+      const importId = createImport(prepared.source, prepared.chatKey, identity.client);
+      let imported;
+      try {
+        imported = importMemories(items, importId, prepared.options.markPrivate === true);
+        const finished = finishImport(importId);
+        const ids = imported.insertedIds || [];
+        for (const id of ids) emitAdded(id);
+        log(identity.client, { ok: true, count: ids.length, latency: now() - started }, ids);
+        return sendJson(res, 200, { ok: true, inserted: imported.inserted, skippedDuplicates: skippedDuplicates + imported.skipped, skippedLogs: prepared.skippedLogs, skippedSecrets: prepared.skippedSecrets, ids, source: prepared.source, importId: finished?.id ?? null }, origin);
+      } catch (error) {
+        try { undoExtensionChatSave(importId, identity.client); } catch {}
+        throw error;
+      }
     }
     log(identity.client, { ok: false, error: 'not_found', latency: now() - started });
     return sendJson(res, 404, { error: 'Unsupported extension endpoint.' }, origin);
@@ -262,4 +323,4 @@ function createExtApi(options) {
   return { handle, createPairCode, status, revokeSite, rotateSite };
 }
 
-module.exports = { SITES, BODY_LIMIT, REQUEST_LIMIT, extensionOrigin, localHost, createExtApi };
+module.exports = { SITES, API_VERSION, MIN_EXTENSION_VERSION, BODY_LIMIT, REQUEST_LIMIT, extensionOrigin, localHost, createExtApi };

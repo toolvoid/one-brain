@@ -8,9 +8,9 @@ const source = path.join(root, 'extension', 'src');
 const outputRoot = path.join(root, 'extension', 'dist');
 const hosts = ['http://127.0.0.1/*', 'https://chatgpt.com/*', 'https://claude.ai/*', 'https://gemini.google.com/*'];
 const contentScripts = [
-  { matches: ['https://chatgpt.com/*'], js: ['src/adapters/chatgpt.js', 'src/editor-insertion.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
-  { matches: ['https://claude.ai/*'], js: ['src/adapters/claude.js', 'src/editor-insertion.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
-  { matches: ['https://gemini.google.com/*'], js: ['src/adapters/gemini.js', 'src/editor-insertion.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' }
+  { matches: ['https://chatgpt.com/*'], js: ['src/adapters/chatgpt.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
+  { matches: ['https://claude.ai/*'], js: ['src/adapters/claude.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
+  { matches: ['https://gemini.google.com/*'], js: ['src/adapters/gemini.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' }
 ];
 
 function build(browser) {
@@ -21,7 +21,7 @@ function build(browser) {
   const manifest = {
     manifest_version: 3,
     name: 'One Brain',
-    version: '1.0.0',
+    version: '1.1.0',
     description: 'Save selected chat messages to your local One Brain memory.',
     permissions: ['storage'],
     host_permissions: hosts,

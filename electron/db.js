@@ -8,6 +8,7 @@ const { Worker } = require('node:worker_threads');
 const { INSIGHT_QUERIES } = require('./analytics-queries');
 const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
 const { JOIN_ALL_MIN } = require('../src/lib/link-constants.json');
+const { rankExtensionResults } = require('./ext-search');
 const MEMORY_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 
 let database;
@@ -369,7 +370,8 @@ async function runRetrievalEvaluation() {
   const modes = [
     ['hybrid', (query) => searchMemories(query, 'all', 10, 0)],
     ['fts-only', (query) => searchFts(query, 'all', 10, 0)],
-    ['semantic-only', (query) => semanticSearch(query, 'all', 10)]
+    ['semantic-only', (query) => semanticSearch(query, 'all', 10)],
+    ['extension-search', async (query) => rankExtensionResults({ query, memories: await searchMemories(query, 'all', 50, 0), limit: 10, minScore: 0.015, getVector: getMemoryEmbeddingVector })]
   ];
   const outputs = [];
   for (const [mode, search] of modes) {
@@ -664,7 +666,7 @@ function cosineSimilarity(a, b) {
 
 function loadCaches(db) {
   if (cachesLoaded) return;
-  memoryCache = new Map(db.prepare('SELECT id, source, title, content, private FROM memories').all().map((row) => [row.id, row]));
+  memoryCache = new Map(db.prepare('SELECT id, source, title, content, private, no_suggest, import_id FROM memories').all().map((row) => [row.id, row]));
   vectorCache = new Map();
   for (const row of db.prepare('SELECT memory_id, model, dim, vector FROM embeddings').all()) {
     const vector = vectorFromBlob(row.vector, row.dim);
@@ -688,7 +690,9 @@ function getDatabase() {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         source TEXT NOT NULL,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        count INTEGER NOT NULL DEFAULT 0
+        count INTEGER NOT NULL DEFAULT 0,
+        chat_key TEXT,
+        extension_client TEXT
       );
       CREATE TABLE IF NOT EXISTS schema_migrations (
         id TEXT PRIMARY KEY,
@@ -944,6 +948,14 @@ function getDatabase() {
       if (!memoryColumns.has('content_hash')) database.exec('ALTER TABLE memories ADD COLUMN content_hash TEXT');
       if (!memoryColumns.has('import_id')) database.exec('ALTER TABLE memories ADD COLUMN import_id INTEGER REFERENCES imports(id) ON DELETE CASCADE');
     });
+    migrate('extension-memory-controls-v1', () => {
+      const memoryColumns = new Set(database.prepare('PRAGMA table_info(memories)').all().map((column) => column.name));
+      if (!memoryColumns.has('no_suggest')) database.exec('ALTER TABLE memories ADD COLUMN no_suggest INTEGER NOT NULL DEFAULT 0 CHECK(no_suggest IN (0, 1))');
+      const importColumns = new Set(database.prepare('PRAGMA table_info(imports)').all().map((column) => column.name));
+      if (!importColumns.has('chat_key')) database.exec('ALTER TABLE imports ADD COLUMN chat_key TEXT');
+      if (!importColumns.has('extension_client')) database.exec('ALTER TABLE imports ADD COLUMN extension_client TEXT');
+      database.exec('CREATE INDEX IF NOT EXISTS imports_chat_key_idx ON imports(chat_key, extension_client)');
+    });
     database.exec('CREATE INDEX IF NOT EXISTS memories_import_id_idx ON memories(import_id)');
 
     const backfillHashes = database.transaction(() => {
@@ -1023,11 +1035,14 @@ function createSemanticLinks(memoryId, vector) {
   const existingPairs = new Set(db.prepare('SELECT a_id, b_id FROM links').all().map((row) => `${row.a_id}:${row.b_id}`));
   const rejectedPairs = new Set(db.prepare("SELECT a_id, b_id FROM link_suggestions WHERE status = 'rejected'").all().map((row) => `${row.a_id}:${row.b_id}`));
   const ownTitle = normalizedSemanticTitle(memory.title);
+  const chatKeys = new Map(db.prepare('SELECT id, chat_key FROM imports WHERE chat_key IS NOT NULL').all().map((row) => [Number(row.id), row.chat_key]));
+  const ownChatKey = memory.import_id == null ? null : chatKeys.get(Number(memory.import_id));
   const candidates = [];
   for (const [otherId, entry] of vectorCache) {
     if (otherId === Number(memoryId) || entry.model !== embeddingModel) continue;
     const other = memoryCache.get(otherId);
     if (!other || (ownTitle && ownTitle === normalizedSemanticTitle(other.title))) continue;
+    if (ownChatKey && other.import_id != null && chatKeys.get(Number(other.import_id)) === ownChatKey) continue;
     const score = cosineSimilarity(vector, entry.vector);
     if (score < SUGGEST_MIN) continue;
     const [lowId, highId] = Number(memoryId) < otherId ? [Number(memoryId), otherId] : [otherId, Number(memoryId)];
@@ -1072,7 +1087,7 @@ function createSemanticLinks(memoryId, vector) {
 async function embedMemory(memoryId) {
   const db = getDatabase();
   if (cancelledEmbeddingIds.has(Number(memoryId))) return false;
-  const memory = db.prepare('SELECT id, source, title, content FROM memories WHERE id = ?').get(memoryId);
+  const memory = db.prepare('SELECT id, source, title, content, private, no_suggest, import_id FROM memories WHERE id = ?').get(memoryId);
   if (!memory || !embeddingProvider) return false;
   const vector = await embeddingProvider(memory.content);
   if (cancelledEmbeddingIds.has(Number(memoryId)) || !db.prepare('SELECT 1 FROM memories WHERE id = ?').get(memoryId)) return false;
@@ -1279,7 +1294,7 @@ function setMemoryPrivate(memoryId, isPrivate) {
   const id = Number(memoryId);
   const changed = db.prepare('UPDATE memories SET private = ? WHERE id = ?').run(isPrivate ? 1 : 0, id).changes > 0;
   if (!changed) return false;
-  const memory = db.prepare('SELECT id, source, title, content, private FROM memories WHERE id = ?').get(id);
+  const memory = db.prepare('SELECT id, source, title, content, private, no_suggest, import_id FROM memories WHERE id = ?').get(id);
   memoryCache.set(id, memory);
   recordEvent({ kind: 'privacy_change', tool: 'memory_privacy', source: memory.source, result_count: 1, ok: 1, error: memory.private ? 'private' : 'public' });
   return true;
@@ -1298,7 +1313,7 @@ function setMemorySource(memoryId, source) {
     return true;
   });
   if (!move()) return false;
-  const memory = db.prepare('SELECT id, source, title, content, private FROM memories WHERE id = ?').get(id);
+  const memory = db.prepare('SELECT id, source, title, content, private, no_suggest, import_id FROM memories WHERE id = ?').get(id);
   memoryCache.set(id, memory);
   recordEvent({ kind: 'source_change', tool: 'memory_source', source, result_count: 1, ok: 1 });
   return true;
@@ -1317,7 +1332,23 @@ async function searchMemoriesForClient(query, source, limit, profile) {
   const placeholders = candidates.map(() => '?').join(',');
   const visible = new Set(getDatabase().prepare(`SELECT id FROM memories WHERE private = 0 AND source IN (${currentAllowed.map(() => '?').join(',')}) AND id IN (${placeholders})`)
     .all(...currentAllowed, ...candidates.map((memory) => memory.id)).map((row) => Number(row.id)));
-  return { memories: candidates.filter((memory) => visible.has(Number(memory.id))), denied: false };
+  const visibleCandidates = candidates.filter((memory) => visible.has(Number(memory.id)));
+  const details = visibleCandidates.length ? getDatabase().prepare(`SELECT id, content, no_suggest FROM memories WHERE id IN (${visibleCandidates.map(() => '?').join(',')})`).all(...visibleCandidates.map((memory) => memory.id)) : [];
+  const detailsById = new Map(details.map((row) => [Number(row.id), row]));
+  return { memories: visibleCandidates.map((memory) => ({ ...memory, ...detailsById.get(Number(memory.id)), vector: vectorCache.get(Number(memory.id))?.vector || null })), denied: false };
+}
+
+function getMemoryEmbeddingVector(memoryId) { return vectorCache.get(Number(memoryId))?.vector || null; }
+
+function setMemoryNoSuggest(memoryId, noSuggest) {
+  ensureWritable();
+  const changed = getDatabase().prepare('UPDATE memories SET no_suggest = ? WHERE id = ?').run(noSuggest ? 1 : 0, Number(memoryId)).changes > 0;
+  if (changed) {
+    const memory = getDatabase().prepare('SELECT id, source, title, content, private, no_suggest, import_id FROM memories WHERE id = ?').get(Number(memoryId));
+    if (memoryCache.has(Number(memoryId))) memoryCache.set(Number(memoryId), memory);
+    recordEvent({ kind: 'memory_suggestibility', tool: 'memory_no_suggest', source: memory.source, result_count: 1, ok: 1, error: memory.no_suggest ? 'disabled' : 'enabled' });
+  }
+  return changed;
 }
 
 function getMemoryForClient(memoryId, profile) {
@@ -1357,7 +1388,7 @@ function addMemory({ source, title, content }, { handAdded = false, event = null
     }
 
     const memory = db
-      .prepare('SELECT id, source, title, content, created_at, private FROM memories WHERE id = ?')
+      .prepare('SELECT id, source, title, content, created_at, private, no_suggest, import_id FROM memories WHERE id = ?')
       .get(id);
     return { memory, inserted: Boolean(result.changes) };
   });
@@ -1372,10 +1403,27 @@ function addMemory({ source, title, content }, { handAdded = false, event = null
   return result.memory;
 }
 
-function createImport(source) {
+function createImport(source, chatKey = null, extensionClient = null) {
   ensureWritable();
-  const result = getDatabase().prepare('INSERT INTO imports (source, count) VALUES (?, 0)').run(String(source || ''));
+  const result = getDatabase().prepare('INSERT INTO imports (source, count, chat_key, extension_client) VALUES (?, 0, ?, ?)').run(String(source || ''), chatKey, extensionClient);
   return Number(result.lastInsertRowid);
+}
+
+function getExtensionChatSave(chatKey, extensionClient) {
+  const db = getDatabase();
+  const imports = db.prepare('SELECT id, source, count, created_at FROM imports WHERE chat_key = ? AND extension_client = ? AND count > 0 ORDER BY id DESC').all(String(chatKey), String(extensionClient));
+  if (!imports.length) return { saved: false, imports: [], hashes: [] };
+  const ids = imports.map((item) => item.id);
+  const hashes = db.prepare(`SELECT DISTINCT content_hash FROM memories WHERE import_id IN (${ids.map(() => '?').join(',')}) AND content_hash IS NOT NULL`).all(...ids).map((item) => item.content_hash);
+  return { saved: true, imports, hashes };
+}
+
+function undoExtensionChatSave(importId, extensionClient) {
+  ensureWritable();
+  const owned = getDatabase().prepare('SELECT id FROM imports WHERE id = ? AND extension_client = ?').get(Number(importId), String(extensionClient));
+  if (!owned) return { removed: false, memoryIds: [] };
+  const memoryIds = getDatabase().prepare('SELECT id FROM memories WHERE import_id = ?').all(Number(importId)).map((row) => Number(row.id));
+  return { removed: undoImport(Number(importId)), memoryIds };
 }
 
 function importMemories(items, importId, markPrivate = false) {
@@ -1409,11 +1457,11 @@ function importMemories(items, importId, markPrivate = false) {
   const result = importBatch(items);
   recordEvent({ kind: 'import', tool: 'import_memories', source: id ? db.prepare('SELECT source FROM imports WHERE id = ?').get(id)?.source : null, result_count: result.inserted });
   if (cachesLoaded && result.insertedIds.length) {
-    const get = db.prepare('SELECT id, source, title, content, private FROM memories WHERE id = ?');
+    const get = db.prepare('SELECT id, source, title, content, private, no_suggest, import_id FROM memories WHERE id = ?');
     for (const id of result.insertedIds) memoryCache.set(id, get.get(id));
   }
   for (const id of result.insertedIds) void enqueueEmbedding(id).catch(() => {});
-  return { inserted: result.inserted, skipped: result.skipped };
+  return { inserted: result.inserted, skipped: result.skipped, insertedIds: result.insertedIds };
 }
 
 function finishImport(importId) {
@@ -1449,13 +1497,13 @@ function undoImport(importId) {
 
 function listMemories() {
   return getDatabase()
-    .prepare('SELECT id, source, title, content, created_at, private FROM memories ORDER BY created_at DESC, id DESC')
+    .prepare('SELECT id, source, title, content, created_at, private, no_suggest FROM memories ORDER BY created_at DESC, id DESC')
     .all();
 }
 
 function getMemory(id) {
   const db = getDatabase();
-  const memory = db.prepare('SELECT id, source, title, content, created_at, private FROM memories WHERE id = ?').get(Number(id));
+  const memory = db.prepare('SELECT id, source, title, content, created_at, private, no_suggest FROM memories WHERE id = ?').get(Number(id));
   if (!memory) return null;
   const linkedMemoryIds = db.prepare('SELECT CASE WHEN a_id = ? THEN b_id ELSE a_id END AS id FROM links WHERE a_id = ? OR b_id = ? ORDER BY id').all(memory.id, memory.id, memory.id).map((row) => row.id);
   return { ...memory, linked_memory_ids: linkedMemoryIds };
@@ -1482,7 +1530,7 @@ function searchFts(query, source, limit, offset) {
   const params = filterSource ? [match, filterSource, safeLimit, safeOffset] : [match, safeLimit, safeOffset];
   const sourceWhere = filterSource ? 'AND memories.source = ?' : '';
   return db.prepare(`
-    SELECT memories.id, memories.source, memories.title, memories.created_at, memories.private,
+    SELECT memories.id, memories.source, memories.title, memories.created_at, memories.private, memories.no_suggest,
       substr(snippet(memories_fts, -1, '', '', ' … ', 24), 1, 120) AS snippet
     FROM memories_fts
     JOIN memories ON memories.id = memories_fts.rowid
@@ -1502,7 +1550,7 @@ async function semanticSearch(query, source, limit = 50) {
     const memory = memoryCache.get(id);
     if (!memory || (source && source !== 'all' && memory.source !== source)) continue;
     const score = cosineSimilarity(queryVector, entry.vector);
-    results.push({ id, source: memory.source, title: memory.title, created_at: memory.created_at, snippet: String(memory.content || '').slice(0, 120), score });
+    results.push({ id, source: memory.source, title: memory.title, created_at: memory.created_at, snippet: String(memory.content || '').slice(0, 120), private: memory.private, no_suggest: memory.no_suggest, score });
   }
   results.sort((a, b) => b.score - a.score);
   return results.slice(0, safeLimit);
@@ -1535,11 +1583,11 @@ async function searchMemories(query, source, limit = 50, offset = 0, event = nul
   }
 
   const combined = new Map();
-  fts.forEach((row, index) => combined.set(row.id, { ...row, score: 1 / (60 + index + 1) }));
+  fts.forEach((row, index) => combined.set(row.id, { ...row, matchedFts: true, matchedSemantic: false, score: 1 / (60 + index + 1) }));
   semantic.forEach((row, index) => {
     const existing = combined.get(row.id);
-    if (existing) existing.score += 1 / (60 + index + 1);
-    else combined.set(row.id, { ...row, score: 1 / (60 + index + 1) });
+    if (existing) { existing.score += 1 / (60 + index + 1); existing.matchedSemantic = true; }
+    else combined.set(row.id, { ...row, matchedFts: false, matchedSemantic: true, score: 1 / (60 + index + 1) });
   });
   const results = [...combined.values()].sort((a, b) => b.score - a.score).slice(safeOffset, safeOffset + safeLimit);
   if (event) recordEvent({ ...event, source: source === 'all' ? null : source, query, result_count: results.length, top_score: results[0]?.score ?? null, latency_ms: Date.now() - startedAt }, results.map((row) => row.id));
@@ -1757,4 +1805,4 @@ function countBySource() {
     }, {});
 }
 
-module.exports = { initializeDatabase, closeDatabaseForTest, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemorySource, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, JOIN_ALL_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
+module.exports = { initializeDatabase, closeDatabaseForTest, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, searchMemoriesForClient, getMemoryEmbeddingVector, getMemoryForClient, countBySourceForClient, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, JOIN_ALL_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };

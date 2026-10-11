@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld('brain', {
   dismissSuggestions: () => ipcRenderer.invoke('suggestions:dismiss-all'),
   deleteMemory: (id) => ipcRenderer.invoke('memories:delete', id),
   setMemoryPrivate: (id, isPrivate) => ipcRenderer.invoke('memories:set-private', id, isPrivate),
+  setMemoryNoSuggest: (id, noSuggest) => ipcRenderer.invoke('memories:set-no-suggest', id, noSuggest),
   moveMemoryToSource: (id, source) => ipcRenderer.invoke('memories:move-source', id, source),
   countConversationParts: (id) => ipcRenderer.invoke('memories:conversation-parts:count', id),
   deleteConversationParts: (id) => ipcRenderer.invoke('memories:conversation-parts:delete', id),
