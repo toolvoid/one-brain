@@ -21,6 +21,99 @@ function InsightBars({ rows, valueKey, labelKey, groupKey, colors }) {
   return <div className="insight-bars">{rows.map((row, index) => <div className="insight-bar-row" key={`${row[labelKey]}-${row[groupKey] || index}`}><span>{row[labelKey]}{groupKey ? ` · ${row[groupKey]}` : ''}</span><div className="insight-bar-track"><i style={{ width: `${Math.max(1, (Number(row[valueKey]) || 0) / maximum * 100)}%`, background: colors?.[row[groupKey]] || '#83b9f4' }} /></div><b>{row[valueKey]}</b></div>)}{rows.length === 0 && <p className="empty-note">No data yet</p>}</div>;
 }
 
+function EvaluationPanel() {
+  const [cases, setCases] = useState([]);
+  const [recentQueries, setRecentQueries] = useState([]);
+  const [history, setHistory] = useState([]);
+  const [query, setQuery] = useState('');
+  const [lookupQuery, setLookupQuery] = useState('');
+  const [matches, setMatches] = useState([]);
+  const [editingCase, setEditingCase] = useState(null);
+  const [searching, setSearching] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState('');
+  const [lastRun, setLastRun] = useState(null);
+  const [notes, setNotes] = useState({});
+
+  async function refresh() {
+    const [nextCases, nextRecent, nextHistory] = await Promise.all([
+      window.brain.listEvaluationCases(), window.brain.listRecentEvaluationQueries(30), window.brain.getEvaluationHistory()
+    ]);
+    setCases(nextCases); setRecentQueries(nextRecent); setHistory(nextHistory);
+    setNotes(Object.fromEntries(nextHistory.map((run) => [run.id, run.note || ''])));
+  }
+  useEffect(() => { void refresh().catch((reason) => setError(reason.message || 'Could not load evaluation data.')); }, []);
+
+  async function searchForExpected(nextQuery = lookupQuery) {
+    const value = String(nextQuery || '').trim();
+    if (!value) return;
+    setLookupQuery(value); setSearching(true); setError('');
+    try { setMatches(await window.brain.searchMemories(value, 'all', 10, 0)); }
+    catch (reason) { setError(reason.message || 'Search failed.'); }
+    finally { setSearching(false); }
+  }
+
+  async function beginExpectedLookup(caseQuery, editId = null) {
+    setQuery(caseQuery); setEditingCase(editId); setLookupQuery(caseQuery);
+    await searchForExpected(caseQuery);
+  }
+
+  async function chooseExpected(memoryId) {
+    try {
+      if (editingCase?.kind === 'case') await window.brain.updateEvaluationCase(editingCase.id, memoryId);
+      else await window.brain.addEvaluationCase(query, memoryId);
+      setEditingCase(null); setMatches([]); setQuery(''); await refresh();
+    } catch (reason) { setError(reason.message || 'Could not save the evaluation case.'); }
+  }
+
+  async function removeCase(id) {
+    try { await window.brain.deleteEvaluationCase(id); await refresh(); }
+    catch (reason) { setError(reason.message || 'Could not delete this case.'); }
+  }
+
+  async function run() {
+    setRunning(true); setError('');
+    try { setLastRun(await window.brain.runRetrievalEvaluation()); await refresh(); }
+    catch (reason) { setError(reason.message || 'Evaluation failed.'); }
+    finally { setRunning(false); }
+  }
+
+  async function saveNote(runId) {
+    try { await window.brain.updateEvaluationNote(runId, notes[runId] || ''); await refresh(); }
+    catch (reason) { setError(reason.message || 'Could not save the run note.'); }
+  }
+
+  const percent = (value) => `${(Number(value || 0) * 100).toFixed(1)}%`;
+  const delta = (value) => value == null ? '—' : `${value > 0 ? '+' : ''}${(Number(value) * 100).toFixed(1)}%`;
+  const modeName = (mode) => ({ hybrid: 'Hybrid', 'fts-only': 'FTS only', 'semantic-only': 'Semantic only' })[mode] || mode;
+
+  return <section className="insight-card evaluation-panel">
+    <header><h2>Retrieval evaluation</h2><button className="run-sql-button" type="button" onClick={() => void run()} disabled={running || cases.every((item) => item.stale)}>{running ? 'Running…' : 'Run evaluation'}</button></header>
+    <p className="evaluation-help">Cases save only query text and expected memory IDs. Deleted expected memories are stale and skipped.</p>
+    {error && <p className="sql-error" role="alert">{error}</p>}
+    <div className="evaluation-add">
+      <label>Query<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search query to evaluate" /></label>
+      <button type="button" onClick={() => void searchForExpected(query, editingCase)} disabled={searching || !query.trim()}>{searching ? 'Searching…' : 'Search'}</button>
+      {editingCase && <button type="button" className="cancel-button" onClick={() => { setEditingCase(null); setMatches([]); }}>Cancel</button>}
+    </div>
+      <div className="evaluation-add evaluation-memory-search"><label>Find expected memory<input value={lookupQuery} onChange={(event) => setLookupQuery(event.target.value)} placeholder="Search titles and content" /></label><button type="button" onClick={() => void searchForExpected()} disabled={searching || !lookupQuery.trim()}>{searching ? 'Searching…' : 'Find memory'}</button></div>
+      {matches.length > 0 && <div className="evaluation-picks"><strong>Pick the memory expected at rank 1</strong>{matches.map((memory) => <button type="button" key={memory.id} onClick={() => void chooseExpected(memory.id)}><span>{memory.title || 'Untitled memory'}</span><small>{memory.source} · #{memory.id}</small></button>)}</div>}
+    <details className="evaluation-recent"><summary>Add from recent searches ({recentQueries.length})</summary>
+      {recentQueries.map((item, index) => <article key={`${item.query}-${index}`}><span>{item.query}<small>{item.result_count === 0 ? 'Zero results' : `Last search ${dateLabel(item.ts) || 'recently'}`}</small></span><button type="button" onClick={() => void beginExpectedLookup(item.query, { kind: 'recent' })}>Pick expected</button></article>)}
+      {recentQueries.length === 0 && <p className="empty-note">No recent searches recorded.</p>}
+    </details>
+    <div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>Query</th><th>Expected first</th><th>Status</th><th>Actions</th></tr></thead><tbody>
+      {cases.map((item) => <tr key={item.id}><td>{item.query}</td><td>{item.expected_title || (item.stale ? `Deleted memory #${item.expected_memory_id}` : `Memory #${item.expected_memory_id}`)}</td><td>{item.stale ? 'Stale · skipped' : 'Ready'}</td><td><button type="button" onClick={() => void beginExpectedLookup(item.query, { kind: 'case', id: item.id })}>Edit expected</button><button type="button" className="evaluation-delete" onClick={() => void removeCase(item.id)}>Delete</button></td></tr>)}
+      {cases.length === 0 && <tr><td colSpan="4">No evaluation cases yet.</td></tr>}
+    </tbody></table></div>
+    {lastRun && <section className="evaluation-results"><h3>Latest comparison</h3><table className="evaluation-table"><thead><tr><th>Mode</th><th>Hit@1</th><th>Hit@3</th><th>MRR</th></tr></thead><tbody>{lastRun.runs.map((item) => <tr key={item.id}><td>{modeName(item.mode)}</td><td>{percent(item.hit1)}</td><td>{percent(item.hit3)}</td><td>{Number(item.mrr).toFixed(3)}</td></tr>)}</tbody></table>
+      <h4>Per-case rank (blank means not in top 10)</h4><div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>Query</th>{lastRun.runs.map((item) => <th key={item.id}>{modeName(item.mode)}</th>)}</tr></thead><tbody>{cases.filter((item) => !item.stale).map((item) => <tr key={item.id}><td>{item.query}</td>{lastRun.runs.map((runItem) => <td key={runItem.id}>{runItem.caseRanks.find((rank) => rank.case_id === item.id)?.rank ?? ''}</td>)}</tr>)}</tbody></table></div>
+      {lastRun.runs.map((runItem) => <section className="evaluation-failures" key={`fail-${runItem.id}`}><h4>{modeName(runItem.mode)} · cases not in top 3</h4>{runItem.failingCases.length ? runItem.failingCases.map((item) => <article key={item.case_id}><strong>{item.expected_title || 'Untitled expected memory'} · rank {item.rank ?? '—'}</strong><small>Returned: {item.returned.map((memory) => memory.title).join(' · ') || 'No results'}</small></article>) : <p className="empty-note">All valid cases ranked in the top 3.</p>}</section>)}
+    </section>}
+    <section className="evaluation-history"><h3>Run history</h3>{history.map((item) => <article key={item.id}><header><strong>{modeName(item.mode)} · {dateLabel(item.ts)}</strong><small>{item.cases} cases · hit@1 {percent(item.hit1)} · hit@3 {percent(item.hit3)} · hit@5 {percent(item.hit5)} · MRR {Number(item.mrr).toFixed(3)}</small></header><small>Delta vs previous {modeName(item.mode)} run: hit@1 {delta(item.delta?.hit1)} · hit@3 {delta(item.delta?.hit3)} · hit@5 {delta(item.delta?.hit5)} · MRR {delta(item.delta?.mrr)}</small><div className="evaluation-note"><input aria-label={`Note for run ${item.id}`} value={notes[item.id] || ''} onChange={(event) => setNotes((current) => ({ ...current, [item.id]: event.target.value }))} placeholder="Add a note" /><button type="button" onClick={() => void saveNote(item.id)}>Save note</button></div></article>)}{history.length === 0 && <p className="empty-note">No evaluation runs yet.</p>}</section>
+  </section>;
+}
+
 function InsightsView({ data, onBack, sql, setSql, runSql, sqlResult, sqlRunning }) {
   const view = (key) => data?.[key] || { rows: [], sql: '' };
   const table = (rows, keys, empty = 'No data yet') => rows.length ? <div className="insight-table-wrap"><table className="insight-table"><thead><tr>{keys.map(([key, label]) => <th key={key}>{label}</th>)}</tr></thead><tbody>{rows.map((row, index) => <tr key={row.id ?? row.ts ?? `${index}`} >{keys.map(([key]) => <td key={key}>{row[key] == null ? '—' : String(row[key])}</td>)}</tr>)}</tbody></table></div> : <p className="empty-note">{empty}</p>;
@@ -38,6 +131,7 @@ function InsightsView({ data, onBack, sql, setSql, runSql, sqlResult, sqlRunning
       <SqlPanel title="Embedding index status" sql={embedding.sql}><div className="insight-stat"><strong>{embedding.rows[0]?.indexed ?? 0}</strong><span>indexed of {embedding.rows[0]?.total ?? 0} memories</span></div></SqlPanel>
       <SqlPanel title="Connected MCP clients" sql={clients.sql}>{table(clients.rows, [['client','Client'],['first_seen','First seen'],['last_seen','Last seen'],['total_calls','Total calls'],['calls_last_7_days','Last 7 days']])}</SqlPanel>
     </div>
+    <EvaluationPanel />
     <section className="insight-card run-sql-card"><header><h2>Run SQL</h2><small>Read only · SELECT only · 200 rows · 3 second timeout</small></header><textarea aria-label="SQL query" spellCheck="false" value={sql} onChange={(event) => setSql(event.target.value)} /><button className="run-sql-button" type="button" onClick={runSql} disabled={sqlRunning}>{sqlRunning ? 'Running…' : 'Run SQL'}</button>{sqlResult?.error && <p className="sql-error" role="alert">{sqlResult.error}</p>}{sqlResult?.rows && table(sqlResult.rows, sqlResult.columns.map((column) => [column, column]), 'Query returned no rows')}</section>
   </section>;
 }
@@ -865,6 +959,40 @@ function App() {
         .insight-note b { color:#eaf2fc; }
         .insight-stat { display:flex;align-items:baseline;gap:9px;padding:8px 0;color:#9aabc0; }
         .insight-stat strong { color:#eaf2fc;font-size:28px; }
+        .evaluation-panel { max-width:1500px;margin:14px auto 0; }
+        .evaluation-panel > header button,.evaluation-add > button,.evaluation-picks button,.evaluation-recent button,.evaluation-table button,.evaluation-note button { border:1px solid rgba(143,196,255,.25);border-radius:6px;padding:6px 9px;color:#c7e1ff;background:#182a40;font:10px system-ui,sans-serif;cursor:pointer; }
+        .evaluation-panel button:disabled { opacity:.55;cursor:default; }
+        .evaluation-help { margin:0 0 12px;color:#8b9bb0;font-size:10px; }
+        .evaluation-add { display:flex;align-items:end;gap:7px;margin-bottom:10px; }
+        .evaluation-add label { display:grid;flex:1;gap:5px;color:#b9c8da;font-size:10px; }
+        .evaluation-add input,.evaluation-note input { min-width:0;padding:8px;border:1px solid #354054;border-radius:6px;color:#edf2fb;background:#111827;font:11px system-ui,sans-serif; }
+        .evaluation-picks { display:grid;gap:6px;margin:8px 0;padding:9px;border:1px solid rgba(175,195,224,.14);border-radius:7px; }
+        .evaluation-picks > strong { color:#dce6f2;font-size:10px; }
+        .evaluation-picks button { display:flex;justify-content:space-between;gap:8px;text-align:left; }
+        .evaluation-picks small,.evaluation-recent small { color:#91a2b8;font-size:9px; }
+        .evaluation-recent { margin:10px 0;padding:9px;border:1px solid rgba(175,195,224,.14);border-radius:7px;color:#c5d1e0;font-size:10px; }
+        .evaluation-recent summary { cursor:pointer; }
+        .evaluation-recent article { display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-top:1px solid rgba(175,195,224,.1); }
+        .evaluation-recent article span { display:grid;gap:3px;overflow-wrap:anywhere; }
+        .evaluation-table-wrap { width:100%;overflow:auto; }
+        .evaluation-table { width:100%;border-collapse:collapse;color:#becbdd;font-size:10px; }
+        .evaluation-table th,.evaluation-table td { padding:8px 7px;border-bottom:1px solid rgba(175,195,224,.1);text-align:left;vertical-align:top; }
+        .evaluation-table th { color:#91a2b8;font-weight:550; }
+        .evaluation-table td:first-child { overflow-wrap:anywhere; }
+        .evaluation-table td button { margin:0 4px 3px 0;padding:4px 6px; }
+        .evaluation-table .evaluation-delete { border-color:rgba(255,136,136,.25);color:#ffc6c6;background:#3b252b; }
+        .evaluation-results,.evaluation-history { margin-top:16px;padding-top:12px;border-top:1px solid rgba(175,195,224,.14); }
+        .evaluation-results h3,.evaluation-history h3 { margin:0 0 9px;color:#dce6f2;font-size:12px; }
+        .evaluation-failures { display:grid;gap:5px;margin-top:10px; }
+        .evaluation-failures h4 { margin:0;color:#afc2da;font-size:10px; }
+        .evaluation-failures article,.evaluation-history article { display:grid;gap:5px;padding:8px;border:1px solid rgba(175,195,224,.1);border-radius:6px;background:rgba(7,13,22,.3); }
+        .evaluation-failures article strong { color:#d3deed;font-size:10px; }
+        .evaluation-failures article small,.evaluation-history article small { color:#95a5b9;font-size:9px;overflow-wrap:anywhere; }
+        .evaluation-history { display:grid;gap:8px; }
+        .evaluation-history article header { display:grid;gap:4px; }
+        .evaluation-history article header strong { color:#dce6f2;font-size:10px; }
+        .evaluation-note { display:flex;gap:6px; }
+        .evaluation-note input { flex:1; }
         .run-sql-card { max-width:1500px;margin:14px auto 0; }
         .run-sql-card > header small { color:#8192a9;font-size:10px; }
         .run-sql-card textarea { box-sizing:border-box;width:100%;min-height:82px;resize:vertical;padding:10px;border:1px solid rgba(175,195,224,.17);border-radius:6px;outline:none;color:#cfe0f4;background:#080e18;font:11px/1.5 ui-monospace,monospace; }
@@ -872,7 +1000,7 @@ function App() {
         .run-sql-button:disabled { opacity:.6;cursor:wait; }
         .sql-error { margin:10px 0 0;color:#ff9292;font-size:11px; }
         .run-sql-card .insight-table-wrap { margin-top:12px; }
-        @media(max-width:620px) { .insights-view { padding:16px 12px 30px; }.insights-grid { grid-template-columns:1fr; }.insight-card { padding:11px; }.insight-bar-row { grid-template-columns:95px 1fr 24px;gap:5px; } }
+        @media(max-width:620px) { .insights-view { padding:16px 12px 30px; }.insights-grid { grid-template-columns:1fr; }.insight-card { padding:11px; }.insight-bar-row { grid-template-columns:95px 1fr 24px;gap:5px; }.evaluation-add { flex-wrap:wrap; }.evaluation-add label { flex-basis:100%; } }
         .memory-panel.is-collapsed { transform:translateX(calc(-100% + 34px)); }
         .sidebar-toggle { position:absolute;z-index:8;top:50%;transform:translate(-50%,-50%);width:26px;height:54px;padding:0;border:1px solid rgba(175,195,224,.26);border-radius:0 9px 9px 0;color:#c9d9ef;background:rgba(20,29,45,.92);font:23px/1 system-ui,sans-serif;cursor:pointer;transition:left 250ms ease; }
         .search-row { display:flex;gap:8px; }

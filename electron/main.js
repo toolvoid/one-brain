@@ -1,6 +1,6 @@
 const { app, BrowserWindow, ipcMain, Menu, safeStorage } = require('electron');
 const path = require('path');
-const { initializeDatabase, getDatabaseStatus, getInsights, runAnalyticsSql, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, addMemory, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
+const { initializeDatabase, getDatabaseStatus, getInsights, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, addMemory, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
 const { startMcpServer } = require('./mcp-server');
 const { createEmbedder } = require('./embedder');
 const connectors = require('./connectors');
@@ -57,6 +57,15 @@ ipcMain.handle('clients:grant', (_event, client, source, status) => updateClient
 ipcMain.handle('clients:update', (_event, client, changes) => updateClientProfile(client, changes));
 ipcMain.handle('analytics:insights', () => getInsights());
 ipcMain.handle('analytics:run-sql', (_event, sql) => runAnalyticsSql(sql));
+ipcMain.handle('evaluation:cases', () => listEvaluationCases());
+ipcMain.handle('evaluation:add-case', (_event, query, expectedId) => addEvaluationCase(query, expectedId));
+ipcMain.handle('evaluation:update-case', (_event, id, expectedId) => updateEvaluationCase(id, expectedId));
+ipcMain.handle('evaluation:delete-case', (_event, id) => deleteEvaluationCase(id));
+ipcMain.handle('evaluation:recent-queries', (_event, limit) => listRecentEvaluationQueries(limit));
+ipcMain.handle('evaluation:history', () => getEvaluationHistory());
+ipcMain.handle('evaluation:update-note', (_event, id, note) => updateEvaluationNote(id, note));
+ipcMain.handle('evaluation:run', () => runRetrievalEvaluation());
+ipcMain.handle('evaluation:run-results', (_event, runId) => getEvaluationRunResults(runId));
 
 function createWindow() {
   const win = new BrowserWindow({

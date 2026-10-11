@@ -76,6 +76,121 @@ function runAnalyticsSql(sql) {
   });
 }
 
+function listEvaluationCases() {
+  return getDatabase().prepare(`SELECT c.id, c.query, c.expected_memory_id, c.created_at,
+    m.title AS expected_title, CASE WHEN m.id IS NULL THEN 1 ELSE 0 END AS stale
+    FROM eval_cases c LEFT JOIN memories m ON m.id = c.expected_memory_id ORDER BY c.id DESC`).all();
+}
+
+function addEvaluationCase(query, expectedMemoryId) {
+  ensureWritable();
+  const text = String(query || '').trim();
+  const id = Number(expectedMemoryId);
+  if (!text) throw new Error('Enter a search query.');
+  if (!Number.isInteger(id) || !getDatabase().prepare('SELECT 1 FROM memories WHERE id = ?').get(id)) throw new Error('Choose an existing expected memory.');
+  const result = getDatabase().prepare('INSERT INTO eval_cases(query, expected_memory_id) VALUES (?, ?)').run(text.slice(0, 200), id);
+  return Number(result.lastInsertRowid);
+}
+
+function updateEvaluationCase(id, expectedMemoryId) {
+  ensureWritable();
+  const caseId = Number(id), memoryId = Number(expectedMemoryId);
+  if (!Number.isInteger(memoryId) || !getDatabase().prepare('SELECT 1 FROM memories WHERE id = ?').get(memoryId)) throw new Error('Choose an existing expected memory.');
+  const changed = getDatabase().prepare('UPDATE eval_cases SET expected_memory_id = ? WHERE id = ?').run(memoryId, caseId).changes;
+  if (!changed) throw new Error('Evaluation case was not found.');
+}
+
+function deleteEvaluationCase(id) {
+  ensureWritable();
+  const caseId = Number(id); const db = getDatabase();
+  db.transaction(() => {
+    db.prepare('DELETE FROM eval_results WHERE case_id = ?').run(caseId);
+    db.prepare('DELETE FROM eval_cases WHERE id = ?').run(caseId);
+  })();
+}
+
+function listRecentEvaluationQueries(limit = 30) {
+  return getDatabase().prepare(`WITH ranked AS (
+    SELECT query, result_count, ts, id,
+      row_number() OVER (PARTITION BY lower(trim(query)) ORDER BY ts DESC, id DESC) AS ordinal
+    FROM events WHERE query IS NOT NULL AND trim(query) != '' AND tool IN ('search_memories', 'ui_search')
+  ) SELECT query, result_count, ts FROM ranked WHERE ordinal = 1
+    ORDER BY (result_count = 0) DESC, ts DESC LIMIT ?`).all(Math.max(1, Math.min(100, Number(limit) || 30)));
+}
+
+function getEvaluationHistory() {
+  const rows = getDatabase().prepare('SELECT id, ts, mode, k, cases, hit1, hit3, hit5, mrr, note FROM eval_runs ORDER BY id ASC').all().slice(-100);
+  const previous = new Map();
+  return rows.map((row) => {
+    const prior = previous.get(row.mode) || null;
+    previous.set(row.mode, row);
+    return { ...row, delta: prior ? { hit1: row.hit1 - prior.hit1, hit3: row.hit3 - prior.hit3, hit5: row.hit5 - prior.hit5, mrr: row.mrr - prior.mrr } : null };
+  }).reverse();
+}
+
+function updateEvaluationNote(id, note) {
+  ensureWritable();
+  const changed = getDatabase().prepare('UPDATE eval_runs SET note = ? WHERE id = ?').run(String(note || '').slice(0, 500), Number(id)).changes;
+  if (!changed) throw new Error('Evaluation run was not found.');
+}
+
+const evaluationYield = () => new Promise((resolve) => setImmediate(resolve));
+function evaluationMetrics(ranks) {
+  const count = ranks.length || 1;
+  return {
+    hit1: ranks.filter((rank) => rank === 1).length / count,
+    hit3: ranks.filter((rank) => rank !== null && rank <= 3).length / count,
+    hit5: ranks.filter((rank) => rank !== null && rank <= 5).length / count,
+    mrr: ranks.reduce((sum, rank) => sum + (rank ? 1 / rank : 0), 0) / count
+  };
+}
+
+async function runRetrievalEvaluation() {
+  ensureWritable();
+  const db = getDatabase();
+  const cases = db.prepare(`SELECT c.id, c.query, c.expected_memory_id, m.title AS expected_title
+    FROM eval_cases c JOIN memories m ON m.id = c.expected_memory_id ORDER BY c.id`).all();
+  const modes = [
+    ['hybrid', (query) => searchMemories(query, 'all', 10, 0)],
+    ['fts-only', (query) => searchFts(query, 'all', 10, 0)],
+    ['semantic-only', (query) => semanticSearch(query, 'all', 10)]
+  ];
+  const outputs = [];
+  for (const [mode, search] of modes) {
+    const records = [];
+    for (let index = 0; index < cases.length; index++) {
+      const item = cases[index];
+      const results = await search(item.query);
+      const rankIndex = results.findIndex((result) => Number(result.id) === Number(item.expected_memory_id));
+      records.push({ case_id: item.id, rank: rankIndex < 0 ? null : rankIndex + 1,
+        top_score: results[0]?.score ?? null,
+        expected_title: item.expected_title,
+        returned: results.slice(0, 3).map((result) => ({ id: Number(result.id), title: result.title || 'Untitled' })) });
+      if ((index + 1) % 2 === 0) await evaluationYield();
+    }
+    const metrics = evaluationMetrics(records.map((record) => record.rank));
+    const transaction = db.transaction(() => {
+      const inserted = db.prepare('INSERT INTO eval_runs(mode, k, cases, hit1, hit3, hit5, mrr, note) VALUES (?, 10, ?, ?, ?, ?, ?, ?)')
+        .run(mode, cases.length, metrics.hit1, metrics.hit3, metrics.hit5, metrics.mrr, '');
+      const runId = Number(inserted.lastInsertRowid);
+      const add = db.prepare('INSERT INTO eval_results(run_id, case_id, rank, top_score) VALUES (?, ?, ?, ?)');
+      for (const record of records) add.run(runId, record.case_id, record.rank, record.top_score);
+      return runId;
+    });
+    const runId = transaction();
+    outputs.push({ id: runId, mode, k: 10, cases: cases.length, ...metrics,
+      caseRanks: records.map(({ case_id, rank }) => ({ case_id, rank })),
+      failingCases: records.filter((record) => record.rank === null || record.rank > 3).map(({ case_id, rank, expected_title, returned }) => ({ case_id, rank, expected_title, returned })) });
+  }
+  return { runs: outputs, staleCount: db.prepare(`SELECT count(*) AS count FROM eval_cases c LEFT JOIN memories m ON m.id = c.expected_memory_id WHERE m.id IS NULL`).get().count };
+}
+
+function getEvaluationRunResults(runId) {
+  return getDatabase().prepare(`SELECT r.case_id, r.rank, r.top_score, c.query, c.expected_memory_id, expected.title AS expected_title
+    FROM eval_results r LEFT JOIN eval_cases c ON c.id = r.case_id
+    LEFT JOIN memories expected ON expected.id = c.expected_memory_id WHERE r.run_id = ? ORDER BY r.case_id`).all(Number(runId));
+}
+
 function ensureWritable() {
   if (!databaseWritable) throw new Error(databaseStatus.message || 'Database is read-only; memory writes are disabled.');
 }
@@ -410,6 +525,31 @@ function getDatabase() {
         latency_ms INTEGER,
         ok INTEGER,
         error TEXT
+      );
+      CREATE TABLE IF NOT EXISTS eval_cases (
+        id INTEGER PRIMARY KEY,
+        query TEXT NOT NULL,
+        expected_memory_id INTEGER,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS eval_runs (
+        id INTEGER PRIMARY KEY,
+        ts TEXT DEFAULT CURRENT_TIMESTAMP,
+        mode TEXT NOT NULL,
+        k INTEGER NOT NULL,
+        cases INTEGER NOT NULL,
+        hit1 REAL NOT NULL,
+        hit3 REAL NOT NULL,
+        hit5 REAL NOT NULL,
+        mrr REAL NOT NULL,
+        note TEXT
+      );
+      CREATE TABLE IF NOT EXISTS eval_results (
+        run_id INTEGER NOT NULL,
+        case_id INTEGER NOT NULL,
+        rank INTEGER,
+        top_score REAL,
+        PRIMARY KEY(run_id, case_id)
       );
       CREATE INDEX IF NOT EXISTS events_ts_idx ON events(ts);
       CREATE INDEX IF NOT EXISTS events_kind_idx ON events(kind, ts);
@@ -1267,4 +1407,4 @@ function countBySource() {
     }, {});
 }
 
-module.exports = { initializeDatabase, getDatabaseStatus, getInsights, runAnalyticsSql, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
+module.exports = { initializeDatabase, getDatabaseStatus, getInsights, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };

@@ -40,6 +40,15 @@ contextBridge.exposeInMainWorld('brain', {
   updateClientProfile: (client, changes) => ipcRenderer.invoke('clients:update', client, changes),
   getInsights: () => ipcRenderer.invoke('analytics:insights'),
   runAnalyticsSql: (sql) => ipcRenderer.invoke('analytics:run-sql', sql),
+  listEvaluationCases: () => ipcRenderer.invoke('evaluation:cases'),
+  addEvaluationCase: (query, expectedId) => ipcRenderer.invoke('evaluation:add-case', query, expectedId),
+  updateEvaluationCase: (id, expectedId) => ipcRenderer.invoke('evaluation:update-case', id, expectedId),
+  deleteEvaluationCase: (id) => ipcRenderer.invoke('evaluation:delete-case', id),
+  listRecentEvaluationQueries: (limit) => ipcRenderer.invoke('evaluation:recent-queries', limit),
+  getEvaluationHistory: () => ipcRenderer.invoke('evaluation:history'),
+  updateEvaluationNote: (id, note) => ipcRenderer.invoke('evaluation:update-note', id, note),
+  runRetrievalEvaluation: () => ipcRenderer.invoke('evaluation:run'),
+  getEvaluationRunResults: (runId) => ipcRenderer.invoke('evaluation:run-results', runId),
   onEmbeddingStatus: (callback) => {
     const listener = (_event, status) => callback(status);
     ipcRenderer.on('brain:embedding-status', listener);
