@@ -1,6 +1,6 @@
 const { app, BrowserWindow, ipcMain, Menu, safeStorage } = require('electron');
 const path = require('path');
-const { initializeDatabase, getDatabaseStatus, getInsights, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, searchMemoriesForClient, getMemoryForClient, recordProxyEvent, getPendingMemories, addPendingMemory, approvePendingMemory, rejectPendingMemory, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, addMemory, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
+const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, searchMemoriesForClient, getMemoryForClient, recordProxyEvent, getPendingMemories, addPendingMemory, approvePendingMemory, rejectPendingMemory, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, addMemory, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
 const { startMcpServer } = require('./mcp-server');
 const { createEmbedder } = require('./embedder');
 const connectors = require('./connectors');
@@ -43,7 +43,11 @@ ipcMain.handle('suggestions:list-rejected', () => listRejected());
 ipcMain.handle('suggestions:restore', (_event, id) => restoreRejected(id));
 ipcMain.handle('suggestions:dismiss-all', () => dismissSuggestions());
 ipcMain.handle('memories:list', () => listMemories());
-ipcMain.handle('memories:search', (_event, query, source, limit, offset) => searchMemories(query, source, limit, offset, { kind: 'search', tool: 'ui_search' }));
+ipcMain.handle('memories:search', async (_event, query, source, limit, offset, countRetrieval = false) => {
+  const results = await searchMemories(query, source, limit, offset, countRetrieval && String(query || '').trim() ? { kind: 'search', tool: 'ui_search' } : null);
+  recordMemoryViews(results.map((row) => row.id));
+  return results;
+});
 ipcMain.handle('memories:count-by-source', () => countBySource());
 ipcMain.handle('mcp:config', () => mcpConnection ? { endpoint: mcpConnection.config.endpoint } : null);
 ipcMain.handle('connectors:list', () => connectors.discoverClients(app.getPath('home'), app.getAppPath(), listClients(), listClientTokenStates()));
@@ -66,6 +70,7 @@ ipcMain.handle('clients:grant', (_event, client, source, status) => updateClient
 ipcMain.handle('clients:update', (_event, client, changes) => updateClientProfile(client, changes));
 ipcMain.handle('analytics:insights', () => getInsights());
 ipcMain.handle('analytics:run-sql', (_event, sql) => runAnalyticsSql(sql));
+ipcMain.handle('analytics:reset-retrieval-counts', () => resetRetrievalCounts());
 ipcMain.handle('evaluation:cases', () => listEvaluationCases());
 ipcMain.handle('evaluation:add-case', (_event, query, expectedId) => addEvaluationCase(query, expectedId));
 ipcMain.handle('evaluation:update-case', (_event, id, expectedId) => updateEvaluationCase(id, expectedId));

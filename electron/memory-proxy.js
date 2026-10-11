@@ -249,7 +249,7 @@ function createMemoryProxy(options) {
       }
     } catch { errorCode = 'upstream_unreachable'; if (!res.headersSent) sendJson(res, 502, { error: 'Provider request failed.' }); else res.destroy(); }
     finally {
-      recordProxyEvent({ client: identity.client, provider, memories_injected: memories.length, estimated_tokens_added: tokensAdded, latency_ms: Date.now() - started, upstream_status: status, ok, error: errorCode || null });
+      recordProxyEvent({ client: identity.client, provider, memories_injected: memories.length, estimated_tokens_added: tokensAdded, latency_ms: Date.now() - started, upstream_status: status, ok, error: errorCode || null }, dryRun ? [] : memories.map((memory) => memory.id));
     }
   }
 

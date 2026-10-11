@@ -161,11 +161,11 @@ function PendingMemoryInbox({ items, onRefresh }) {
   </section>;
 }
 
-function InsightsView({ data, onBack, sql, setSql, runSql, sqlResult, sqlRunning }) {
+function InsightsView({ data, onBack, sql, setSql, runSql, sqlResult, sqlRunning, onResetRetrievalCounts }) {
   const view = (key) => data?.[key] || { rows: [], sql: '' };
   const table = (rows, keys, empty = 'No data yet') => rows.length ? <div className="insight-table-wrap"><table className="insight-table"><thead><tr>{keys.map(([key, label]) => <th key={key}>{label}</th>)}</tr></thead><tbody>{rows.map((row, index) => <tr key={row.id ?? row.ts ?? `${index}`} >{keys.map(([key]) => <td key={key}>{row[key] == null ? '—' : String(row[key])}</td>)}</tr>)}</tbody></table></div> : <p className="empty-note">{empty}</p>;
   const memories = view('memoriesByDay'), links = view('linksAndSuggestions'), calls = view('mcpCallsByDay'), latency = view('searchLatency');
-  const retrievals = view('retrievals'), never = view('neverRetrieved'), embedding = view('embeddingStatus'), clients = view('connectedClients'), proxyCalls = view('proxyCalls');
+  const retrievals = view('retrievals'), viewed = view('mostViewed'), never = view('neverRetrieved'), embedding = view('embeddingStatus'), clients = view('connectedClients'), proxyCalls = view('proxyCalls');
   const linkRows = links.rows;
   return <section className="insights-view"><header className="insights-header"><button className="back-button" type="button" onClick={onBack}>‹</button><div><h1>Insights</h1><p>Local SQLite activity and retrieval analytics</p></div></header>
     <div className="insights-grid">
@@ -174,7 +174,8 @@ function InsightsView({ data, onBack, sql, setSql, runSql, sqlResult, sqlRunning
       <SqlPanel title="MCP calls per day per client" sql={calls.sql}><InsightBars rows={calls.rows.slice(0, 60)} valueKey="calls" labelKey="day" groupKey="client" /></SqlPanel>
       <SqlPanel title="Search latency by day" sql={latency.sql}>{table(latency.rows, [['day','Day'],['average_ms','Average ms'],['p95_ms','p95 ms'],['samples','Searches']])}</SqlPanel>
       <SqlPanel title="Searches with zero results" sql={view('zeroResultSearches').sql}>{table(view('zeroResultSearches').rows, [['ts','Time'],['client','Client'],['source','Source'],['query','Query']], 'No zero result searches')}</SqlPanel>
-      <SqlPanel title="Most retrieved memories" sql={retrievals.sql}>{table(retrievals.rows, [['id','ID'],['title','Title'],['source','Source'],['retrieved','Retrieved']])}<p className="insight-note">Never retrieved: <b>{never.rows[0]?.total ?? 0}</b></p></SqlPanel>
+      <SqlPanel title="Most retrieved memories" sql={retrievals.sql}>{table(retrievals.rows, [['id','ID'],['title','Title'],['source','Source'],['retrieved','Retrieved'],['views','UI views']])}<p className="insight-note">Never retrieved: <b>{never.rows[0]?.total ?? 0}</b></p><p className="insight-note">{data?.retrievalResetAt ? `Retrieval counts reset ${dateLabel(data.retrievalResetAt)}.` : `Counts before ${data?.retrievalWarningDate || 'the reset'} may include list loads.`}</p>{!data?.retrievalResetAt && <button type="button" onClick={onResetRetrievalCounts}>Reset retrieval counts</button>}</SqlPanel>
+      <SqlPanel title="Most viewed in the UI" sql={viewed.sql}>{table(viewed.rows, [['id','ID'],['title','Title'],['source','Source'],['views','Views']])}</SqlPanel>
       <SqlPanel title="Embedding index status" sql={embedding.sql}><div className="insight-stat"><strong>{embedding.rows[0]?.indexed ?? 0}</strong><span>indexed of {embedding.rows[0]?.total ?? 0} memories</span></div></SqlPanel>
       <SqlPanel title="Connected MCP clients" sql={clients.sql}>{table(clients.rows, [['client','Client'],['identity','Identity'],['first_seen','First seen'],['last_seen','Last seen'],['total_calls','Total calls'],['calls_last_7_days','Last 7 days']])}</SqlPanel>
       <SqlPanel title="Proxy" sql={proxyCalls.sql}>{table(proxyCalls.rows, [['client','Client'],['provider','Provider'],['calls','Calls'],['average_memories_injected','Average memories injected']])}</SqlPanel>
@@ -294,6 +295,7 @@ function App() {
   const [copied, setCopied] = useState('');
   const graphRef = useRef(null);
   const searchRequest = useRef(0);
+  const typedSearchPending = useRef(null);
   const pickerRequest = useRef(0);
   const searchState = useRef({ query: debouncedQuery, sourceFilter });
   searchState.current = { query: debouncedQuery, sourceFilter };
@@ -470,6 +472,12 @@ function App() {
     catch (error) { setInsightsData({}); setSqlResult({ error: error.message || 'Could not load insights.' }); }
   }
 
+  async function resetRetrievalCounts() {
+    if (!window.confirm('Reset retrieval counts? This clears the old aggregate totals and can only be done once.')) return;
+    await window.brain.resetRetrievalCounts();
+    setInsightsData(await window.brain.getInsights());
+  }
+
   async function runAnalyticsQuery() {
     setSqlRunning(true);
     setSqlResult(null);
@@ -563,7 +571,9 @@ function App() {
   useEffect(() => {
     if (!dataReady) return undefined;
     const requestId = ++searchRequest.current;
-    window.brain.searchMemories(debouncedQuery, sourceFilter, PAGE_SIZE, pageOffset).then((batch) => {
+    const countRetrieval = typedSearchPending.current === debouncedQuery && Boolean(debouncedQuery.trim());
+    if (countRetrieval) typedSearchPending.current = null;
+    window.brain.searchMemories(debouncedQuery, sourceFilter, PAGE_SIZE, pageOffset, countRetrieval && pageOffset === 0).then((batch) => {
       if (requestId !== searchRequest.current) return;
       setResults((current) => pageOffset === 0 ? batch : [...current, ...batch]);
       setHasMore(batch.length === PAGE_SIZE);
@@ -796,7 +806,7 @@ function App() {
   return (
     <main className="memory-app">
       <BrainGraph ref={graphRef} memories={memories} counts={counts} links={visibleGraphLinks} dataReady={dataReady} sidebarCollapsed={sidebarCollapsed} linksVisible={linksVisible} onLinksVisibleChange={setLinksVisible} />
-      {insightsOpen && <InsightsView data={insightsData} onBack={() => setInsightsOpen(false)} sql={sql} setSql={setSql} runSql={runAnalyticsQuery} sqlResult={sqlResult} sqlRunning={sqlRunning} />}
+      {insightsOpen && <InsightsView data={insightsData} onBack={() => setInsightsOpen(false)} sql={sql} setSql={setSql} runSql={runAnalyticsQuery} sqlResult={sqlResult} sqlRunning={sqlRunning} onResetRetrievalCounts={resetRetrievalCounts} />}
       <aside className={`memory-panel${sidebarCollapsed ? ' is-collapsed' : ''}`} style={insightsOpen ? { display: 'none' } : undefined}>
         <header className="sidebar-header"><strong>One Brain</strong><button type="button" onClick={() => { setPendingOpen(true); setConnectOpen(false); void refreshPendingMemories(); }}>Pending ({pendingMemories.length})</button><button type="button" onClick={openInsights}>Insights</button></header>
         {pendingOpen ? <><header className="detail-header"><button className="back-button" type="button" onClick={() => setPendingOpen(false)}>‹</button><span>Pending memories</span></header><PendingMemoryInbox items={pendingMemories} onRefresh={refreshPendingMemories} /></> : connectOpen ? (
@@ -922,7 +932,7 @@ function App() {
         ) : (
           <>
             <div className="search-row">
-              <input value={query} onChange={(event) => { setQuery(event.target.value); setPageOffset(0); }} placeholder="Search memories..." aria-label="Search memories" />
+              <input value={query} onChange={(event) => { typedSearchPending.current = event.target.value; setQuery(event.target.value); setPageOffset(0); }} placeholder="Search memories..." aria-label="Search memories" />
               {suggestions.length > 0 && <button className="suggestions-button" type="button" onClick={() => setSuggestionsOpen(true)}>Suggestions ({suggestions.length})</button>}
               <button className="settings-button" type="button" aria-label="Connect AI settings" title="Connect AI" onClick={openConnectSettings}>⚙</button>
               <button className="add-button" type="button" aria-label="Add memory or import" title={databaseStatus.writable ? 'Add or import memories' : 'Memory writes are disabled'} disabled={!databaseStatus.writable} onClick={() => { setAddMode('add'); setAddOpen(true); }}>+</button>
@@ -934,7 +944,7 @@ function App() {
               {embeddingStatus.fallback && embeddingStatus.state !== 'indexing' && <span className="embedding-error">Using fallback model: Xenova/all-MiniLM-L6-v2</span>}
             </div>
             <nav className="source-filters" aria-label="Filter by source">
-              {['all', ...SOURCES].map((source) => <button type="button" key={source} className={`filter-chip${sourceFilter === source ? ' is-selected' : ''}`} onClick={() => { setSourceFilter(source); setPageOffset(0); }}>
+              {['all', ...SOURCES].map((source) => <button type="button" key={source} className={`filter-chip${sourceFilter === source ? ' is-selected' : ''}`} onClick={() => { typedSearchPending.current = null; setSourceFilter(source); setPageOffset(0); }}>
                 {source !== 'all' && <i style={{ background: SOURCE_COLORS[source] }} />}{source === 'all' ? 'All' : source}
               </button>)}
             </nav>
@@ -953,7 +963,7 @@ function App() {
                 </button>;
               })}
               {results.length === 0 && dataReady && <p className="empty-note">No memories found</p>}
-              {hasMore && <button className="load-more" type="button" onClick={() => setPageOffset((offset) => offset + PAGE_SIZE)}>Load more</button>}
+              {hasMore && <button className="load-more" type="button" onClick={() => { typedSearchPending.current = null; setPageOffset((offset) => offset + PAGE_SIZE); }}>Load more</button>}
             </section>
           </>
         )}

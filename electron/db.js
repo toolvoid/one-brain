@@ -49,8 +49,23 @@ function openAnalyticsDatabase() {
 function getInsights() {
   const db = openAnalyticsDatabase();
   try {
-    return Object.fromEntries(Object.entries(INSIGHT_QUERIES).map(([name, sql]) => [name, { sql, rows: db.prepare(sql).all() }]));
+    const result = Object.fromEntries(Object.entries(INSIGHT_QUERIES).map(([name, sql]) => [name, { sql, rows: db.prepare(sql).all() }]));
+    result.retrievalResetAt = db.prepare("SELECT value FROM brain_meta WHERE key = 'retrieval_counts_reset_at'").get()?.value || null;
+    result.retrievalWarningDate = db.prepare("SELECT value FROM brain_meta WHERE key = 'retrieval_counts_warning_since'").get()?.value || null;
+    return result;
   } finally { db.close(); }
+}
+
+function resetRetrievalCounts() {
+  ensureWritable();
+  const db = getDatabase();
+  const reset = db.transaction(() => {
+    if (db.prepare("SELECT 1 FROM brain_meta WHERE key = 'retrieval_counts_reset_at'").get()) return false;
+    db.prepare('DELETE FROM memory_retrieval_stats').run();
+    db.prepare("INSERT INTO brain_meta(key, value) VALUES ('retrieval_counts_reset_at', datetime('now'))").run();
+    return true;
+  });
+  return reset();
 }
 
 function runAnalyticsSql(sql) {
@@ -156,15 +171,32 @@ function getProxyClientProfile(client) {
   return profile;
 }
 
-function recordProxyEvent(event = {}) {
+function recordProxyEvent(event = {}, memoryIds = []) {
   try {
-    getDatabase().prepare(`INSERT INTO events (kind, tool, client, provider, query, result_count, memories_injected, estimated_tokens_added, latency_ms, upstream_status, ok, error, verified)
+    const db = getDatabase();
+    const result = db.prepare(`INSERT INTO events (kind, tool, client, provider, query, result_count, memories_injected, estimated_tokens_added, latency_ms, upstream_status, ok, error, verified)
       VALUES ('proxy_call', 'memory_proxy', ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 1)`)
       .run(String(event.client || '').slice(0, 120), String(event.provider || '').slice(0, 32),
         Math.max(0, Number(event.memories_injected) || 0), Math.max(0, Number(event.memories_injected) || 0),
         Math.max(0, Number(event.estimated_tokens_added) || 0), Math.max(0, Math.round(event.latency_ms || 0)),
         Number.isInteger(event.upstream_status) ? event.upstream_status : null, event.ok ? 1 : 0,
         event.error ? String(event.error).slice(0, 80) : null);
+    const eventId = Number(result.lastInsertRowid);
+    const insert = db.prepare('INSERT OR IGNORE INTO event_memory_retrievals (event_id, memory_id) SELECT ?, id FROM memories WHERE id = ?');
+    for (const memoryId of [...new Set(memoryIds.map(Number).filter(Number.isInteger))]) {
+      if (insert.run(eventId, memoryId).changes) db.prepare(`INSERT INTO memory_retrieval_stats (memory_id, retrieval_count) VALUES (?, 1)
+        ON CONFLICT(memory_id) DO UPDATE SET retrieval_count = retrieval_count + 1`).run(memoryId);
+    }
+  } catch {}
+}
+
+function recordMemoryViews(memoryIds = []) {
+  try {
+    const db = getDatabase();
+    const insert = db.prepare(`INSERT INTO memory_view_stats(memory_id, view_count) SELECT id, 1 FROM memories WHERE id = ?
+      ON CONFLICT(memory_id) DO UPDATE SET view_count = view_count + 1`);
+    const add = db.transaction((ids) => { for (const id of [...new Set(ids.map(Number).filter(Number.isInteger))]) insert.run(id); });
+    add(memoryIds);
   } catch {}
 }
 
@@ -671,6 +703,10 @@ function getDatabase() {
         memory_id INTEGER PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
         retrieval_count INTEGER NOT NULL DEFAULT 0
       );
+      CREATE TABLE IF NOT EXISTS memory_view_stats (
+        memory_id INTEGER PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+        view_count INTEGER NOT NULL DEFAULT 0
+      );
       CREATE TABLE IF NOT EXISTS mcp_client_stats (
         client TEXT PRIMARY KEY,
         first_seen TEXT NOT NULL,
@@ -799,6 +835,7 @@ function getDatabase() {
       });
       backfill();
     }
+    database.prepare("INSERT OR IGNORE INTO brain_meta(key, value) VALUES ('retrieval_counts_warning_since', date('now'))").run();
     loadCaches(database);
     databaseSchemaReady = true;
   }
@@ -1536,4 +1573,4 @@ function countBySource() {
     }, {});
 }
 
-module.exports = { initializeDatabase, getDatabaseStatus, getInsights, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, recordProxyEvent, getPendingMemories, addPendingMemory, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
+module.exports = { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, recordProxyEvent, getPendingMemories, addPendingMemory, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };

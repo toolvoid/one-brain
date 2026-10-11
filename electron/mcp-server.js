@@ -69,7 +69,7 @@ function createMcpServer(identity) {
     if (!memory) return { result: { isError: true, content: [{ type: 'text', text: 'Memory was not found.' }] }, count: 0, denied, reason: 'memory_unavailable' };
     notifyRenderer('brain:retrieved', [memory.id, ...memory.linked_memory_ids]);
     const { private: _private, ...safeMemory } = memory;
-    return { result: { content: [{ type: 'text', text: JSON.stringify(safeMemory) }] }, count: 1, ids: [memory.id, ...memory.linked_memory_ids], source: memory.source };
+    return { result: { content: [{ type: 'text', text: JSON.stringify(safeMemory) }] }, count: 1, ids: [memory.id], source: memory.source };
   });
 
   registerTrackedTool('add_memory', {
