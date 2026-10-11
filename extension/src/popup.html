@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>One Brain</title><link rel="stylesheet" href="popup.css"></head>
+<body>
+  <header><span class="brand-mark">OB</span><div><strong>One Brain</strong><small>Browser extension</small></div></header>
+  <section class="pairing"><h1>Pair this browser</h1><p>In One Brain Settings, choose Browser extension → Pair, then enter the six digit code and the API address shown there.</p><label>Local API address<input id="endpoint" value="http://127.0.0.1:3738" spellcheck="false"></label><label>Site<select id="site"><option value="">Choose a site</option><option value="chatgpt">ChatGPT</option><option value="claude">Claude</option><option value="gemini">Gemini</option></select></label><label>Pairing code<input id="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="6 digit code"></label><button id="pair" disabled>Pair selected site</button><p id="pair-error" role="alert"></p></section>
+  <section><div class="connection-head"><h2>Connections</h2><button id="refresh" type="button">Refresh</button></div><div id="connections"><p class="muted">Checking One Brain…</p></div></section>
+  <section><h2>Adapter self-check</h2><p class="muted">Reports matched selectors only. It never reads page text.</p><div id="self-check" class="muted">Open one of the supported chat sites to report selector matches.</div></section>
+  <script src="popup.js"></script>
+</body>
+</html>

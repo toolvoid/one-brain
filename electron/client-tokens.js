@@ -6,17 +6,17 @@ const { createHash, randomBytes } = require('node:crypto');
 
 function checkedClient(client) {
   const name = String(client || '');
-  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) throw new Error('Invalid client name.');
+  if (!/^[a-z0-9][a-z0-9:-]{0,63}$/.test(name)) throw new Error('Invalid client name.');
   return name;
 }
 
 function tokenPath(userDataPath, client) {
-  return path.join(userDataPath, 'tokens', `${checkedClient(client)}.token`);
+  return path.join(userDataPath, 'tokens', `${checkedClient(client).replaceAll(':', '~3a')}.token`);
 }
 
 function hashToken(token) { return createHash('sha256').update(String(token), 'utf8').digest('hex'); }
 
-function createClientToken(userDataPath, client, storeHash) {
+function createClientToken(userDataPath, client, storeHash, { exposeToken = false } = {}) {
   const name = checkedClient(client);
   const folder = path.join(userDataPath, 'tokens');
   fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
@@ -37,7 +37,7 @@ function createClientToken(userDataPath, client, storeHash) {
     } catch {}
     throw error;
   }
-  return { client: name, created: true };
+  return { client: name, created: true, ...(exposeToken ? { token } : {}) };
 }
 
 function revokeClientTokenFile(userDataPath, client, revoke) {

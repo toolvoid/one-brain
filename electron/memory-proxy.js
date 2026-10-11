@@ -113,7 +113,7 @@ function candidateSafe(item) {
 function createMemoryProxy(options) {
   const { userDataPath, safeStorage, authenticateClientToken, getClientProfile, searchMemoriesForClient,
     getMemoryForClient, recordProxyEvent, addPendingMemory, fetchImpl = globalThis.fetch,
-    providerUrls = PROVIDER_URLS, searchTimeoutMs = 800, titleTimeoutMs = 3000, listenPort = null } = options;
+    providerUrls = PROVIDER_URLS, searchTimeoutMs = 800, titleTimeoutMs = 3000, listenPort = null, extensionApi = null } = options;
   const settingsPath = path.join(userDataPath, 'memory-proxy-settings.json');
   const keysPath = path.join(userDataPath, 'provider-keys.enc');
   const readSettings = () => ({ ...DEFAULT_SETTINGS, ...safeReadJson(settingsPath, {}) });
@@ -247,6 +247,10 @@ function createMemoryProxy(options) {
   }
 
   async function handle(req, res) {
+    if (extensionApi && new URL(req.url, 'http://127.0.0.1').pathname.startsWith('/ext/')) {
+      await extensionApi.handle(req, res);
+      return;
+    }
     const started = Date.now();
     const route = new URL(req.url, 'http://127.0.0.1').pathname.match(/^\/v1\/([a-z]+)\/chat\/completions$/);
     const provider = route?.[1];

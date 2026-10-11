@@ -160,7 +160,27 @@ function ProviderKeysPanel({ clients }) {
   const [settings, setSettings] = useState(null);
   const [keys, setKeys] = useState({});
   const [notice, setNotice] = useState('');
+  const [extensions, setExtensions] = useState([]);
+  const [pairCode, setPairCode] = useState(null);
+  const [extensionError, setExtensionError] = useState('');
   useEffect(() => { window.brain.getMemoryProxySettings().then(setSettings).catch(() => setNotice('Proxy settings are unavailable.')); }, []);
+  useEffect(() => { window.brain.getExtensionStatus().then(setExtensions).catch((error) => setExtensionError(error.message || 'Extension status is unavailable.')); }, [clients]);
+  async function makePairCode() {
+    try { setPairCode(await window.brain.createExtensionPairCode()); setExtensionError(''); }
+    catch (error) { setExtensionError(error.message || 'Could not create a pairing code.'); }
+  }
+  async function refreshExtensions() {
+    try { setExtensions(await window.brain.getExtensionStatus()); }
+    catch (error) { setExtensionError(error.message || 'Could not refresh extension status.'); }
+  }
+  async function revokeExtension(site) {
+    try { await window.brain.revokeExtension(site); setPairCode(null); await refreshExtensions(); }
+    catch (error) { setExtensionError(error.message || 'Could not revoke this extension.'); }
+  }
+  async function rotateExtension(site) {
+    try { setPairCode(await window.brain.rotateExtension(site)); await refreshExtensions(); }
+    catch (error) { setExtensionError(error.message || 'Could not rotate this extension.'); }
+  }
   async function update(patch) { const next = await window.brain.updateMemoryProxySettings(patch); setSettings(next); }
   async function save(provider) {
     try {
@@ -175,6 +195,7 @@ function ProviderKeysPanel({ clients }) {
     <header><h2>Provider keys</h2><small>Keys are encrypted locally and never read back into the UI.</small></header>
     <p className="connect-hint">Use <code>{settings.endpoint || 'http://127.0.0.1:3738'}/v1/&lt;provider&gt;</code> as base_url and this client’s One Brain token as api_key.</p>
     {PROXY_PROVIDERS.map((provider) => <article className="proxy-key-row" key={provider}><label>{provider}<input type="password" autoComplete="new-password" value={keys[provider] || ''} onChange={(event) => setKeys((current) => ({ ...current, [provider]: event.target.value }))} placeholder={settings.providerKeyStatus?.[provider] ? 'Key saved' : 'Paste provider key'} /></label><button type="button" onClick={() => void save(provider)} disabled={!keys[provider]}>Save</button>{settings.providerKeyStatus?.[provider] && <button type="button" onClick={async () => { await window.brain.deleteProviderKey(provider); setSettings(await window.brain.getMemoryProxySettings()); }}>Remove</button>}</article>)}
+    <section className="extension-pair-card"><header><h3>Browser extension</h3><button type="button" onClick={() => void makePairCode()}>Pair</button></header><p className="connect-hint">Enter the code and local API address in the One Brain extension popup. New sites appear here for approval and source grants.</p>{pairCode && <p className="extension-pair-code" role="status">Pairing code <strong>{pairCode.code}</strong> · expires in 2 minutes<br />API address <code>{pairCode.endpoint}</code></p>}{extensions.map((item) => <article className="extension-site-row" key={item.site}><span><strong>{item.site}</strong><small>{item.active ? (item.status === 'approved' ? 'Connected' : 'Waiting for approval') : 'Not paired'}{item.origin ? ` · ${item.origin}` : ''}</small></span>{item.paired && <><button type="button" onClick={() => void rotateExtension(item.site)}>Rotate</button><button type="button" onClick={() => void revokeExtension(item.site)}>Revoke</button></>}</article>)}{extensionError && <p role="alert" className="empty-note">{extensionError}</p>}</section>
     <h3>Memory injection</h3>
     <label className="proxy-setting"><input type="checkbox" checked={settings.enabled} onChange={(event) => void update({ enabled: event.target.checked })} />Enabled</label>
     <label className="proxy-setting"><input type="checkbox" checked={settings.dryRun} onChange={(event) => void update({ dryRun: event.target.checked })} />Dry run (measure retrieval, send unchanged request)</label>
@@ -1628,6 +1649,7 @@ function App() {
         .proxy-key-row input,.proxy-setting input:not([type=checkbox]) { box-sizing:border-box;min-width:0;padding:6px;border:1px solid rgba(175,195,224,.18);border-radius:5px;color:#dce8f7;background:#0c1421;font:10px system-ui,sans-serif; }
         .proxy-key-row button,.pending-memory-inbox button { border:1px solid rgba(143,196,255,.22);border-radius:5px;padding:5px 7px;color:#c7e1ff;background:#182a40;font:9px system-ui,sans-serif;cursor:pointer; }
         .proxy-settings h3 { margin:8px 0 0;color:#d5e1f0;font-size:11px; }
+        .extension-pair-card { display:grid;gap:7px;margin-top:10px;padding:10px;border:1px solid rgba(143,196,255,.15);border-radius:8px;background:rgba(12,20,33,.52); }.extension-pair-card > header,.extension-site-row { display:flex;align-items:center;gap:7px; }.extension-pair-card > header { justify-content:space-between; }.extension-pair-card h3 { margin:0; }.extension-site-row { padding:5px 0;border-top:1px solid rgba(175,195,224,.1); }.extension-site-row span { display:grid;gap:3px;flex:1;text-transform:capitalize; }.extension-site-row small { color:#8494aa;font-size:9px;overflow-wrap:anywhere;text-transform:none; }.extension-site-row button,.extension-pair-card > header button { border:1px solid rgba(143,196,255,.22);border-radius:5px;padding:5px 7px;color:#c7e1ff;background:#182a40;font:9px system-ui,sans-serif;cursor:pointer; }.extension-pair-code { margin:0;padding:8px;border-radius:6px;background:#111c2b;font-size:11px; }.extension-pair-code strong { letter-spacing:.2em;font:700 20px ui-monospace,monospace; }
         .proxy-setting { display:flex;align-items:center;gap:6px;color:#bac9dc;font-size:10px; }
         .proxy-setting input[type=number] { width:58px;margin-left:auto; }
         .proxy-setting input[type=text] { width:145px;margin-left:auto; }

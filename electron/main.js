@@ -1,15 +1,17 @@
 const { app, BrowserWindow, ipcMain, Menu, safeStorage } = require('electron');
 const path = require('path');
 const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
-const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, listRecentImports, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemorySource, addMemory, createImport, importMemories, finishImport, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
+const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, getMcpClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, listRecentImports, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemorySource, addMemory, createImport, importMemories, finishImport, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
 const { startMcpServer } = require('./mcp-server');
 const { createEmbedder } = require('./embedder');
 const connectors = require('./connectors');
 const { createClientToken, revokeClientTokenFile } = require('./client-tokens');
 const { createMemoryProxy } = require('./memory-proxy');
+const { createExtApi } = require('./ext-api');
 
 let mcpConnection;
 let memoryProxy;
+let extensionApi;
 let embedder;
 let embedderGeneration = 0;
 let embeddingStatus = { state: 'loading' };
@@ -115,6 +117,10 @@ ipcMain.handle('evaluation:update-note', (_event, id, note) => updateEvaluationN
 ipcMain.handle('evaluation:run', () => runRetrievalEvaluation());
 ipcMain.handle('evaluation:run-results', (_event, runId) => getEvaluationRunResults(runId));
 ipcMain.handle('memory-proxy:settings', () => memoryProxy.publicSettings());
+ipcMain.handle('extension:status', () => extensionApi.status());
+ipcMain.handle('extension:pair-code', () => ({ ...extensionApi.createPairCode(), endpoint: memoryProxy.publicSettings().endpoint }));
+ipcMain.handle('extension:revoke', (_event, site) => extensionApi.revokeSite(site));
+ipcMain.handle('extension:rotate', (_event, site) => extensionApi.rotateSite(site));
 ipcMain.handle('memory-proxy:update-settings', (_event, values) => memoryProxy.updateSettings(values));
 ipcMain.handle('memory-proxy:save-key', (_event, provider, key) => memoryProxy.saveKey(provider, key));
 ipcMain.handle('memory-proxy:delete-key', (_event, provider) => memoryProxy.deleteKey(provider));
@@ -206,7 +212,22 @@ app.whenReady().then(async () => {
 
   startEmbedder();
 
-  memoryProxy = createMemoryProxy({ userDataPath: app.getPath('userData'), safeStorage, authenticateClientToken,
+  const userDataPath = app.getPath('userData');
+  extensionApi = createExtApi({ userDataPath, authenticateClientToken, getClientProfile: getProxyClientProfile,
+    getMcpClientProfile: (client, identity) => {
+      const profile = getMcpClientProfile(client, identity);
+      if (profile.created) for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:client-pending', { client: profile.client, verified: true, reported_name: identity.reported_name });
+      return profile;
+    },
+    createToken: async (client) => createClientToken(userDataPath, client, storeClientTokenHash, { exposeToken: true }).token,
+    revokeToken: (client) => revokeClientTokenFile(userDataPath, client, revokeClientToken),
+    isTokenActive: (client) => listClientTokenStates().some((item) => item.client === client && !item.revoked),
+    searchMemoriesForClient, addMemory, recordProxyEvent,
+    emitRetrieved: (ids) => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:retrieved', ids); },
+    emitAdded: (id) => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:changed', { type: 'add', id }); }
+  });
+
+  memoryProxy = createMemoryProxy({ userDataPath, safeStorage, authenticateClientToken, extensionApi,
     getClientProfile: getProxyClientProfile, searchMemoriesForClient, getMemoryForClient, recordProxyEvent,
     addPendingMemory: async (item) => {
       const result = await addPendingMemory(item);

@@ -129,7 +129,7 @@ function deleteEvaluationCase(id) {
 function storeClientTokenHash(clientName, tokenHash) {
   ensureWritable();
   const client = String(clientName || '').trim();
-  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(client) || !/^[a-f\d]{64}$/i.test(String(tokenHash || ''))) throw new Error('Invalid client token record.');
+  if (!/^[a-z0-9][a-z0-9:-]{0,63}$/.test(client) || !/^[a-f\d]{64}$/i.test(String(tokenHash || ''))) throw new Error('Invalid client token record.');
   getDatabase().prepare(`INSERT INTO client_tokens(client, token_hash, created_at, last_used, revoked)
     VALUES (?, ?, CURRENT_TIMESTAMP, NULL, 0)
     ON CONFLICT(client) DO UPDATE SET token_hash = excluded.token_hash, created_at = CURRENT_TIMESTAMP, last_used = NULL, revoked = 0`)
@@ -139,7 +139,7 @@ function storeClientTokenHash(clientName, tokenHash) {
 function revokeClientToken(clientName) {
   ensureWritable();
   const client = String(clientName || '').trim();
-  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(client)) throw new Error('Invalid client name.');
+  if (!/^[a-z0-9][a-z0-9:-]{0,63}$/.test(client)) throw new Error('Invalid client name.');
   getDatabase().prepare('UPDATE client_tokens SET revoked = 1 WHERE client = ?').run(client);
 }
 
