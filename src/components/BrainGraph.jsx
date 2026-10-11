@@ -7,6 +7,7 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { fitCameraToPoints, lineDrawPoints, linkLineDrawState, straightLinkPoints } from '../lib/graph-math.mjs';
 import { linksJustEnabled } from '../lib/graph-links.mjs';
+import { clearSavedView, saveViewBeforeFocus } from '../lib/graph-focus.mjs';
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 const COLORS = {
@@ -95,10 +96,11 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
   const previousLinkVisibilityRef = useRef(linkVisibility);
   const onMemoryClickRef = useRef(onMemoryClick);
   onMemoryClickRef.current = onMemoryClick;
-  const apiRef = useRef({ retrieve: () => false, focus: () => false });
+  const apiRef = useRef({ retrieve: () => false, focus: () => false, restore: () => false });
   useImperativeHandle(ref, () => ({
     retrieve: (id) => apiRef.current.retrieve(id),
-    focus: (id) => apiRef.current.focus(id)
+    focus: (id) => apiRef.current.focus(id),
+    restore: () => apiRef.current.restore()
   }), []);
 
   useEffect(() => {
@@ -120,7 +122,9 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     labels.domElement.className = 'brain-label-layer';
     host.appendChild(labels.domElement);
     const controls = new OrbitControls(camera, labels.domElement);
-    controls.rotateSpeed = -1;
+    controls.rotateSpeed = 1;
+    controls.minPolarAngle = 0.01;
+    controls.maxPolarAngle = Math.PI - 0.01;
     controls.enableDamping = true;
     controls.dampingFactor = 0.06;
     controls.minDistance = 20;
@@ -186,6 +190,8 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     let edgeDraws = new Map();
     let hubFlash = { color: new THREE.Color('#ffffff'), strength: 0, until: 0 };
     let focusMove = null;
+    let savedView = null;
+    let restoringView = false;
     let manualOrbitPaused = false;
     let hoveredMemoryId = null;
     let hoveredMemorySource = null;
@@ -193,7 +199,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     let orbitPointerStart = null;
 
     function fitView(smooth = true, explicit = false) {
-      if (explicit) manualOrbitPaused = false;
+      if (explicit) { manualOrbitPaused = false; savedView = clearSavedView(); restoringView = false; }
       const positions = [HUB.toArray(), ...SOURCES.map((key) => ANCHORS[key]), ...currentMemories.map((memory) => hashPosition(memory.id, memory.source).toArray())];
       const fit = fitCameraToPoints(positions, camera.fov, camera.aspect);
       const direction = new THREE.Vector3(32, 24, 42).normalize();
@@ -219,7 +225,10 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     fitButton.setAttribute('aria-label', 'Fit all AI anchors and hub in view');
     fitButton.addEventListener('click', () => fitView(true, true));
     host.__brainGraphFit = () => { if (!manualOrbitPaused) fitView(true); };
-    controls.addEventListener('start', () => { focusMove = null; });
+    controls.addEventListener('start', () => {
+      focusMove = null;
+      if (restoringView) { savedView = clearSavedView(); restoringView = false; }
+    });
     host.appendChild(fitButton);
 
     const linksControl = document.createElement('div');
@@ -447,6 +456,8 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
       const offset = camera.position.clone().sub(controls.target);
       if (offset.lengthSq() < 0.001) offset.set(1, 0.7, 1);
       offset.setLength(Math.min(offset.length(), 24));
+      savedView = saveViewBeforeFocus(savedView, camera.position, controls.target);
+      restoringView = false;
       focusMove = {
         cameraFrom: camera.position.clone(), targetFrom: controls.target.clone(),
         cameraTo: target.clone().add(offset), targetTo: target,
@@ -455,7 +466,18 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
       retrieve(memoryId);
       return true;
     }
-    apiRef.current = { retrieve, focus };
+    function restore() {
+      if (!savedView) return false;
+      focusMove = {
+        cameraFrom: camera.position.clone(), targetFrom: controls.target.clone(),
+        cameraTo: new THREE.Vector3(savedView.position.x, savedView.position.y, savedView.position.z),
+        targetTo: new THREE.Vector3(savedView.target.x, savedView.target.y, savedView.target.z),
+        startedAt: performance.now(), duration: 700
+      };
+      restoringView = true;
+      return true;
+    }
+    apiRef.current = { retrieve, focus, restore };
     // Start with valid GPU attributes before the first animation frame; the first data snapshot
     // establishes the baseline and should not animate every memory already in the database.
     rebuild([], [], {}, false);
@@ -468,19 +490,25 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     raycaster.params.Points.threshold = 0.55;
     raycaster.params.Line.threshold = 0.55;
     const pointer = new THREE.Vector2();
+    let graphPointerStart = null;
+    const onGraphPointerDown = (event) => { graphPointerStart = [event.clientX, event.clientY]; };
+    renderer.domElement.addEventListener('pointerdown', onGraphPointerDown);
+    labels.domElement.addEventListener('pointerdown', onGraphPointerDown);
     function onPointerClick(event) {
       if (event.button !== 0) return;
+      const dragged = graphPointerStart && Math.hypot(event.clientX - graphPointerStart[0], event.clientY - graphPointerStart[1]) > 4;
+      graphPointerStart = null;
       const rect = renderer.domElement.getBoundingClientRect();
       pointer.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
       raycaster.setFromCamera(pointer, camera);
       const pointHit = raycaster.intersectObject(points, false).find((item) => nodeMeta[item.index]?.kind === 'memory');
       if (pointHit) { onMemoryClickRef.current?.(nodeMeta[pointHit.index].id); return; }
-      if (!currentLinks.length) return;
+      if (!currentLinks.length) { if (!dragged) restore(); return; }
       const edgeHit = raycaster.intersectObject(lines, false).find((item) => {
         const edge = edgeMeta[segmentToEdge[Math.floor((item.index || 0) / 2)]];
         return edge?.memoryLink && edge.linkMemoryIds?.length === 2;
       });
-      if (!edgeHit) return;
+      if (!edgeHit) { if (!dragged) restore(); return; }
       const edge = edgeMeta[segmentToEdge[Math.floor((edgeHit.index || 0) / 2)]];
       if (!currentLinks.some((link) => String(link.id ?? `${link.a_id}-${link.b_id}`) === edge.key.slice(5))) return;
       events.push({ kind: 'link', aId: edge.linkMemoryIds[0], bId: edge.linkMemoryIds[1], linkId: edge.key.slice(5), linkKind: edge.linkKind, startedAt: performance.now() });
@@ -684,7 +712,10 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
         const eased = progress * progress * (3 - 2 * progress);
         camera.position.lerpVectors(focusMove.cameraFrom, focusMove.cameraTo, eased);
         controls.target.lerpVectors(focusMove.targetFrom, focusMove.targetTo, eased);
-        if (progress >= 1) focusMove = null;
+        if (progress >= 1) {
+          focusMove = null;
+          if (restoringView) { savedView = clearSavedView(); restoringView = false; }
+        }
       }
       controls.update(); composer.render(); labels.render(scene, camera);
     }
@@ -720,6 +751,8 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     return () => {
       cancelAnimationFrame(raf); observer.disconnect(); controls.dispose();
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
+      renderer.domElement.removeEventListener('pointerdown', onGraphPointerDown);
+      labels.domElement.removeEventListener('pointerdown', onGraphPointerDown);
       renderer.domElement.removeEventListener('pointerleave', onPointerLeave);
       renderer.domElement.removeEventListener('click', onPointerClick);
       labels.domElement.removeEventListener('click', onPointerClick);

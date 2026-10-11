@@ -14,6 +14,17 @@ test('graph fit math encloses the hub, anchors and memory positions with a fitte
   assert.ok(fit.distance <= 110);
 });
 
+test('graph focus preserves the original camera view until it is explicitly cleared', async () => {
+  const { saveViewBeforeFocus, clearSavedView } = await import('../src/lib/graph-focus.mjs');
+  const position = { x: 10, y: 20, z: 30 }, target = { x: 1, y: 2, z: 3 };
+  const saved = saveViewBeforeFocus(null, position, target);
+  assert.deepEqual(saved, { position, target });
+  const second = saveViewBeforeFocus(saved, { x: -4, y: 8, z: 2 }, { x: 9, y: 9, z: 9 });
+  assert.equal(second, saved);
+  assert.equal(clearSavedView(), null);
+  assert.deepEqual(saved.position, { x: 10, y: 20, z: 30 });
+});
+
 test('memory links are a single straight segment between their endpoint nodes', async () => {
   const { straightLinkPoints } = await import('../src/lib/graph-math.mjs');
   const start = [-3, 0, 0], end = [3, 4, 6];
