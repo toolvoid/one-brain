@@ -6,6 +6,7 @@ const os = require('os');
 const { createHash, randomBytes } = require('crypto');
 const { Worker } = require('node:worker_threads');
 const { INSIGHT_QUERIES } = require('./analytics-queries');
+const MEMORY_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 
 let database;
 let databaseKey = null;
@@ -332,7 +333,7 @@ function cosineSimilarity(a, b) {
 
 function loadCaches(db) {
   if (cachesLoaded) return;
-  memoryCache = new Map(db.prepare('SELECT id, source, title, content FROM memories').all().map((row) => [row.id, row]));
+  memoryCache = new Map(db.prepare('SELECT id, source, title, content, private FROM memories').all().map((row) => [row.id, row]));
   vectorCache = new Map();
   for (const row of db.prepare('SELECT memory_id, model, dim, vector FROM embeddings').all()) {
     const vector = vectorFromBlob(row.vector, row.dim);
@@ -431,6 +432,19 @@ function getDatabase() {
         status TEXT PRIMARY KEY CHECK(status IN ('accepted', 'rejected')),
         total INTEGER NOT NULL DEFAULT 0
       );
+      CREATE TABLE IF NOT EXISTS client_grants (
+        client TEXT NOT NULL,
+        read_source TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('allow', 'deny')),
+        PRIMARY KEY(client, read_source)
+      );
+      CREATE TABLE IF NOT EXISTS client_profiles (
+        client TEXT PRIMARY KEY,
+        write_source TEXT,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'blocked')),
+        first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
       CREATE TRIGGER IF NOT EXISTS memories_fts_insert AFTER INSERT ON memories BEGIN
         INSERT INTO memories_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
       END;
@@ -489,6 +503,7 @@ function getDatabase() {
     migrateSemanticLinks();
 
     const memoryColumns = new Set(database.prepare('PRAGMA table_info(memories)').all().map((column) => column.name));
+    if (!memoryColumns.has('private')) database.exec('ALTER TABLE memories ADD COLUMN private INTEGER NOT NULL DEFAULT 0 CHECK(private IN (0, 1))');
     if (!memoryColumns.has('content_hash')) database.exec('ALTER TABLE memories ADD COLUMN content_hash TEXT');
     if (!memoryColumns.has('import_id')) database.exec('ALTER TABLE memories ADD COLUMN import_id INTEGER REFERENCES imports(id) ON DELETE CASCADE');
     database.exec('CREATE INDEX IF NOT EXISTS memories_import_id_idx ON memories(import_id)');
@@ -729,6 +744,123 @@ function recordEvent(event = {}, memoryIds = []) {
   } catch { return null; }
 }
 
+function normalizeClientName(client) {
+  return String(client || '').trim().slice(0, 120) || 'Unknown MCP client';
+}
+
+function getMcpClientProfile(clientName) {
+  const db = getDatabase();
+  const client = normalizeClientName(clientName);
+  const created = db.prepare(`INSERT OR IGNORE INTO client_profiles (client, write_source, status, first_seen, last_seen)
+    VALUES (?, NULL, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`).run(client).changes > 0;
+  db.prepare('UPDATE client_profiles SET last_seen = CURRENT_TIMESTAMP WHERE client = ?').run(client);
+  const profile = db.prepare('SELECT client, write_source, status, first_seen, last_seen FROM client_profiles WHERE client = ?').get(client);
+  if (created) recordEvent({ kind: 'client_pending', tool: 'client_profile', client, ok: 1 });
+  const allowedSources = db.prepare("SELECT read_source FROM client_grants WHERE client = ? AND status = 'allow'").all(client).map((row) => row.read_source);
+  return { ...profile, allowedSources, created };
+}
+
+function listClients() {
+  const db = getDatabase();
+  return db.prepare('SELECT client, write_source, status, first_seen, last_seen FROM client_profiles ORDER BY last_seen DESC, client').all().map((profile) => ({
+    ...profile,
+    grants: Object.fromEntries(MEMORY_SOURCES.map((source) => [source, db.prepare('SELECT status FROM client_grants WHERE client = ? AND read_source = ?').get(profile.client, source)?.status || 'deny']))
+  }));
+}
+
+function approveClient(clientName, readSources, writeSource) {
+  ensureWritable();
+  const db = getDatabase();
+  const client = normalizeClientName(clientName);
+  if (!MEMORY_SOURCES.includes(writeSource)) throw new Error('Choose a valid write source.');
+  const allowed = new Set((Array.isArray(readSources) ? readSources : []).filter((source) => MEMORY_SOURCES.includes(source)));
+  const apply = db.transaction(() => {
+    db.prepare(`INSERT INTO client_profiles (client, write_source, status, first_seen, last_seen)
+      VALUES (?, ?, 'approved', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      ON CONFLICT(client) DO UPDATE SET write_source = excluded.write_source, status = 'approved', last_seen = CURRENT_TIMESTAMP`).run(client, writeSource);
+    const grant = db.prepare(`INSERT INTO client_grants (client, read_source, status) VALUES (?, ?, ?)
+      ON CONFLICT(client, read_source) DO UPDATE SET status = excluded.status`);
+    for (const source of MEMORY_SOURCES) grant.run(client, source, allowed.has(source) ? 'allow' : 'deny');
+  });
+  apply();
+  recordEvent({ kind: 'client_approved', tool: 'client_profile', client, source: writeSource, ok: 1 });
+  for (const source of MEMORY_SOURCES) recordEvent({ kind: 'grant_change', tool: 'client_grant', client, source, ok: 1, error: allowed.has(source) ? 'allow' : 'deny' });
+  recordEvent({ kind: 'grant_change', tool: 'client_write_source', client, source: writeSource, ok: 1 });
+  return listClients().find((profile) => profile.client === client);
+}
+
+function updateClientGrant(clientName, readSource, status) {
+  ensureWritable();
+  const client = normalizeClientName(clientName);
+  if (!MEMORY_SOURCES.includes(readSource) || !['allow', 'deny'].includes(status)) throw new Error('Invalid client read permission.');
+  if (!getDatabase().prepare('SELECT 1 FROM client_profiles WHERE client = ?').get(client)) throw new Error('Client profile was not found.');
+  getDatabase().prepare(`INSERT INTO client_grants (client, read_source, status) VALUES (?, ?, ?)
+    ON CONFLICT(client, read_source) DO UPDATE SET status = excluded.status`).run(client, readSource, status);
+  recordEvent({ kind: 'grant_change', tool: 'client_grant', client, source: readSource, ok: 1, error: status });
+  return true;
+}
+
+function updateClientProfile(clientName, changes = {}) {
+  ensureWritable();
+  const db = getDatabase();
+  const client = normalizeClientName(clientName);
+  const current = db.prepare('SELECT client, write_source, status FROM client_profiles WHERE client = ?').get(client);
+  if (!current) throw new Error('Client profile was not found.');
+  const writeSource = changes.write_source === undefined ? current.write_source : changes.write_source;
+  if (writeSource !== null && !MEMORY_SOURCES.includes(writeSource)) throw new Error('Choose a valid write source.');
+  const status = changes.status === undefined ? current.status : changes.status;
+  if (!['pending', 'approved', 'blocked'].includes(status)) throw new Error('Invalid client status.');
+  db.prepare('UPDATE client_profiles SET write_source = ?, status = ? WHERE client = ?').run(writeSource, status, client);
+  if (writeSource !== current.write_source) recordEvent({ kind: 'grant_change', tool: 'client_write_source', client, source: writeSource, ok: 1 });
+  if (status !== current.status) recordEvent({ kind: status === 'approved' ? 'client_approved' : (status === 'blocked' ? 'client_blocked' : 'client_profile_change'), tool: 'client_profile', client, source: writeSource, ok: 1 });
+  return listClients().find((profile) => profile.client === client);
+}
+
+function setMemoryPrivate(memoryId, isPrivate) {
+  ensureWritable();
+  const db = getDatabase();
+  const id = Number(memoryId);
+  const changed = db.prepare('UPDATE memories SET private = ? WHERE id = ?').run(isPrivate ? 1 : 0, id).changes > 0;
+  if (!changed) return false;
+  const memory = db.prepare('SELECT id, source, title, content, private FROM memories WHERE id = ?').get(id);
+  memoryCache.set(id, memory);
+  recordEvent({ kind: 'privacy_change', tool: 'memory_privacy', source: memory.source, result_count: 1, ok: 1, error: memory.private ? 'private' : 'public' });
+  return true;
+}
+
+async function searchMemoriesForClient(query, source, limit, profile) {
+  const allowedSources = profile.allowedSources || [];
+  if (source && source !== 'all' && !allowedSources.includes(source)) return { memories: [], denied: true };
+  const sources = source && source !== 'all' ? [source] : allowedSources;
+  const batches = await Promise.all(sources.map((allowedSource) => searchMemories(query, allowedSource, limit, 0)));
+  const candidates = batches.flat().sort((a, b) => b.score - a.score).slice(0, limit);
+  if (!candidates.length) return { memories: [], denied: allowedSources.length === 0 };
+  const currentAllowed = getDatabase().prepare("SELECT read_source FROM client_grants WHERE client = ? AND status = 'allow'").all(profile.client).map((row) => row.read_source);
+  if (source && source !== 'all' && !currentAllowed.includes(source)) return { memories: [], denied: true };
+  if (!currentAllowed.length) return { memories: [], denied: false };
+  const placeholders = candidates.map(() => '?').join(',');
+  const visible = new Set(getDatabase().prepare(`SELECT id FROM memories WHERE private = 0 AND source IN (${currentAllowed.map(() => '?').join(',')}) AND id IN (${placeholders})`)
+    .all(...currentAllowed, ...candidates.map((memory) => memory.id)).map((row) => Number(row.id)));
+  return { memories: candidates.filter((memory) => visible.has(Number(memory.id))), denied: false };
+}
+
+function getMemoryForClient(memoryId, profile) {
+  const memory = getMemory(memoryId);
+  if (!memory || memory.private || !profile.allowedSources?.includes(memory.source)) return { memory: null, denied: true };
+  const allowedSources = profile.allowedSources;
+  const placeholders = allowedSources.map(() => '?').join(',');
+  const linkedMemoryIds = allowedSources.length ? getDatabase().prepare(`SELECT l.other_id AS id FROM (
+      SELECT CASE WHEN a_id = ? THEN b_id ELSE a_id END AS other_id FROM links WHERE a_id = ? OR b_id = ?
+    ) l JOIN memories m ON m.id = l.other_id WHERE m.private = 0 AND m.source IN (${placeholders}) ORDER BY l.other_id`)
+    .all(memory.id, memory.id, memory.id, ...allowedSources).map((row) => row.id) : [];
+  return { memory: { ...memory, linked_memory_ids: linkedMemoryIds }, denied: false };
+}
+
+function countBySourceForClient(profile) {
+  const counts = getDatabase().prepare('SELECT source, count(*) AS count FROM memories WHERE private = 0 GROUP BY source').all();
+  return Object.fromEntries(counts.filter((row) => profile.allowedSources?.includes(row.source)).map((row) => [row.source, row.count]));
+}
+
 function addMemory({ source, title, content }, { handAdded = false, event = null } = {}) {
   ensureWritable();
   const db = getDatabase();
@@ -749,7 +881,7 @@ function addMemory({ source, title, content }, { handAdded = false, event = null
     }
 
     const memory = db
-      .prepare('SELECT id, source, title, content, created_at FROM memories WHERE id = ?')
+      .prepare('SELECT id, source, title, content, created_at, private FROM memories WHERE id = ?')
       .get(id);
     return { memory, inserted: Boolean(result.changes) };
   });
@@ -770,7 +902,7 @@ function createImport(source) {
   return Number(result.lastInsertRowid);
 }
 
-function importMemories(items, importId) {
+function importMemories(items, importId, markPrivate = false) {
   ensureWritable();
   const db = getDatabase();
   const id = Number(importId);
@@ -778,7 +910,7 @@ function importMemories(items, importId) {
   if (!Array.isArray(items) || items.length > 3000) throw new Error('Imports are limited to 3,000 chunks.');
   const current = db.prepare('SELECT count FROM imports WHERE id = ?').get(id).count;
   if (current + items.length > 3000) throw new Error('Imports are limited to 3,000 chunks.');
-  const insert = db.prepare('INSERT OR IGNORE INTO memories (source, title, content, content_hash, import_id) VALUES (?, ?, ?, ?, ?)');
+  const insert = db.prepare('INSERT OR IGNORE INTO memories (source, title, content, content_hash, import_id, private) VALUES (?, ?, ?, ?, ?, ?)');
   const importBatch = db.transaction((batch) => {
     let inserted = 0;
     let skipped = 0;
@@ -791,7 +923,7 @@ function importMemories(items, importId) {
         skipped += 1;
         continue;
       }
-      const result = insert.run(source, title, content, contentHash(content), id);
+      const result = insert.run(source, title, content, contentHash(content), id, markPrivate ? 1 : 0);
       if (result.changes) { inserted += 1; insertedIds.push(Number(result.lastInsertRowid)); }
       else skipped += 1;
     }
@@ -801,7 +933,7 @@ function importMemories(items, importId) {
   const result = importBatch(items);
   recordEvent({ kind: 'import', tool: 'import_memories', source: id ? db.prepare('SELECT source FROM imports WHERE id = ?').get(id)?.source : null, result_count: result.inserted });
   if (cachesLoaded && result.insertedIds.length) {
-    const get = db.prepare('SELECT id, source, title, content FROM memories WHERE id = ?');
+    const get = db.prepare('SELECT id, source, title, content, private FROM memories WHERE id = ?');
     for (const id of result.insertedIds) memoryCache.set(id, get.get(id));
   }
   for (const id of result.insertedIds) void enqueueEmbedding(id).catch(() => {});
@@ -841,13 +973,13 @@ function undoImport(importId) {
 
 function listMemories() {
   return getDatabase()
-    .prepare('SELECT id, source, title, content, created_at FROM memories ORDER BY created_at DESC, id DESC')
+    .prepare('SELECT id, source, title, content, created_at, private FROM memories ORDER BY created_at DESC, id DESC')
     .all();
 }
 
 function getMemory(id) {
   const db = getDatabase();
-  const memory = db.prepare('SELECT id, source, title, content, created_at FROM memories WHERE id = ?').get(Number(id));
+  const memory = db.prepare('SELECT id, source, title, content, created_at, private FROM memories WHERE id = ?').get(Number(id));
   if (!memory) return null;
   const linkedMemoryIds = db.prepare('SELECT CASE WHEN a_id = ? THEN b_id ELSE a_id END AS id FROM links WHERE a_id = ? OR b_id = ? ORDER BY id').all(memory.id, memory.id, memory.id).map((row) => row.id);
   return { ...memory, linked_memory_ids: linkedMemoryIds };
@@ -864,7 +996,7 @@ function searchFts(query, source, limit, offset) {
     const params = filterSource ? [filterSource, safeLimit, safeOffset] : [safeLimit, safeOffset];
     const where = filterSource ? 'WHERE source = ?' : '';
     return db.prepare(`
-      SELECT id, source, title, substr(content, 1, 120) AS snippet
+      SELECT id, source, title, private, substr(content, 1, 120) AS snippet
       FROM memories ${where}
       ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
     `).all(...params).map((row, index) => ({ ...row, score: 1 / (60 + safeOffset + index + 1) }));
@@ -874,7 +1006,7 @@ function searchFts(query, source, limit, offset) {
   const params = filterSource ? [match, filterSource, safeLimit, safeOffset] : [match, safeLimit, safeOffset];
   const sourceWhere = filterSource ? 'AND memories.source = ?' : '';
   return db.prepare(`
-    SELECT memories.id, memories.source, memories.title,
+    SELECT memories.id, memories.source, memories.title, memories.private,
       substr(snippet(memories_fts, -1, '', '', ' … ', 24), 1, 120) AS snippet
     FROM memories_fts
     JOIN memories ON memories.id = memories_fts.rowid
@@ -1135,4 +1267,4 @@ function countBySource() {
     }, {});
 }
 
-module.exports = { initializeDatabase, getDatabaseStatus, getInsights, runAnalyticsSql, recordEvent, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
+module.exports = { initializeDatabase, getDatabaseStatus, getInsights, runAnalyticsSql, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };

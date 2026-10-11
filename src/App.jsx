@@ -90,6 +90,7 @@ function App() {
   const [saving, setSaving] = useState(false);
   const [addMode, setAddMode] = useState('add');
   const [importSource, setImportSource] = useState('chatgpt');
+  const [importPrivate, setImportPrivate] = useState(false);
   const [importFile, setImportFile] = useState(null);
   const [importText, setImportText] = useState('');
   const [includeAssistant, setIncludeAssistant] = useState(false);
@@ -109,6 +110,11 @@ function App() {
   const [databaseStatus, setDatabaseStatus] = useState({ writable: true, message: '' });
   const [showSemanticLinks, setShowSemanticLinks] = useState(true);
   const [connectOpen, setConnectOpen] = useState(false);
+  const [clients, setClients] = useState([]);
+  const [pendingClient, setPendingClient] = useState(null);
+  const [pendingReadSources, setPendingReadSources] = useState([]);
+  const [pendingWriteSource, setPendingWriteSource] = useState(SOURCES[2]);
+  const [privacyNoticeOpen, setPrivacyNoticeOpen] = useState(() => window.localStorage.getItem('one-brain-provider-notice-dismissed') !== '1');
   const [insightsOpen, setInsightsOpen] = useState(false);
   const [insightsData, setInsightsData] = useState(null);
   const [sql, setSql] = useState('SELECT date(ts) AS day, count(*) AS calls FROM events GROUP BY date(ts) ORDER BY day DESC;');
@@ -157,6 +163,68 @@ function App() {
     setLegacyCleanupStatus(cleanupStatus);
     setCounts({ ...EMPTY_COUNTS, ...savedCounts });
     return { savedMemories, savedLinks, savedCounts };
+  }
+
+  async function refreshClients() {
+    const savedClients = await window.brain.listClients();
+    setClients(savedClients);
+    return savedClients;
+  }
+
+  function openConnectSettings() {
+    setConnectOpen(true);
+    void refreshClients().then((rows) => {
+      const pending = rows.find((client) => client.status === 'pending');
+      if (pending && !pendingClient) {
+        setPendingClient(pending.client);
+        setPendingReadSources([]);
+        setPendingWriteSource(SOURCES[2]);
+      }
+    });
+  }
+
+  async function handleApproveClient() {
+    if (!pendingClient) return;
+    await window.brain.approveClient(pendingClient, pendingReadSources, pendingWriteSource);
+    const remaining = (await refreshClients()).find((client) => client.status === 'pending');
+    setPendingClient(remaining?.client || null);
+    setPendingReadSources([]);
+    setPendingWriteSource(SOURCES[2]);
+  }
+
+  async function handleBlockClient() {
+    if (!pendingClient) return;
+    await window.brain.updateClientProfile(pendingClient, { status: 'blocked' });
+    const remaining = (await refreshClients()).find((client) => client.status === 'pending');
+    setPendingClient(remaining?.client || null);
+    setPendingReadSources([]);
+    setPendingWriteSource(SOURCES[2]);
+  }
+
+  async function handleClientGrant(client, source, allowed) {
+    await window.brain.updateClientGrant(client, source, allowed ? 'allow' : 'deny');
+    await refreshClients();
+  }
+
+  async function handleClientStatus(client, status) {
+    await window.brain.updateClientProfile(client, { status });
+    await refreshClients();
+  }
+
+  async function handleClientWriteSource(client, write_source) {
+    await window.brain.updateClientProfile(client, { write_source });
+    await refreshClients();
+  }
+
+  async function handlePrivateToggle(memory) {
+    await window.brain.setMemoryPrivate(memory.id, !memory.private);
+    await refreshData();
+    await refreshSearch();
+  }
+
+  function dismissPrivacyNotice() {
+    window.localStorage.setItem('one-brain-provider-notice-dismissed', '1');
+    setPrivacyNoticeOpen(false);
   }
 
   async function refreshSearch(searchQuery = debouncedQuery, filter = sourceFilter) {
@@ -213,11 +281,29 @@ function App() {
       const { query: activeQuery, sourceFilter: activeSource } = searchState.current;
       await refreshSearch(activeQuery, activeSource);
     });
+    const unsubscribeClientPending = window.brain.onClientPending((client) => {
+      if (!client?.client) return;
+      setPendingClient(client.client);
+      setPendingReadSources([]);
+      setPendingWriteSource(SOURCES[2]);
+      void refreshClients();
+    });
+    window.brain.listClients().then((rows) => {
+      if (!active) return;
+      setClients(rows);
+      const pending = rows.find((client) => client.status === 'pending');
+      if (pending) {
+        setPendingClient(pending.client);
+        setPendingReadSources([]);
+        setPendingWriteSource(SOURCES[2]);
+      }
+    }).catch(() => {});
     return () => {
       active = false;
       unsubscribeEmbeddingStatus();
       unsubscribeRetrieved();
       unsubscribeChanged();
+      unsubscribeClientPending();
     };
   }, []);
 
@@ -399,7 +485,7 @@ function App() {
     try {
       if (window.brain.createImport) importId = await window.brain.createImport(importSource);
       for (let offset = 0; offset < items.length; offset += 200) {
-        const result = await window.brain.importMemories(items.slice(offset, offset + 200), importId);
+        const result = await window.brain.importMemories(items.slice(offset, offset + 200), importId, importPrivate);
         inserted += result.inserted;
         skipped += result.skipped;
         setImportProgress(Math.round((Math.min(offset + 200, items.length) / items.length) * 100));
@@ -413,6 +499,7 @@ function App() {
         if (firstImported) setPendingImportPulse(firstImported.id);
       }
       setImportSummary(`Imported ${inserted}, skipped ${skipped} duplicates`);
+      setImportPrivate(false);
     } catch (error) {
       if (importId !== null && window.brain.finishImport) {
         try { const completedImport = await window.brain.finishImport(importId); if (completedImport) setLastImport(completedImport); await refreshData(); } catch {}
@@ -502,6 +589,17 @@ function App() {
               <section className="config-section"><h2>Claude Code</h2><pre>{claudeCodeCommand}</pre><button type="button" onClick={() => copyText(claudeCodeCommand, 'claude')}>{copied === 'claude' ? 'Copied' : 'Copy command'}</button></section>
               <section className="config-section"><h2>Codex CLI</h2><p>Add this to <code>~/.codex/config.toml</code>.</p><pre>{codexConfig}</pre><button type="button" onClick={() => copyText(codexConfig, 'codex')}>{copied === 'codex' ? 'Copied' : 'Copy config'}</button></section>
             </> : <p className="empty-note">Starting the local MCP server...</p>}
+            <section className="clients-settings">
+              <header><h2>Connected AIs</h2><button type="button" onClick={() => { void refreshClients(); }}>Refresh</button></header>
+              {clients.map((client) => <article className="client-card" key={client.client}>
+                <div className="client-heading"><strong>{client.client}</strong><span className={`client-status ${client.status}`}>{client.status}</span></div>
+                <small>Last seen {dateLabel(client.last_seen) || '—'}</small>
+                <label>Write as<select value={client.write_source || ''} onChange={(event) => handleClientWriteSource(client.client, event.target.value || null)}><option value="">Choose source</option>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label>
+                <fieldset><legend>May read</legend>{SOURCES.map((source) => <label className="client-grant" key={source}><input type="checkbox" checked={client.grants?.[source] === 'allow'} onChange={(event) => handleClientGrant(client.client, source, event.target.checked)} />{source}</label>)}</fieldset>
+                {client.status === 'blocked' ? <button type="button" className="client-unblock" disabled={!client.write_source} onClick={() => handleClientStatus(client.client, 'approved')}>Unblock</button> : <button type="button" className="client-block" onClick={() => handleClientStatus(client.client, 'blocked')}>Block</button>}
+              </article>)}
+              {clients.length === 0 && <p className="empty-note">No MCP clients have connected yet.</p>}
+            </section>
             {legacyCleanupStatus.count >= 200 && <section className="legacy-cleanup-section"><h2>Legacy import cleanup</h2><p>{legacyCleanupStatus.count.toLocaleString()} matching Claude memories found.</p>{legacyCleanupStatus.error && <p className="import-error">Safety backup failed: {legacyCleanupStatus.error}</p>}<button type="button" disabled={!legacyCleanupStatus.backupPath} onClick={handleLegacyCleanup}>{legacyCleanupStatus.backupPath ? 'Remove legacy junk import' : 'Preparing safety backup…'}</button></section>}
           </section>
         ) : suggestionsOpen ? (
@@ -542,11 +640,12 @@ function App() {
               {suggestions.length > 0 && <button className="header-suggestions" type="button" onClick={() => { setSelectedId(null); setSuggestionsOpen(true); }}>Suggestions ({suggestions.length})</button>}
             </header>
             <div className="detail-source"><i style={{ background: SOURCE_COLORS[selectedMemory.source] }} />{selectedMemory.source}</div>
-            <h1>{selectedMemory.title || 'Untitled memory'}</h1>
+            <h1>{selectedMemory.private ? '🔒 ' : ''}{selectedMemory.title || 'Untitled memory'}</h1>
             <p className="detail-content">{selectedMemory.content}</p>
             <time className="detail-date">{dateLabel(selectedMemory.created_at)}</time>
             <div className="detail-actions">
               <button type="button" onClick={() => graphRef.current?.retrieve(selectedMemory.id)}>Retrieve</button>
+              <button type="button" aria-pressed={Boolean(selectedMemory.private)} onClick={() => handlePrivateToggle(selectedMemory)}>{selectedMemory.private ? '🔒 Private · turn off' : 'Mark private'}</button>
               <button type="button" className="danger-button" onClick={() => handleDelete(selectedMemory.id)}>Delete</button>
               {conversationPartCount >= 2 && / \(part \d+\/\d+\)$/.test(selectedMemory.title || '') && <button type="button" className="danger-button" onClick={handleDeleteConversationParts}>Delete all {conversationPartCount} parts of this chat</button>}
             </div>
@@ -588,7 +687,7 @@ function App() {
             <div className="search-row">
               <input value={query} onChange={(event) => { setQuery(event.target.value); setPageOffset(0); }} placeholder="Search memories..." aria-label="Search memories" />
               {suggestions.length > 0 && <button className="suggestions-button" type="button" onClick={() => setSuggestionsOpen(true)}>Suggestions ({suggestions.length})</button>}
-              <button className="settings-button" type="button" aria-label="Connect AI settings" title="Connect AI" onClick={() => setConnectOpen(true)}>⚙</button>
+              <button className="settings-button" type="button" aria-label="Connect AI settings" title="Connect AI" onClick={openConnectSettings}>⚙</button>
               <button className="add-button" type="button" aria-label="Add memory or import" title={databaseStatus.writable ? 'Add or import memories' : 'Memory writes are disabled'} disabled={!databaseStatus.writable} onClick={() => { setAddMode('add'); setAddOpen(true); }}>+</button>
             </div>
             <div className="embedding-status" aria-live="polite">
@@ -612,7 +711,7 @@ function App() {
                 const displayTitle = item.title?.trim() || (full?.content || '').slice(0, 40) || 'Untitled memory';
                 return <button type="button" className="result-item" key={item.id} onClick={() => openDetail(item.id)}>
                   <i className="result-dot" style={{ background: SOURCE_COLORS[item.source] }} />
-                  <span className="result-copy"><strong>{displayTitle}</strong><small>{item.snippet || full?.content.slice(0, 120) || ''}</small></span>
+                  <span className="result-copy"><strong>{item.private ? '🔒 ' : ''}{displayTitle}</strong><small>{item.snippet || full?.content.slice(0, 120) || ''}</small></span>
                   <span className="result-source">{item.source}</span>
                 </button>;
               })}
@@ -624,6 +723,10 @@ function App() {
       </aside>
       {!insightsOpen && <button className="sidebar-toggle" type="button" aria-label={sidebarCollapsed ? 'Expand memories sidebar' : 'Collapse memories sidebar'} aria-expanded={!sidebarCollapsed} onClick={() => setSidebarCollapsed((collapsed) => !collapsed)} style={{ left: sidebarCollapsed ? 32 : 'min(360px, 92vw)' }}>{sidebarCollapsed ? '›' : '‹'}</button>}
       {suggestionToast && <button className="suggestion-toast" type="button" onClick={() => { setSuggestionToast(false); setSuggestionsOpen(true); }}>1 possible link found - Review</button>}
+
+      {privacyNoticeOpen && createPortal(<div className="modal-backdrop notice-backdrop"><section className="consent-modal" role="dialog" aria-modal="true" aria-labelledby="provider-notice-title"><h2 id="provider-notice-title">Privacy notice</h2><p>When a cloud AI reads a memory through One Brain, that text is sent to that AI's provider.</p><button className="save-button" type="button" onClick={dismissPrivacyNotice}>Got it</button></section></div>, document.body)}
+
+      {pendingClient && !privacyNoticeOpen && createPortal(<div className="modal-backdrop"><section className="consent-modal" role="dialog" aria-modal="true" aria-labelledby="client-consent-title"><header><h2 id="client-consent-title">Approve connected AI</h2></header><p><strong>{pendingClient}</strong> is waiting to connect.</p><fieldset><legend>May read these sources</legend>{SOURCES.map((source) => <label className="consent-source" key={source}><input type="checkbox" checked={pendingReadSources.includes(source)} onChange={(event) => setPendingReadSources((current) => event.target.checked ? [...current, source] : current.filter((item) => item !== source))} />{source}</label>)}</fieldset><label className="consent-write-source">Write memories as<select value={pendingWriteSource} onChange={(event) => setPendingWriteSource(event.target.value)}>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label><footer><button type="button" className="client-block" onClick={handleBlockClient}>Block</button><button type="button" className="save-button" onClick={handleApproveClient}>Approve</button></footer></section></div>, document.body)}
 
       {addOpen && createPortal(<div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setAddOpen(false); }}>
         <form className="add-modal" onSubmit={handleAdd}>
@@ -639,6 +742,7 @@ function App() {
             <button className="save-button" type="submit" disabled={!databaseStatus.writable || saving || !addContent.trim()}>{saving ? 'Saving...' : 'Save memory'}</button>
           </> : <>
             <label>Target source<select value={importSource} onChange={(event) => { setImportSource(event.target.value); setImportParsed(null); setImportSummary(''); setConfirmLargeImport(false); }}>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label>
+            <label className="import-check"><input type="checkbox" checked={importPrivate} onChange={(event) => setImportPrivate(event.target.checked)} />Mark all as private</label>
             <label>Conversation file<input type="file" accept=".json,.txt,.md,application/json,text/plain,text/markdown" onChange={(event) => { setImportFile(event.target.files?.[0] || null); setImportText(''); setImportParsed(null); setImportSummary(''); setImportError(''); setConfirmLargeImport(false); }} /></label>
             <label className="import-check"><input type="checkbox" checked={includeAssistant} onChange={(event) => { setIncludeAssistant(event.target.checked); setImportParsed(null); setConfirmLargeImport(false); }} />Include assistant replies</label>
             <label className="import-check"><input type="checkbox" checked={skipLogText} onChange={(event) => { toggleSkipLogText(event.target.checked); setConfirmLargeImport(false); }} />Skip terminal/log text</label>
@@ -791,6 +895,32 @@ function App() {
         .picker-results { max-height:230px;overflow-y:auto; }
         .picker-result { width:100%; }
         .modal-backdrop { box-sizing:border-box;position:fixed;z-index:20;inset:0;display:grid;place-items:center;overflow:auto;padding:16px;background:rgba(1,4,10,.72);backdrop-filter:blur(7px); }
+        .consent-modal { box-sizing:border-box;display:grid;gap:12px;width:min(460px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto;padding:20px;border:1px solid rgba(175,195,224,.22);border-radius:12px;background:#0c1421;box-shadow:0 20px 70px rgba(0,0,0,.48); }
+        .consent-modal h2 { margin:0;color:#e9f0fb;font-size:16px; }
+        .consent-modal p { margin:0;color:#b8c7da;font-size:12px; }
+        .consent-modal fieldset,.client-card fieldset { display:flex;flex-wrap:wrap;gap:6px 12px;margin:0;padding:9px;border:1px solid rgba(175,195,224,.14);border-radius:7px; }
+        .consent-modal legend,.client-card legend { padding:0 4px;color:#aab9cd;font-size:10px; }
+        .consent-source { display:flex;align-items:center;gap:6px;color:#d2deed;font-size:11px;text-transform:capitalize; }
+        .consent-source input,.client-grant input { accent-color:#8dc4ff; }
+        .consent-write-source,.client-card > label { display:grid;gap:5px;color:#aebcd0;font-size:10px; }
+        .consent-write-source select,.client-card select { padding:7px;border:1px solid #354054;border-radius:6px;color:#edf2fb;background:#111827;font:11px system-ui,sans-serif; }
+        .consent-modal footer { display:flex;justify-content:flex-end;gap:8px; }
+        .client-block,.client-unblock { border:1px solid rgba(255,136,136,.28);border-radius:6px;padding:7px 11px;color:#ffd0d0;background:#3c2329;font:11px system-ui,sans-serif;cursor:pointer; }
+        .client-unblock { color:#c8efd9;border-color:rgba(123,218,164,.28);background:#19342b; }
+        .client-unblock:disabled { opacity:.5;cursor:not-allowed; }
+        .clients-settings { margin-top:20px;padding-top:12px;border-top:1px solid rgba(175,195,224,.14); }
+        .clients-settings > header { display:flex;align-items:center;justify-content:space-between; }
+        .clients-settings > header h2 { margin:0;color:#dce6f2;font-size:12px; }
+        .clients-settings > header button { border:1px solid rgba(143,196,255,.22);border-radius:6px;padding:5px 8px;color:#c7e1ff;background:#182a40;font:10px system-ui,sans-serif;cursor:pointer; }
+        .client-card { display:grid;gap:8px;margin-top:10px;padding:10px;border:1px solid rgba(175,195,224,.14);border-radius:8px;background:rgba(20,29,43,.45); }
+        .client-heading { display:flex;justify-content:space-between;gap:8px;color:#e1eaf6;font-size:11px; }
+        .client-heading strong { overflow-wrap:anywhere; }
+        .client-status { color:#c8d4e3;font-size:9px;text-transform:capitalize; }
+        .client-status.approved { color:#9ce0b9; }.client-status.blocked { color:#ffaaa4; }.client-status.pending { color:#f2d785; }
+        .client-card > small { color:#8d9bb0;font-size:9px; }
+        .client-card fieldset { gap:5px 10px; }
+        .client-grant { display:flex;align-items:center;gap:4px;color:#b9c7d8;font-size:9px;text-transform:capitalize; }
+        .client-card > .client-block,.client-card > .client-unblock { justify-self:end;padding:5px 9px;font-size:10px; }
         .add-modal { box-sizing:border-box;display:grid;gap:13px;width:min(560px,calc(100vw - 32px));max-height:calc(100vh - 32px);min-width:0;overflow-x:hidden;overflow-y:auto;padding:18px;border:1px solid rgba(175,195,224,.22);border-radius:12px;background:#0c1421;box-shadow:0 20px 70px rgba(0,0,0,.48); }
         .add-modal header { display:flex;align-items:center;justify-content:space-between; }
         .add-modal h2 { margin:0;color:#e9f0fb;font-size:16px; }

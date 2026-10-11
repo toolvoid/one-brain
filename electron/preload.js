@@ -3,7 +3,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('brain', {
   addMemory: (memory) => ipcRenderer.invoke('memories:add', memory),
   createImport: (source) => ipcRenderer.invoke('imports:create', source),
-  importMemories: (items, importId) => ipcRenderer.invoke('memories:import', items, importId),
+  importMemories: (items, importId, markPrivate) => ipcRenderer.invoke('memories:import', items, importId, markPrivate),
   finishImport: (id) => ipcRenderer.invoke('imports:finish', id),
   listRecentImports: () => ipcRenderer.invoke('imports:list'),
   undoImport: (id) => ipcRenderer.invoke('imports:undo', id),
@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld('brain', {
   restoreRejected: (id) => ipcRenderer.invoke('suggestions:restore', id),
   dismissSuggestions: () => ipcRenderer.invoke('suggestions:dismiss-all'),
   deleteMemory: (id) => ipcRenderer.invoke('memories:delete', id),
+  setMemoryPrivate: (id, isPrivate) => ipcRenderer.invoke('memories:set-private', id, isPrivate),
   countConversationParts: (id) => ipcRenderer.invoke('memories:conversation-parts:count', id),
   deleteConversationParts: (id) => ipcRenderer.invoke('memories:conversation-parts:delete', id),
   listMemories: () => ipcRenderer.invoke('memories:list'),
@@ -27,6 +28,10 @@ contextBridge.exposeInMainWorld('brain', {
   getMcpConfig: () => ipcRenderer.invoke('mcp:config'),
   getEmbeddingStatus: () => ipcRenderer.invoke('embeddings:status'),
   getDatabaseStatus: () => ipcRenderer.invoke('database:status'),
+  listClients: () => ipcRenderer.invoke('clients:list'),
+  approveClient: (client, readSources, writeSource) => ipcRenderer.invoke('clients:approve', client, readSources, writeSource),
+  updateClientGrant: (client, source, status) => ipcRenderer.invoke('clients:grant', client, source, status),
+  updateClientProfile: (client, changes) => ipcRenderer.invoke('clients:update', client, changes),
   getInsights: () => ipcRenderer.invoke('analytics:insights'),
   runAnalyticsSql: (sql) => ipcRenderer.invoke('analytics:run-sql', sql),
   onEmbeddingStatus: (callback) => {
@@ -43,5 +48,10 @@ contextBridge.exposeInMainWorld('brain', {
     const listener = (_event, change) => callback(change);
     ipcRenderer.on('brain:changed', listener);
     return () => ipcRenderer.removeListener('brain:changed', listener);
+  },
+  onClientPending: (callback) => {
+    const listener = (_event, profile) => callback(profile);
+    ipcRenderer.on('brain:client-pending', listener);
+    return () => ipcRenderer.removeListener('brain:client-pending', listener);
   }
 });

@@ -1,6 +1,6 @@
 const { app, BrowserWindow, ipcMain, Menu, safeStorage } = require('electron');
 const path = require('path');
-const { initializeDatabase, getDatabaseStatus, getInsights, runAnalyticsSql, addMemory, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
+const { initializeDatabase, getDatabaseStatus, getInsights, runAnalyticsSql, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, addMemory, createImport, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
 const { startMcpServer } = require('./mcp-server');
 const { createEmbedder } = require('./embedder');
 
@@ -19,13 +19,14 @@ function publishEmbeddingStatus(status) {
 
 ipcMain.handle('memories:add', (_event, memory) => addMemory(memory, { handAdded: true }));
 ipcMain.handle('imports:create', (_event, source) => createImport(source));
-ipcMain.handle('memories:import', (_event, items, importId) => importMemories(items, importId));
+ipcMain.handle('memories:import', (_event, items, importId, markPrivate) => importMemories(items, importId, markPrivate));
 ipcMain.handle('imports:finish', (_event, id) => finishImport(id));
 ipcMain.handle('imports:list', () => listRecentImports());
 ipcMain.handle('imports:undo', (_event, id) => undoImport(id));
 ipcMain.handle('legacy-cleanup:status', () => getLegacyCleanupStatus());
 ipcMain.handle('legacy-cleanup:run', () => cleanupLegacyJunk());
 ipcMain.handle('memories:delete', (_event, id) => deleteMemory(id));
+ipcMain.handle('memories:set-private', (_event, id, isPrivate) => setMemoryPrivate(id, isPrivate));
 ipcMain.handle('memories:conversation-parts:count', (_event, id) => countConversationParts(id));
 ipcMain.handle('memories:conversation-parts:delete', (_event, id) => deleteConversationParts(id));
 ipcMain.handle('links:list', () => listLinks());
@@ -43,6 +44,10 @@ ipcMain.handle('memories:count-by-source', () => countBySource());
 ipcMain.handle('mcp:config', () => mcpConnection?.config || null);
 ipcMain.handle('embeddings:status', () => embeddingStatus);
 ipcMain.handle('database:status', () => getDatabaseStatus());
+ipcMain.handle('clients:list', () => listClients());
+ipcMain.handle('clients:approve', (_event, client, readSources, writeSource) => approveClient(client, readSources, writeSource));
+ipcMain.handle('clients:grant', (_event, client, source, status) => updateClientGrant(client, source, status));
+ipcMain.handle('clients:update', (_event, client, changes) => updateClientProfile(client, changes));
 ipcMain.handle('analytics:insights', () => getInsights());
 ipcMain.handle('analytics:run-sql', (_event, sql) => runAnalyticsSql(sql));
 
