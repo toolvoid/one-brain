@@ -54,6 +54,7 @@ for (const site of ['chatgpt', 'claude', 'gemini']) {
     assert.ok(messages.length >= 1);
     assert.equal(messages.at(-1).role, 'assistant');
     assert.equal(adapter.getLastAssistantMessage(root).role, 'assistant');
+    if (site === 'claude') assert.equal(messages.find((message) => message.role === 'user')?.role, 'user');
     assert.equal(Boolean(adapter.selfCheck(root).messages), true);
   });
 }

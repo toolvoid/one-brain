@@ -1,9 +1,9 @@
 'use strict';
 
 const OneBrainClaudeSelectors = Object.freeze({
-  messages: ['[data-testid="chat-message"]', '[data-message-author-role]', '[role="article"]'],
-  assistant: ['[data-message-author-role="assistant"]', '[data-testid*="assistant"]', '[aria-label*="assistant message" i]'],
-  user: ['[data-message-author-role="user"]'],
+  messages: ['[data-testid="chat-message"]', '[data-testid*="user-message" i]', '[data-testid*="human-message" i]', '[data-message-author-role]', '[role="article"]', '.font-user-message'],
+  assistant: ['[data-message-author-role="assistant"]', '[data-testid*="assistant-message" i]', '[data-testid*="assistant"]', '[aria-label*="assistant message" i]'],
+  user: ['[data-message-author-role="user"]', '[data-testid*="user-message" i]', '[data-testid*="human-message" i]', '[aria-label*="user message" i]', '.font-user-message'],
   composer: ['[contenteditable="true"][role="textbox"]', 'textarea[placeholder]', '[aria-label*="reply" i]', '[aria-label*="message" i]'],
   sendButton: ['button[aria-label*="send" i]', '[data-testid*="send" i]', 'button[aria-label*="submit" i]'],
   loadOlder: ['button[aria-label*="load older" i]', 'button[aria-label*="load more" i]', '[data-testid*="load-older" i]']
@@ -14,8 +14,13 @@ const OneBrainClaudeAdapter = {
   getMessages(root = document) {
     const elements = new Set(OneBrainClaudeSelectors.messages.flatMap((selector) => [...root.querySelectorAll(selector)]));
     const order = new Map([...root.querySelectorAll('*')].map((element, index) => [element, index]));
-    return [...elements].sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0)).map((element) => ({ element, role: element.getAttribute('data-message-author-role') ||
-      (OneBrainClaudeSelectors.assistant.some((selector) => element.matches(selector)) ? 'assistant' : OneBrainClaudeSelectors.user.some((selector) => element.matches(selector)) ? 'user' : 'unknown') }));
+    return [...elements].sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0)).map((element) => {
+      const explicit = String(element.getAttribute('data-message-author-role') || element.getAttribute('data-role') || '').toLowerCase();
+      const role = ['user', 'human'].includes(explicit) ? 'user' : ['assistant', 'model'].includes(explicit) ? 'assistant' :
+        OneBrainClaudeSelectors.user.some((selector) => element.matches(selector)) ? 'user' :
+          OneBrainClaudeSelectors.assistant.some((selector) => element.matches(selector)) ? 'assistant' : 'unknown';
+      return { element, role };
+    });
   },
   getInputElement(root = document) { for (const selector of OneBrainClaudeSelectors.composer) { const element = root.querySelector(selector); if (element) return element; } return null; },
   getSendButton(root = document) { for (const selector of OneBrainClaudeSelectors.sendButton) { const element = root.querySelector(selector); if (element) return element; } return null; },

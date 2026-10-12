@@ -390,7 +390,7 @@
     modal = document.createElement('section');
     modal.className = 'one-brain-extension-modal one-brain-extension-ui';
     modal.innerHTML = `<div class="one-brain-extension-dialog one-brain-chat-save-dialog"><h2>Save this chat</h2>
-      <section class="one-brain-load-controls"><button type="button" data-load>Load full chat</button><button type="button" data-cancel-load>Cancel loading</button><span data-load-progress></span></section>
+      <section class="one-brain-load-controls"><button type="button" data-load>Load full chat</button><button type="button" data-cancel-load>Cancel loading</button><span data-load-progress></span></section><p data-message-status></p>
       <label>Title<input data-title maxlength="160"></label><label>Source<select data-source></select></label>
       <label>Scope<select data-scope><option value="whole">Whole chat</option><option value="from">From the selected message on</option><option value="pick">Pick messages</option></select></label>
       <label data-from-label hidden>Start at<select data-from></select></label><div data-pick-actions hidden><button type="button" data-select-all>Select all</button><button type="button" data-select-none>Select none</button></div><div data-pick class="one-brain-chat-picks" hidden></div>
@@ -412,6 +412,8 @@
     const picks = panel.querySelector('[data-pick]');
     function renderMessageSelectors() {
       const list = readChatMessages();
+      const messageStatus = panel.querySelector('[data-message-status]');
+      messageStatus.textContent = list.length ? `${list.length} messages detected.` : 'No readable chat messages detected. Try “Load full chat”.';
       startsAt.replaceChildren(); picks.replaceChildren();
       list.forEach((message, index) => {
         const hiddenText = looksLikeSecret(message.text) ? '[secret-looking text hidden]' : message.text.split(/\r?\n/, 1)[0].slice(0, 100);
