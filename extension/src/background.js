@@ -25,7 +25,11 @@ async function extensionRequest(path, { token, method = 'GET', body, endpoint, t
   try {
     response = await fetch(`${savedEndpoint}${path}`, {
       method, signal: controller.signal,
-      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body ? { 'Content-Type': 'application/json' } : {}) },
+      headers: {
+        'X-One-Brain-Extension-Origin': globalThis.location.origin,
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(body ? { 'Content-Type': 'application/json' } : {})
+      },
       ...(body ? { body: JSON.stringify(body) } : {})
     });
   } finally { clearTimeout(timeout); }
@@ -41,21 +45,24 @@ async function settingsFor(site) {
 
 async function statusFor(site) {
   const tokens = await storageGet('oneBrainTokens') || {};
-  if (!tokens[site]) return { site, paired: false, running: true, status: 'unpaired' };
+  if (!tokens[site]) return { site, paired: false, running: true, status: 'no-token' };
   try {
     const ping = await extensionRequest('/ext/ping', { token: tokens[site] });
     const updateOneBrain = !versionAtLeast(ping.apiVersion, ONE_BRAIN_MIN_API_VERSION);
     const extensionVersion = extensionApi.runtime.getManifest?.().version || '0.0.0';
-    const updateExtension = !versionAtLeast(extensionVersion, ping.minExtensionVersion || '0.0.0');
-    return { site, paired: true, running: true, ...ping, updateOneBrain, updateExtension, minApiVersion: ONE_BRAIN_MIN_API_VERSION };
+    if (ping.site !== site) return { site, paired: false, running: true, status: 'unauthorized' };
+    if (updateOneBrain) return { site, paired: true, running: true, ...ping, status: 'version-mismatch', updateOneBrain, minApiVersion: ONE_BRAIN_MIN_API_VERSION };
+    const status = ping.approval === 'pending' ? 'pending' : ping.approval === 'blocked' ? 'blocked' : 'paired';
+    const reason = status === 'pending' ? 'pending_approval' : status === 'blocked' ? 'blocked' : undefined;
+    return { site, paired: true, running: true, ...ping, status, reason, updateOneBrain, minApiVersion: ONE_BRAIN_MIN_API_VERSION };
   }
   catch (error) {
-    if (error.status === 401) {
-      delete tokens[site]; await storageSet({ oneBrainTokens: tokens });
-      return { site, paired: false, running: true, status: 'revoked' };
+    if ([401, 403, 429].includes(error.status)) {
+      const reason = error.data?.reason || (error.status === 429 ? 'rate_limited' : 'unknown_token');
+      return { site, paired: Boolean(tokens[site]), running: true, status: reason === 'rate_limited' ? 'rate-limited' : 'unauthorized', reason,
+        expectedOrigin: error.data?.expectedOrigin, receivedOrigin: error.data?.receivedOrigin };
     }
-    if (error.status === 403) return { site, paired: true, running: true, status: 'pending' };
-    return { site, paired: Boolean(tokens[site]), running: false, status: 'offline', error: 'One Brain is not running.' };
+    return { site, paired: false, running: false, status: 'unreachable', error: 'One Brain is not running.' };
   }
 }
 
@@ -96,6 +103,12 @@ extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       if (tokens[message.site]) await extensionRequest('/ext/unpair', { method: 'POST', token: tokens[message.site], body: {} });
       delete tokens[message.site]; await storageSet({ oneBrainTokens: tokens });
       return { ok: true };
+    }
+    if (message?.type === 'relink' && ONE_BRAIN_SITES.includes(message.site)) {
+      const tokens = await storageGet('oneBrainTokens') || {};
+      delete tokens[message.site];
+      await storageSet({ oneBrainTokens: tokens });
+      return { ok: true, site: message.site };
     }
     if (message?.type === 'save' && ONE_BRAIN_SITES.includes(message.site)) {
       const tokens = await storageGet('oneBrainTokens') || {};

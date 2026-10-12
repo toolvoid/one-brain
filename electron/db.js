@@ -165,6 +165,18 @@ function authenticateClientToken(token) {
   return { client: match.client };
 }
 
+function getClientTokenState(token) {
+  const raw = String(token || '');
+  if (!/^[a-f\d]{64}$/i.test(raw)) return null;
+  const candidate = createHash('sha256').update(raw, 'utf8').digest();
+  for (const row of getDatabase().prepare('SELECT client, token_hash, revoked FROM client_tokens').all()) {
+    if (!/^[a-f\d]{64}$/i.test(row.token_hash || '')) continue;
+    const expected = Buffer.from(row.token_hash, 'hex');
+    if (candidate.length === expected.length && timingSafeEqual(candidate, expected)) return { client: row.client, revoked: Boolean(row.revoked) };
+  }
+  return null;
+}
+
 function getProxyClientProfile(client) {
   const name = String(client || '').trim();
   if (!/^[a-z0-9][a-z0-9:-]{0,63}$/.test(name)) return null;
@@ -1805,4 +1817,4 @@ function countBySource() {
     }, {});
 }
 
-module.exports = { initializeDatabase, closeDatabaseForTest, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, searchMemoriesForClient, getMemoryEmbeddingVector, getMemoryForClient, countBySourceForClient, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, JOIN_ALL_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
+module.exports = { initializeDatabase, closeDatabaseForTest, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, searchMemoriesForClient, getMemoryEmbeddingVector, getMemoryForClient, countBySourceForClient, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, JOIN_ALL_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };

@@ -14,7 +14,7 @@ const { contentHash } = require('../electron/ext-chat');
 async function harness({ clock = () => Date.now() } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'one-brain-ext-test-'));
   let tick = clock;
-  const tokens = new Map(), profiles = new Map(), events = [], retrieved = [], added = [], memories = [];
+  const tokens = new Map(), profiles = new Map(), events = [], authFailures = [], retrieved = [], added = [], memories = [];
   let tokenCounter = 0, nextMemoryId = 101, nextImportId = 1;
   const imports = new Map();
   const saveImported = (items, importId, markPrivate) => {
@@ -30,12 +30,13 @@ async function harness({ clock = () => Date.now() } = {}) {
   };
   const api = createExtApi({ userDataPath: directory, now: () => tick(),
     authenticateClientToken: (token) => tokens.get(token)?.active ? { client: tokens.get(token).client } : null,
+    getClientTokenState: (token) => tokens.has(token) ? { client: tokens.get(token).client, revoked: !tokens.get(token).active } : null,
     getClientProfile: (client) => profiles.get(client) || null,
     getMcpClientProfile: (client, identity) => {
       const profile = profiles.get(client) || { client, status: 'pending', allowedSources: [], created: true };
       profile.reported_name = identity.reported_name; profiles.set(client, profile); return profile;
     },
-    createToken: async (client) => { const token = String(++tokenCounter).padStart(64, '0'); tokens.set(token, { client, active: true }); return token; },
+    createToken: async (client) => { for (const item of tokens.values()) if (item.client === client) item.active = false; const token = String(++tokenCounter).padStart(64, '0'); tokens.set(token, { client, active: true, tokenHash: hashToken(token) }); return token; },
     revokeToken: (client) => { for (const item of tokens.values()) if (item.client === client) item.active = false; },
     isTokenActive: (client) => [...tokens.values()].some((item) => item.client === client && item.active),
     searchMemoriesForClient: async () => ({ memories: memories.slice() }),
@@ -49,15 +50,15 @@ async function harness({ clock = () => Date.now() } = {}) {
     undoExtensionChatSave: (id, extensionClient) => { const batch = imports.get(id); if (!batch || batch.extensionClient !== extensionClient) return { removed: false, memoryIds: [] }; const rows = memories.filter((item) => item.importId === id); for (let index = memories.length - 1; index >= 0; index--) if (memories[index].importId === id) memories.splice(index, 1); imports.delete(id); return { removed: true, memoryIds: rows.map((item) => item.id) }; },
     recordProxyEvent: (event, ids) => events.push({ ...event, ids }),
     emitRetrieved: (ids) => retrieved.push(...ids), emitAdded: (id) => added.push(id),
-    emitRemoved: (id) => added.push(-id)
+    emitRemoved: (id) => added.push(-id), authFailureLog: (entry) => authFailures.push(entry)
   });
   const proxy = createMemoryProxy({ userDataPath: directory, extensionApi: api });
   const server = http.createServer((req, res) => { void proxy.handle(req, res); });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   const origin = 'chrome-extension://onebrainfixture';
-  async function request(url, { method = 'GET', site = 'chatgpt', token, originHeader = origin, host, body } = {}) {
-    return fetch(`${base}${url}`, { method, headers: { ...(originHeader ? { Origin: originHeader } : {}), ...(host ? { Host: host } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body ? { 'Content-Type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) });
+  async function request(url, { method = 'GET', site = 'chatgpt', token, originHeader = origin, extensionOriginHeader, host, body } = {}) {
+    return fetch(`${base}${url}`, { method, headers: { ...(originHeader ? { Origin: originHeader } : {}), ...(extensionOriginHeader ? { 'X-One-Brain-Extension-Origin': extensionOriginHeader } : {}), ...(host ? { Host: host } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body ? { 'Content-Type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) });
   }
   async function pair(site = 'chatgpt') {
     const code = api.createPairCode().code;
@@ -68,7 +69,7 @@ async function harness({ clock = () => Date.now() } = {}) {
     profiles.get(`ext:${site}`).allowedSources = ['chatgpt', 'claude', 'gemini'];
     return result.token;
   }
-  return { api, server, directory, origin, request, pair, tokens, profiles, events, retrieved, added, memories, setNow(value) { tick = () => value; } };
+  return { api, server, directory, origin, request, pair, tokens, profiles, events, authFailures, retrieved, added, memories, setNow(value) { tick = () => value; } };
 }
 
 test('pairing codes expire and five incorrect attempts exhaust one code', async (t) => {
@@ -105,7 +106,11 @@ test('pairing and extension requests enforce the paired origin and loopback host
   assert.equal(response.status, 403);
   const token = await h.pair();
   response = await h.request('/ext/ping', { token, originHeader: 'chrome-extension://otherextension' });
-  assert.equal(response.status, 401);
+  assert.equal(response.status, 403);
+  const mismatch = await response.json();
+  assert.equal(mismatch.reason, 'origin_mismatch');
+  assert.equal(mismatch.expectedOrigin, h.origin);
+  assert.equal(mismatch.receivedOrigin, 'chrome-extension://otherextension');
   assert.equal(localHost('localhost'), false);
   assert.equal(localHost('127.0.0.1:3738'), true);
   response = await h.request('/ext/ping', { token });
@@ -113,23 +118,83 @@ test('pairing and extension requests enforce the paired origin and loopback host
   const ping = await response.json();
   assert.equal(ping.apiVersion, '1.1.0');
   assert.equal(ping.appVersion, '1.1.0');
+  assert.equal(ping.paired, true);
+  assert.equal(ping.approval, 'approved');
   assert.equal(response.headers.get('access-control-allow-origin'), h.origin);
 });
 
-test('revoked extension tokens are rejected with 401', async (t) => {
+test('revoked extension tokens return a reason-coded 401', async (t) => {
   const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
   const token = await h.pair();
   await h.api.revokeSite('chatgpt');
   const response = await h.request('/ext/ping', { token });
   assert.equal(response.status, 401);
+  assert.equal((await response.json()).reason, 'revoked');
 });
 
-test('a valid token with no saved extension pairing is rejected with 401', async (t) => {
+test('a valid token with no saved extension origin returns origin_mismatch', async (t) => {
   const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
   const token = await h.pair();
   fs.writeFileSync(path.join(h.directory, 'extension-origins.json'), '{}');
   const response = await h.request('/ext/ping', { token });
+  assert.equal(response.status, 403);
+  assert.equal((await response.json()).reason, 'origin_mismatch');
+});
+
+test('extension origin fallback authenticates requests when the browser omits Origin', async (t) => {
+  const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
+  const token = await h.pair('claude');
+  const response = await h.request('/ext/ping', { site: 'claude', token, originHeader: '', extensionOriginHeader: h.origin });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).approval, 'approved');
+});
+
+test('unknown tokens return reason-coded 401 and log only reason, client, and hash prefix', async (t) => {
+  const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
+  const response = await h.request('/ext/ping', { token: '9'.repeat(64) });
   assert.equal(response.status, 401);
+  assert.equal((await response.json()).reason, 'unknown_token');
+  assert.deepEqual(h.authFailures.at(-1), { type: 'extension_auth_failure', reason: 'unknown_token', client: 'ext:unknown', tokenHashPrefix: hashToken('9'.repeat(64)).slice(0, 6) });
+});
+
+test('pending clients can ping but search and save receive pending_approval', async (t) => {
+  const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
+  const token = await h.pair('claude');
+  h.profiles.get('ext:claude').status = 'pending';
+  let response = await h.request('/ext/ping', { site: 'claude', token });
+  assert.equal(response.status, 200);
+  assert.deepEqual(Object.fromEntries(Object.entries(await response.json()).filter(([key]) => ['paired', 'approval'].includes(key))), { paired: true, approval: 'pending' });
+  response = await h.request('/ext/search', { method: 'POST', site: 'claude', token, body: { query: 'fixture' } });
+  assert.equal(response.status, 403);
+  assert.equal((await response.json()).reason, 'pending_approval');
+  response = await h.request('/ext/save', { method: 'POST', site: 'claude', token, body: { site: 'claude', kind: 'message', text: 'fixture text' } });
+  assert.equal(response.status, 403);
+  assert.equal((await response.json()).reason, 'pending_approval');
+});
+
+test('blocked clients ping with blocked approval and protected calls return blocked', async (t) => {
+  const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
+  const token = await h.pair('claude'); h.profiles.get('ext:claude').status = 'blocked';
+  const ping = await h.request('/ext/ping', { site: 'claude', token });
+  assert.equal((await ping.json()).approval, 'blocked');
+  const response = await h.request('/ext/search', { method: 'POST', site: 'claude', token, body: { query: 'fixture' } });
+  assert.equal(response.status, 403);
+  assert.equal((await response.json()).reason, 'blocked');
+});
+
+test('re-pairing replaces the previous site token and saves its extension origin', async (t) => {
+  const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
+  const oldToken = await h.pair('claude');
+  const newToken = await h.pair('claude');
+  const origins = JSON.parse(fs.readFileSync(path.join(h.directory, 'extension-origins.json'), 'utf8'));
+  assert.equal(origins.claude.origin, h.origin);
+  assert.equal(h.tokens.get(newToken).tokenHash, hashToken(newToken));
+  assert.equal(h.tokens.get(oldToken).active, false);
+  let response = await h.request('/ext/ping', { site: 'claude', token: oldToken });
+  assert.equal(response.status, 401);
+  assert.equal((await response.json()).reason, 'revoked');
+  response = await h.request('/ext/ping', { site: 'claude', token: newToken });
+  assert.equal(response.status, 200);
 });
 
 test('save forces the source from the paired site and search excludes private results', async (t) => {
@@ -172,6 +237,7 @@ test('extension token is limited to thirty requests per minute', async (t) => {
   let response;
   for (let index = 0; index < 31; index++) response = await h.request('/ext/ping', { token });
   assert.equal(response.status, 429);
+  assert.equal((await response.json()).reason, 'rate_limited');
 });
 
 test('extension API rejects request bodies larger than two megabytes', async (t) => {

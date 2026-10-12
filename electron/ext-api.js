@@ -19,12 +19,16 @@ function extensionOrigin(value) {
 
 function localHost(value) { return typeof value === 'string' && /^127\.0\.0\.1(?::\d+)?$/.test(value); }
 
+function requestOrigin(req) {
+  return req.headers.origin || req.headers['x-one-brain-extension-origin'] || '';
+}
+
 function sendJson(res, status, body, corsOrigin = null) {
   const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
   if (corsOrigin) {
     headers['Access-Control-Allow-Origin'] = corsOrigin;
     headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
-    headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type';
+    headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type, X-One-Brain-Extension-Origin';
     headers.Vary = 'Origin';
   }
   res.writeHead(status, headers);
@@ -33,11 +37,12 @@ function sendJson(res, status, body, corsOrigin = null) {
 
 function createExtApi(options) {
   const {
-    userDataPath, authenticateClientToken, getClientProfile, getMcpClientProfile,
+    userDataPath, authenticateClientToken, getClientProfile, getMcpClientProfile, getClientTokenState = () => null,
     createToken, revokeToken, searchMemoriesForClient, addMemory, recordProxyEvent, isTokenActive = () => true,
     emitRetrieved = () => {}, emitAdded = () => {}, emitRemoved = () => {}, now = Date.now, getEmbeddingVector = () => null,
     setMemoryNoSuggest = () => false, getMemoryForClient = () => ({ memory: null }), createImport, importMemories, finishImport, getExtensionChatSave, undoExtensionChatSave,
     embedText, appVersion = require('../package.json').version,
+    authFailureLog = (entry) => console.info(JSON.stringify(entry)),
     importText = async (...args) => (await import('../src/lib/importers.js')).parseImportText(...args)
   } = options;
   const originsPath = path.join(userDataPath, 'extension-origins.json');
@@ -103,6 +108,14 @@ function createExtApi(options) {
     try { recordProxyEvent({ client, provider: 'extension', query: '', memories_injected: count, latency_ms: latency, ok, error }, memoryIds); } catch {}
   }
 
+  function authFailure(res, { reason, client, token, status, message, origin, expectedOrigin, receivedOrigin }) {
+    const tokenHashPrefix = token ? createHash('sha256').update(token).digest('hex').slice(0, 6) : null;
+    try { authFailureLog({ type: 'extension_auth_failure', reason, client, tokenHashPrefix }); } catch {}
+    log(client || 'ext:unknown', { ok: false, error: reason });
+    return sendJson(res, status, { error: message, reason,
+      ...(reason === 'origin_mismatch' ? { expectedOrigin: expectedOrigin || null, receivedOrigin: receivedOrigin || null } : {}) }, origin || null);
+  }
+
   async function prepareChatSave(body, site, client) {
     if (body.site !== site || !Array.isArray(body.messages) || body.messages.length > 1000) throw Object.assign(new Error('A valid site and message list are required.'), { status: 400 });
     const chatKey = String(body.chatKey || '');
@@ -163,12 +176,12 @@ function createExtApi(options) {
   async function handleRequest(req, res) {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (!url.pathname.startsWith('/ext/')) return false;
-    const origin = req.headers.origin || '';
+    const origin = requestOrigin(req);
     if (!localHost(req.headers.host)) return sendJson(res, 403, { error: 'Only the 127.0.0.1 host is accepted.' });
     const origins = readOrigins();
     const allowedOrigin = Object.values(origins).some((entry) => entry.origin === origin);
-    const pairingOrigin = url.pathname === '/ext/pair' && extensionOrigin(origin);
-    if (req.method === 'OPTIONS' && !allowedOrigin && !pairingOrigin) {
+    const extensionRequestOrigin = extensionOrigin(origin);
+    if (req.method === 'OPTIONS' && !allowedOrigin && !extensionRequestOrigin) {
       log('ext:unknown', { ok: false, error: 'origin_denied' });
       return sendJson(res, 403, { error: 'This extension origin is not paired.' });
     }
@@ -179,42 +192,42 @@ function createExtApi(options) {
     }
 
     const started = now();
-    const auth = /^Bearer ([a-f\d]{64})$/i.exec(req.headers.authorization || '');
-    const identity = auth ? authenticateClientToken(auth[1]) : null;
+    const auth = /^Bearer (.+)$/i.exec(req.headers.authorization || '');
+    const suppliedToken = auth?.[1] || null;
+    const identity = suppliedToken ? authenticateClientToken(suppliedToken) : null;
     if (!identity || !/^ext:(chatgpt|claude|gemini)$/.test(identity.client)) {
-      log(identity?.client || 'ext:unknown', { ok: false, error: 'unauthorized', latency: now() - started });
-      return sendJson(res, 401, { error: 'A valid, active extension token is required.' }, allowedOrigin ? origin : null);
+      const tokenState = suppliedToken ? getClientTokenState(suppliedToken) : null;
+      const reason = tokenState?.revoked ? 'revoked' : 'unknown_token';
+      return authFailure(res, { reason, client: tokenState?.client || identity?.client || 'ext:unknown', token: suppliedToken, status: 401,
+        message: reason === 'revoked' ? 'This extension token was revoked.' : 'A valid extension token is required.', origin: allowedOrigin ? origin : (extensionRequestOrigin ? origin : null) });
     }
     const site = identity.client.slice(4);
     const savedOrigin = readOrigins()[site]?.origin;
     if (!savedOrigin || savedOrigin !== origin || !allowedOrigin) {
-      log(identity.client, { ok: false, error: 'origin_or_pairing_denied', latency: now() - started });
-      return sendJson(res, 401, { error: 'This extension token is unpaired or revoked.' });
+      return authFailure(res, { reason: 'origin_mismatch', client: identity.client, token: suppliedToken, status: 403,
+        message: 'The extension origin does not match the saved pairing.', origin: extensionRequestOrigin ? origin : null,
+        expectedOrigin: savedOrigin, receivedOrigin: origin });
     }
-    const tokenId = createHash('sha256').update(auth[1]).digest('hex');
+    const tokenId = createHash('sha256').update(suppliedToken).digest('hex');
     const time = now();
     if (rateLimits.size > 2000) for (const [key, entry] of rateLimits) if (time >= entry.startedAt + WINDOW_MS) rateLimits.delete(key);
     const window = rateLimits.get(tokenId);
     if (!window || time >= window.startedAt + WINDOW_MS) rateLimits.set(tokenId, { startedAt: time, count: 1 });
     else if (window.count >= REQUEST_LIMIT) {
-      log(identity.client, { ok: false, error: 'rate_limited', latency: now() - started });
-      return sendJson(res, 429, { error: 'Extension request limit reached. Try again in a minute.' }, origin);
+      return authFailure(res, { reason: 'rate_limited', client: identity.client, token: suppliedToken, status: 429,
+        message: 'Extension request limit reached. Try again in a minute.', origin });
     } else window.count += 1;
 
     const profile = getClientProfile(identity.client);
-    if (!profile || profile.status === 'blocked') {
-      log(identity.client, { ok: false, error: 'client_revoked', latency: now() - started });
-      return sendJson(res, 401, { error: 'This extension token is revoked.' }, origin);
-    }
-    if (profile.status !== 'approved') {
-      log(identity.client, { ok: false, error: 'client_pending', latency: now() - started });
-      return sendJson(res, 403, { error: 'Approve this extension in One Brain before using it.' }, origin);
-    }
-
     if (req.method === 'GET' && url.pathname === '/ext/ping') {
       log(identity.client, { ok: true, latency: now() - started });
-      return sendJson(res, 200, { ok: true, site, status: profile.status, appVersion, apiVersion: API_VERSION, minExtensionVersion: MIN_EXTENSION_VERSION }, origin);
+      const approval = profile?.status === 'approved' ? 'approved' : profile?.status === 'blocked' ? 'blocked' : 'pending';
+      return sendJson(res, 200, { ok: true, paired: true, approval, appVersion, apiVersion: API_VERSION, site }, origin);
     }
+    if (profile?.status === 'blocked') return authFailure(res, { reason: 'blocked', client: identity.client, token: suppliedToken, status: 403,
+      message: 'This extension client is blocked in One Brain.', origin });
+    if (profile?.status !== 'approved') return authFailure(res, { reason: 'pending_approval', client: identity.client, token: suppliedToken, status: 403,
+      message: 'Approve this extension in One Brain before using it.', origin });
     if (req.method === 'POST' && url.pathname === '/ext/unpair') {
       await revokeSite(site);
       log(identity.client, { ok: true, latency: now() - started });
@@ -308,7 +321,7 @@ function createExtApi(options) {
   }
 
   async function handle(req, res) {
-    const origin = req.headers.origin || '';
+    const origin = requestOrigin(req);
     try { return await handleRequest(req, res); }
     catch (error) {
       const pathname = new URL(req.url, 'http://127.0.0.1').pathname;

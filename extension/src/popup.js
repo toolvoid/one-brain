@@ -8,12 +8,16 @@
   const endpointInput = document.querySelector('#endpoint');
   const pairButton = document.querySelector('#pair');
   const pairError = document.querySelector('#pair-error');
+  const pairingSite = document.querySelector('#pairing-site');
   const connections = document.querySelector('#connections');
   const selfCheckRoot = document.querySelector('#self-check');
   document.querySelector('#refresh').addEventListener('click', () => { void refresh().catch(() => { connections.textContent = 'One Brain is not running.'; }); });
 
   async function message(payload) { return api.runtime.sendMessage(payload); }
-  function syncPairButton() { pairButton.disabled = !sites.includes(siteSelect.value) || !/^\d{6}$/.test(codeInput.value); }
+  function syncPairButton() {
+    pairButton.disabled = !sites.includes(siteSelect.value) || !/^\d{6}$/.test(codeInput.value);
+    pairingSite.textContent = `Pairing: ${siteSelect.value ? siteSelect.options[siteSelect.selectedIndex].text : 'Choose a site'}`;
+  }
   siteSelect.addEventListener('change', syncPairButton);
   codeInput.addEventListener('input', () => { codeInput.value = codeInput.value.replace(/\D/g, '').slice(0, 6); syncPairButton(); });
 
@@ -22,7 +26,8 @@
     try {
       const result = await message({ type: 'pair', site: siteSelect.value, code: codeInput.value, endpoint: endpointInput.value.trim() });
       if (!result?.ok) throw new Error(result?.error || 'Pairing failed.');
-      codeInput.value = ''; siteSelect.value = ''; pairError.textContent = result.status === 'approved' ? 'Paired.' : 'Paired. Approve this client in One Brain to finish setup.';
+      const pairedSite = result.site || siteSelect.value;
+      codeInput.value = ''; pairError.textContent = result.status === 'approved' ? `Paired as ext:${pairedSite}` : `Paired as ext:${pairedSite}. Approve this client in One Brain to finish setup.`;
       await refresh();
     } catch (error) { pairError.textContent = error.message || 'Pairing failed.'; }
     finally { syncPairButton(); }
@@ -37,8 +42,17 @@
       const head = document.createElement('div'); head.className = 'connection-head';
       const name = document.createElement('strong'); name.textContent = status.site;
       const label = document.createElement('span'); label.className = 'status';
-      label.textContent = !status.running ? 'One Brain is not running' : status.updateOneBrain ? 'Update One Brain' : status.updateExtension ? 'Update the extension' : status.status === 'approved' ? 'Connected' : status.status === 'pending' ? 'Waiting for approval' : status.paired ? status.status : 'Not paired';
-      head.append(name, label); card.append(head);
+      const labels = { paired: 'Paired', pending: 'Paired, waiting for approval in One Brain', blocked: 'Blocked in One Brain', 'no-token': 'No token stored', unauthorized: 'Unauthorized', 'rate-limited': 'Rate limited', unreachable: 'App not reachable', 'version-mismatch': 'Version mismatch' };
+      const reasonDisplay = status.reason ? globalThis.OneBrainAuthReasons?.authReasonDisplay(status.reason, status.site) : null;
+      label.textContent = reasonDisplay?.label || labels[status.status] || 'App not reachable';
+      const hint = document.createElement('small'); hint.className = 'status-hint';
+      hint.textContent = reasonDisplay?.hint || (status.status === 'paired' ? 'Fix: none needed.' : status.status === 'no-token' ? 'Fix: pair this site.' : status.status === 'unauthorized' ? 'Fix: pair again.' : status.status === 'version-mismatch' ? 'Fix: update One Brain.' : 'Fix: start One Brain and check the local API address.');
+      head.append(name, label); card.append(head, hint);
+      if (status.reason === 'origin_mismatch' && (status.expectedOrigin || status.receivedOrigin)) {
+        const origins = document.createElement('small'); origins.className = 'status-hint';
+        origins.textContent = `Expected origin: ${status.expectedOrigin || '(none)'} · Received origin: ${status.receivedOrigin || '(none)'}`;
+        card.append(origins);
+      }
       const current = await message({ type: 'get-settings', site: status.site });
       for (const [key, text, defaultValue] of [['enabled', 'Enable', true], ['showButtons', 'Show buttons', true], ['autoSaveMessages', 'Auto-save my messages', false]]) {
         const wrapper = document.createElement('label'); const input = document.createElement('input'); input.type = 'checkbox'; input.checked = current[key] ?? defaultValue;
@@ -64,7 +78,19 @@
       const quiet = document.createElement('label'); const quietInput = document.createElement('input'); quietInput.type = 'checkbox'; quietInput.checked = Boolean(current.insertWithoutAsking);
       quietInput.addEventListener('change', async () => { const settings = { ...current, insertWithoutAsking: quietInput.checked }; const result = await message({ type: 'set-site-settings', site: status.site, settings }); if (result?.ok) Object.assign(current, settings); else quietInput.checked = !quietInput.checked; });
       quiet.append(quietInput, document.createTextNode('Insert without asking (Auto only)')); card.append(quiet);
-      if (status.paired) {
+      if (status.reason === 'origin_mismatch') {
+        const footer = document.createElement('footer'); const relink = document.createElement('button'); relink.type = 'button'; relink.textContent = 'Re-link';
+        relink.addEventListener('click', async () => {
+          relink.disabled = true;
+          const result = await message({ type: 'relink', site: status.site });
+          if (!result?.ok) { label.textContent = result?.error || 'Re-link failed'; relink.disabled = false; return; }
+          siteSelect.value = status.site; codeInput.value = ''; syncPairButton();
+          pairError.textContent = `Generate a new pairing code in One Brain, then pair ${status.site}.`;
+          codeInput.focus();
+          await refresh();
+        });
+        footer.append(relink); card.append(footer);
+      } else if (status.paired) {
         const footer = document.createElement('footer'); const unpair = document.createElement('button'); unpair.textContent = 'Unpair';
         unpair.addEventListener('click', async () => { unpair.disabled = true; const result = await message({ type: 'unpair', site: status.site }); if (!result?.ok) { label.textContent = result?.error || 'Unpair failed'; unpair.disabled = false; } else await refresh(); });
         footer.append(unpair); card.append(footer);

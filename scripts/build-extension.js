@@ -2,10 +2,9 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { createHash, createPrivateKey, createPublicKey, generateKeyPairSync } = require('node:crypto');
 
-const root = path.resolve(__dirname, '..');
-const source = path.join(root, 'extension', 'src');
-const outputRoot = path.join(root, 'extension', 'dist');
+const ROOT = path.resolve(__dirname, '..');
 const hosts = ['http://127.0.0.1/*', 'https://chatgpt.com/*', 'https://claude.ai/*', 'https://gemini.google.com/*'];
 const contentScripts = [
   { matches: ['https://chatgpt.com/*'], js: ['src/adapters/chatgpt.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
@@ -13,7 +12,29 @@ const contentScripts = [
   { matches: ['https://gemini.google.com/*'], js: ['src/adapters/gemini.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' }
 ];
 
-function build(browser) {
+function chromeKey(keyDirectory) {
+  fs.mkdirSync(keyDirectory, { recursive: true, mode: 0o700 });
+  fs.chmodSync(keyDirectory, 0o700);
+  const privateKeyPath = path.join(keyDirectory, 'chrome.pem');
+  let privatePem;
+  try { privatePem = fs.readFileSync(privateKeyPath, 'utf8'); }
+  catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    const pair = generateKeyPairSync('rsa', { modulusLength: 2048, publicExponent: 0x10001 });
+    privatePem = pair.privateKey.export({ type: 'pkcs8', format: 'pem' });
+    fs.writeFileSync(privateKeyPath, privatePem, { mode: 0o600, flag: 'wx' });
+    fs.chmodSync(privateKeyPath, 0o600);
+  }
+  fs.chmodSync(privateKeyPath, 0o600);
+  const publicDer = createPublicKey(createPrivateKey(privatePem)).export({ type: 'spki', format: 'der' });
+  const id = createHash('sha256').update(publicDer).digest().subarray(0, 16)
+    .reduce((value, byte) => value + String.fromCharCode(97 + (byte >> 4), 97 + (byte & 0x0f)), '');
+  return { manifestKey: publicDer.toString('base64'), id };
+}
+
+function build(browser, { root = ROOT } = {}) {
+  const source = path.join(root, 'extension', 'src');
+  const outputRoot = path.join(root, 'extension', 'dist');
   const directory = path.join(outputRoot, browser);
   fs.rmSync(directory, { recursive: true, force: true });
   fs.mkdirSync(directory, { recursive: true });
@@ -28,10 +49,22 @@ function build(browser) {
     action: { default_title: 'One Brain', default_popup: 'src/popup.html' },
     content_scripts: contentScripts
   };
+  let extensionId = null;
   manifest.background = browser === 'chrome' ? { service_worker: 'src/background.js' } : { scripts: ['src/background.js'] };
+  if (browser === 'chrome') {
+    const key = chromeKey(path.join(root, 'extension', 'keys'));
+    manifest.key = key.manifestKey;
+    extensionId = key.id;
+  }
   if (browser === 'firefox') manifest.browser_specific_settings = { gecko: { id: 'one-brain-extension@one-brain.local' } };
   fs.writeFileSync(path.join(directory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+  return { directory, extensionId };
 }
 
-build('chrome');
-build('firefox');
+if (require.main === module) {
+  const chrome = build('chrome');
+  build('firefox');
+  console.info(`Chrome extension ID: ${chrome.extensionId}`);
+}
+
+module.exports = { build, chromeKey };
