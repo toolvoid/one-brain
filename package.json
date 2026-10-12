@@ -1,11 +1,18 @@
 {
   "name": "one-brain",
   "version": "1.2.0",
+  "description": "A local desktop app for saving and searching AI memories.",
+  "author": "One Brain",
+  "desktopName": "one-brain",
   "private": true,
   "main": "electron/main.js",
   "scripts": {
-    "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron . --ozone-platform=x11\"",
-    "postinstall": "electron-rebuild -f -w better-sqlite3-multiple-ciphers"
+    "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "build": "vite build",
+    "build:extension": "node scripts/build-extension.js",
+    "pack": "npm run build && npm run build:extension && electron-builder --dir",
+    "dist": "npm run build && npm run build:extension && electron-builder",
+    "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.3.1",
@@ -16,11 +23,30 @@
     "three": "^0.186.1"
   },
   "devDependencies": {
-    "@electron/rebuild": "^4.2.1",
     "@vitejs/plugin-react": "^6.1.2",
     "concurrently": "^10.0.5",
     "electron": "^44.6.0",
+    "electron-builder": "^26.15.3",
     "vite": "^8.3.3",
     "wait-on": "^9.5.1"
+  },
+  "build": {
+    "appId": "com.onebrain.desktop",
+    "productName": "One Brain",
+    "directories": { "output": "release" },
+    "files": ["!test/**", "!extension/**", "!scripts/**", "!README.md", "!AGENTS.md"],
+    "extraResources": [
+      { "from": "scripts/mcp-stdio.js", "to": "one-brain/scripts/mcp-stdio.js" },
+      { "from": "scripts/mcp-stdio-port.js", "to": "one-brain/scripts/mcp-stdio-port.js" },
+      { "from": "extension/dist", "to": "one-brain/extension" }
+    ],
+    "electronFuses": {
+      "runAsNode": true,
+      "enableNodeCliInspectArguments": false,
+      "enableNodeOptionsEnvironmentVariable": false
+    },
+    "linux": { "target": ["AppImage"], "category": "Utility", "syncDesktopName": true },
+    "mac": { "target": ["dmg", "zip"] },
+    "win": { "target": ["nsis"] }
   }
 }

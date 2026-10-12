@@ -11,7 +11,31 @@ npm install
 npm run dev
 ```
 
-The dev script starts Vite and Electron. On Linux it already passes Electron's `--ozone-platform=x11` flag. The Electron main process opens the SQLite database and starts the local MCP server.
+## Build the desktop app
+
+Create an unpacked app folder for the current operating system:
+
+```sh
+npm run pack
+```
+
+Create the platform's installers and browser-extension builds:
+
+```sh
+npm run dist
+```
+
+Desktop packages are written to `release/`. Build on each target operating system for its native installer. The packaged app includes the MCP stdio bridge and launches it with its bundled Electron runtime, so users do not need to install Node.js separately.
+
+## Build the browser extension
+
+```sh
+npm run build:extension
+```
+
+Load `extension/dist/chrome` as an unpacked extension in Chrome or `extension/dist/firefox` as a temporary/unpacked extension in Firefox. Keep `extension/keys/chrome.pem` private and backed up if you need to keep the same Chrome extension ID across rebuilds. After loading the extension, open its popup, choose a site, and pair it using the code shown in **Connections** in One Brain. Approve the new extension client in the app to finish pairing.
+
+The dev script starts Vite and Electron. The Electron main process opens the SQLite database and starts the local MCP server.
 
 ## Project structure
 
@@ -33,9 +57,9 @@ vite.config.mjs           Vite configuration
 
 ## Connect an AI client
 
-Start One Brain with `npm run dev` and open the gear icon's **Connect AI** section. The MCP server listens on `127.0.0.1` (port 3737 by default; if busy, it chooses and saves another port). The app creates a bearer token in Electron's user-data folder. The stdio bridge reads the token and selected port there; keep the token private and out of source control.
+Start One Brain with `npm run dev` and open **Settings → Connections**. The MCP server listens on `127.0.0.1` (port 3737 by default; if busy, it chooses and saves another port). The app creates a bearer token in Electron's user-data folder. The stdio bridge reads the token and selected port there; keep the token private and out of source control.
 
-Configure an MCP client to launch `scripts/mcp-stdio.js` with Node. Use the absolute path to this project on your machine.
+Use the **Connections** section in One Brain to detect, preview, and connect supported AI clients. The app configures each client to launch its local stdio bridge. Keep One Brain running while using a connected client; its authenticated MCP service listens only on `127.0.0.1`.
 
 Codex CLI (`~/.codex/config.toml`):
 
@@ -59,7 +83,9 @@ VS Code Copilot (`.vscode/mcp.json`):
 }
 ```
 
-The server provides `search_memories`, `get_memory`, `add_memory`, and `list_sources`. Alternatively, use the client-specific snippets in **Connect AI**; Claude Code can connect directly to the authenticated HTTP endpoint shown there.
+The server provides `search_memories`, `get_memory`, `add_memory`, and `list_sources`. Claude Code can also connect directly to the authenticated HTTP endpoint shown in **Connections**.
+
+The manual examples below are for connecting a development checkout. In a packaged app, use **Connections** so the client points to the installed bridge and its data directory.
 
 ## Troubleshooting
 

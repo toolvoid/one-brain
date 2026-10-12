@@ -23,6 +23,16 @@ let quickContextWindow = null;
 let quickContextShortcut = null;
 let quickContextRegistrationError = '';
 let connectionActivity = null;
+function connectorAppPath() {
+  return app.isPackaged ? path.join(process.resourcesPath, 'one-brain') : app.getAppPath();
+}
+function connectorEnvironment() {
+  return {
+    ...process.env,
+    ONE_BRAIN_BRIDGE_COMMAND: process.execPath,
+    ONE_BRAIN_USER_DATA: app.getPath('userData')
+  };
+}
 function getConnectorTokenStates() {
   return listClientTokenStates().map((item) => {
     try { return { ...item, file_mtime: fs.statSync(path.join(app.getPath('userData'), 'tokens', `${item.client.replaceAll(':', '~3a')}.token`)).mtimeMs }; }
@@ -153,7 +163,7 @@ ipcMain.handle('memories:search', async (_event, query, source, limit, offset, c
 });
 ipcMain.handle('memories:count-by-source', () => countBySource());
 ipcMain.handle('mcp:config', () => mcpConnection ? { endpoint: mcpConnection.config.endpoint, port: mcpConnection.config.port } : null);
-ipcMain.handle('connectors:list', () => connectors.discoverClients(app.getPath('home'), app.getAppPath(), listClients(), getConnectorTokenStates()));
+ipcMain.handle('connectors:list', () => connectors.discoverClients(app.getPath('home'), connectorAppPath(), listClients(), getConnectorTokenStates(), connectorEnvironment()));
 ipcMain.handle('connections:activity', (_event, client) => connectionActivity?.list(String(client || '').slice(0, 120)) || []);
 ipcMain.handle('connections:counts', () => Object.fromEntries(require('./connection-activity').CLIENTS.map((client) => [client, connectionActivity?.counts(client) || { searches: 0, saves: 0 }])));
 ipcMain.handle('connections:clear-activity', () => connectionActivity?.clear() || { cleared: false });
@@ -169,11 +179,12 @@ ipcMain.handle('connections:rotate-all', () => {
 ipcMain.handle('connections:rotate-preview', () => listClientTokenStates()
   .filter((item) => !item.revoked && connectors.CLIENTS.some((client) => client.id === item.client))
   .map((item) => ({ path: tokenPath(app.getPath('userData'), item.client), before: 'Current token will become invalid immediately.', after: 'Generate a replacement token. The token value is never displayed.', changed: true })));
-ipcMain.handle('connectors:preview', (_event, client) => connectors.previewClient(client, app.getPath('home'), app.getAppPath()));
+ipcMain.handle('connectors:preview', (_event, client) => connectors.previewClient(client, app.getPath('home'), connectorAppPath(), connectorEnvironment()));
 ipcMain.handle('connectors:connect', (_event, client) => {
-  if (!connectors.detectConnector(client, app.getPath('home'), app.getAppPath())) throw new Error(`${connectors.CLIENTS.find((item) => item.id === client)?.name || 'Client'} is not installed.`);
+  const appPath = connectorAppPath(); const env = connectorEnvironment();
+  if (!connectors.detectConnector(client, app.getPath('home'), appPath, env)) throw new Error(`${connectors.CLIENTS.find((item) => item.id === client)?.name || 'Client'} is not installed.`);
   createClientToken(app.getPath('userData'), client, storeClientTokenHash);
-  const files = connectors.connectClient(client, app.getPath('home'), app.getAppPath());
+  const files = connectors.connectClient(client, app.getPath('home'), appPath, env);
   connectionActivity?.add({ client: connectors.CLIENTS.find((item) => item.id === client)?.name, action: 'connect', ok: true });
   return files;
 });
@@ -183,19 +194,19 @@ ipcMain.handle('connectors:rotate-token', (_event, client) => {
   return result;
 });
 ipcMain.handle('connectors:test', (_event, client) => {
-  const result = connectors.testConnector(client, app.getAppPath(), app.getPath('userData'));
+  const result = connectors.testConnector(client, connectorAppPath(), app.getPath('userData'), connectorEnvironment());
   connectionActivity?.add({ client: connectors.CLIENTS.find((item) => item.id === client)?.name, action: 'test', ok: result.ok, reason: result.reason === 'One Brain app is not running.' ? 'app_not_running' : result.ok ? '' : 'request_failed' });
   return result;
 });
 ipcMain.handle('connectors:revoke-token', (_event, client) => revokeClientTokenFile(app.getPath('userData'), client, revokeClientToken));
-ipcMain.handle('connectors:disconnect-preview', (_event, client) => connectors.disconnectPreview(client, app.getPath('home'), app.getAppPath()));
+ipcMain.handle('connectors:disconnect-preview', (_event, client) => connectors.disconnectPreview(client, app.getPath('home'), connectorAppPath(), connectorEnvironment()));
 ipcMain.handle('connectors:disconnect', (_event, client) => {
-  const result = connectors.disconnectClient(client, app.getPath('home'), app.getAppPath());
+  const result = connectors.disconnectClient(client, app.getPath('home'), connectorAppPath(), connectorEnvironment());
   revokeClientTokenFile(app.getPath('userData'), client, revokeClientToken);
   connectionActivity?.add({ client: connectors.CLIENTS.find((item) => item.id === client)?.name, action: 'disconnect', ok: true });
   return result;
 });
-ipcMain.handle('connectors:snippet', (_event, client) => connectors.snippetFor(client, app.getAppPath()));
+ipcMain.handle('connectors:snippet', (_event, client) => connectors.snippetFor(client, connectorAppPath(), connectorEnvironment()));
 ipcMain.handle('embeddings:status', () => embeddingStatus);
 ipcMain.handle('embeddings:retry', async () => {
   ++embedderGeneration;
@@ -373,7 +384,7 @@ app.whenReady().then(async () => {
     for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:memory-proxy-ready', connection);
   } catch (error) { console.error('Could not start One Brain memory proxy:', error?.name || 'Error'); }
 
-  startMcpServer(app.getPath('userData'), app.getAppPath(), {
+  startMcpServer(app.getPath('userData'), connectorAppPath(), {
     searchMemoriesForClient, getEmbeddingVector: getMemoryEmbeddingVector,
     embedText: (text) => embedder?.embed(text) || Promise.reject(new Error('Local embedder is unavailable.')),
     listMemories, addMemory, connectionActivity
