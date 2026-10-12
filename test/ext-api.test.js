@@ -116,11 +116,25 @@ test('pairing and extension requests enforce the paired origin and loopback host
   response = await h.request('/ext/ping', { token });
   assert.equal(response.status, 200);
   const ping = await response.json();
-  assert.equal(ping.apiVersion, '1.1.0');
-  assert.equal(ping.appVersion, '1.1.0');
+  assert.equal(ping.apiVersion, '1.2.0');
+  assert.equal(ping.appVersion, '1.2.0');
   assert.equal(ping.paired, true);
   assert.equal(ping.approval, 'approved');
   assert.equal(response.headers.get('access-control-allow-origin'), h.origin);
+});
+
+test('DeepSeek and Groq pairing tokens can authenticate their extension endpoints', async (t) => {
+  const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
+  for (const site of ['deepseek', 'groq']) {
+    const token = await h.pair(site);
+    h.profiles.get(`ext:${site}`).status = 'approved';
+    const response = await h.request('/ext/ping', { site, token });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).site, site);
+    const layout = await h.request('/ext/layout-status', { site, token, method: 'POST', body: { matched: { input: true, send: false, messages: true, text: 'must not persist' } } });
+    assert.equal(layout.status, 200);
+    assert.equal(h.api.status().find((item) => item.site === site).layoutStatus.broken, true);
+  }
 });
 
 test('revoked extension tokens return a reason-coded 401', async (t) => {

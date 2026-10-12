@@ -46,6 +46,13 @@ function createMcpServer(identity, dependencies = {}) {
       recordEvent({ ...mcpActivityMetadata({ tool: name, client, identity: eventIdentity, source: outcome.source || args.source || null,
         resultCount: outcome.count ?? 0, latencyMs: Date.now() - startedAt, ok: !outcome.result?.isError,
         error: outcome.result?.isError ? 'Tool returned an error.' : null }), top_score: outcome.topScore ?? null }, outcome.ids || []);
+      const labels = { codex: 'Codex', vscode: 'VS Code Copilot', gemini: 'Gemini CLI', 'claude-code': 'Claude Code', 'claude-desktop': 'Claude Desktop' };
+      const normalized = String(client || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const activityClient = Object.entries(labels).find(([id]) => normalized.includes(id.replace(/[^a-z0-9]/g, '')))?.[1] || 'One Brain';
+      const isConnectionTest = identity.reportedName === 'one-brain-connection-test';
+      dependencies.connectionActivity?.add({ client: activityClient,
+        action: isConnectionTest ? 'test' : /^(?:search_memory|search_memories|list_recent|list_sources|get_memory)$/.test(name) ? 'search' : /^(?:save_memory|add_memory)$/.test(name) ? 'save' : 'test',
+        ok: !outcome.result?.isError, reason: outcome.result?.isError ? 'request_failed' : '' });
       return outcome.result;
     } catch (error) {
       recordEvent(mcpActivityMetadata({ tool: name, client, identity: eventIdentity, source: args.source || null,
@@ -267,6 +274,7 @@ function listen(port, token, dependencies) {
 
 async function startMcpServer(userDataPath, appPath, dependencies = {}) {
   fs.mkdirSync(userDataPath, { recursive: true });
+  try { fs.chmodSync(userDataPath, 0o700); } catch {}
   const tokenPath = path.join(userDataPath, 'mcp-token');
   let token;
   try { token = fs.readFileSync(tokenPath, 'utf8').trim(); } catch {}

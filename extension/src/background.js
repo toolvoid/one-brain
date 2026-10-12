@@ -1,7 +1,7 @@
 'use strict';
 
 const ONE_BRAIN_API_DEFAULT = 'http://127.0.0.1:3738';
-const ONE_BRAIN_SITES = ['chatgpt', 'claude', 'gemini'];
+const ONE_BRAIN_SITES = ['chatgpt', 'claude', 'gemini', 'deepseek', 'groq'];
 const ONE_BRAIN_MIN_API_VERSION = '1.1.0';
 const ONE_BRAIN_DEFAULT_PHRASES = ['remember', 'do you remember', 'last time', 'earlier', 'previously', 'about me', 'my memory', 'one brain', 'yaad', 'yaad hai', 'pichli baar', 'pehle', 'mere baare mein', 'meri memory', 'maine bataya tha', 'mera project', 'mera naam'];
 const extensionApi = globalThis.browser || globalThis.chrome;
@@ -80,8 +80,13 @@ extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === 'get-endpoint') return await storageGet('oneBrainEndpoint') || ONE_BRAIN_API_DEFAULT;
     if (message?.type === 'adapter-self-check-report' && ONE_BRAIN_SITES.includes(message.site)) {
       const checks = await storageGet('oneBrainSelfChecks') || {};
-      checks[message.site] = { matched: message.matched || {}, at: Date.now() };
+      const matched = { input: Boolean(message.matched?.input), send: Boolean(message.matched?.send), messages: Boolean(message.matched?.messages) };
+      checks[message.site] = { matched, at: Date.now() };
       await storageSet({ oneBrainSelfChecks: checks });
+      const tokens = await storageGet('oneBrainTokens') || {};
+      if (tokens[message.site]) {
+        try { await extensionRequest('/ext/layout-status', { method: 'POST', token: tokens[message.site], body: { matched } }); } catch {}
+      }
       return { ok: true };
     }
     if (message?.type === 'set-site-settings' && ONE_BRAIN_SITES.includes(message.site)) {

@@ -5,6 +5,7 @@
 .one-brain-extension-menu,.one-brain-chat-toggle { position:fixed!important; right:16px!important; padding:8px 12px!important; border:1px solid #6385a8!important; border-radius:8px!important; color:#eef6ff!important; background:#173452!important; box-shadow:0 4px 18px #0008!important; cursor:pointer!important; }
 .one-brain-extension-menu { bottom:16px!important; }
 .one-brain-chat-toggle { bottom:58px!important; }
+.one-brain-manual-context { position:fixed!important; right:16px!important; bottom:142px!important; padding:8px 12px!important; border:1px solid #6385a8!important; border-radius:8px!important; color:#eef6ff!important; background:#173452!important; box-shadow:0 4px 18px #0008!important; cursor:pointer!important; }
 .one-brain-remove-context { position:fixed!important; right:16px!important; bottom:100px!important; padding:7px 10px!important; border:1px solid #6385a8!important; border-radius:8px!important; color:#eef6ff!important; background:#173452!important; cursor:pointer!important; }
 .one-brain-extension-toast { position:fixed!important; z-index:2147483647!important; right:16px!important; bottom:62px!important; padding:9px 12px!important; border:1px solid #426b91!important; border-radius:8px!important; color:#eff7ff!important; background:#102237!important; font:12px system-ui,sans-serif!important; }
 .one-brain-extension-toast[data-error="true"] { border-color:#b45151!important; background:#381d24!important; }

@@ -9,8 +9,8 @@ const contextBlocks = require('../extension/src/context-blocks');
 const smartSave = require('../extension/src/smart-save');
 const { splitChatMessages, contentHash, looksSecret } = require('./ext-chat');
 
-const SITES = Object.freeze({ chatgpt: 'chatgpt', claude: 'claude', gemini: 'gemini' });
-const API_VERSION = '1.1.0';
+const SITES = Object.freeze({ chatgpt: 'chatgpt', claude: 'claude', gemini: 'gemini', deepseek: 'deepseek', groq: 'groq' });
+const API_VERSION = '1.2.0';
 const MIN_EXTENSION_VERSION = '1.1.0';
 const BODY_LIMIT = 2 * 1024 * 1024;
 const WINDOW_MS = 60_000;
@@ -83,7 +83,7 @@ function createExtApi(options) {
     return Object.keys(SITES).map((site) => {
       const profile = getClientProfile(`ext:${site}`);
       const active = Boolean(origins[site] && isTokenActive(`ext:${site}`));
-      return { site, paired: active, origin: origins[site]?.origin || null,
+      return { site, paired: active, origin: origins[site]?.origin || null, layoutStatus: origins[site]?.layoutStatus || null,
         label: origins[site]?.label || null, status: profile?.status || 'unpaired', active };
     });
   }
@@ -107,8 +107,8 @@ function createExtApi(options) {
     catch { throw Object.assign(new Error('Invalid JSON body.'), { status: 400 }); }
   }
 
-  function log(client, { ok, count = 0, error = null, latency = 0 } = {}, memoryIds = []) {
-    try { recordProxyEvent({ client, provider: 'extension', query: '', memories_injected: count, latency_ms: latency, ok, error }, memoryIds); } catch {}
+  function log(client, { ok, count = 0, error = null, latency = 0 } = {}, memoryIds = [], action = 'test') {
+    try { recordProxyEvent({ client, provider: 'extension', tool: action, query: '', memories_injected: count, latency_ms: latency, ok, error }, memoryIds); } catch {}
   }
 
   function authFailure(res, { reason, client, token, status, message, origin, expectedOrigin, receivedOrigin }) {
@@ -206,7 +206,7 @@ function createExtApi(options) {
     const auth = /^Bearer (.+)$/i.exec(req.headers.authorization || '');
     const suppliedToken = auth?.[1] || null;
     const identity = suppliedToken ? authenticateClientToken(suppliedToken) : null;
-    if (!identity || !/^ext:(chatgpt|claude|gemini)$/.test(identity.client)) {
+    if (!identity || !/^ext:(chatgpt|claude|gemini|deepseek|groq)$/.test(identity.client)) {
       const tokenState = suppliedToken ? getClientTokenState(suppliedToken) : null;
       const reason = tokenState?.revoked ? 'revoked' : 'unknown_token';
       return authFailure(res, { reason, client: tokenState?.client || identity?.client || 'ext:unknown', token: suppliedToken, status: 401,
@@ -237,6 +237,15 @@ function createExtApi(options) {
     }
     if (profile?.status === 'blocked') return authFailure(res, { reason: 'blocked', client: identity.client, token: suppliedToken, status: 403,
       message: 'This extension client is blocked in One Brain.', origin });
+    if (req.method === 'POST' && url.pathname === '/ext/layout-status') {
+      const body = await readJson(req);
+      const matched = body.matched && typeof body.matched === 'object' ? body.matched : {};
+      const safeMatched = { input: Boolean(matched.input), send: Boolean(matched.send), messages: Boolean(matched.messages) };
+      const latest = readOrigins();
+      latest[site] = { ...latest[site], layoutStatus: { broken: !safeMatched.input || !safeMatched.send, matched: safeMatched, at: new Date(now()).toISOString() } };
+      saveOrigins(latest);
+      return sendJson(res, 200, { ok: true }, origin);
+    }
     if (profile?.status !== 'approved') return authFailure(res, { reason: 'pending_approval', client: identity.client, token: suppliedToken, status: 403,
       message: 'Approve this extension in One Brain before using it.', origin });
     if (req.method === 'POST' && url.pathname === '/ext/unpair') {
@@ -256,7 +265,7 @@ function createExtApi(options) {
       const queryVector = typeof embedText === 'function' ? await embedText(query).catch(() => null) : null;
       const memories = await prepareSearchMemories({ query, memories: safeMemories, limit, excludeIds, getVector: getEmbeddingVector, queryVector, embedText, floor: 0.12 });
       emitRetrieved(memories.map((memory) => memory.id));
-      log(identity.client, { ok: true, count: memories.length, latency: now() - started }, memories.map((memory) => memory.id));
+      log(identity.client, { ok: true, count: memories.length, latency: now() - started }, memories.map((memory) => memory.id), 'search');
       return sendJson(res, 200, { memories }, origin);
     }
     if (req.method === 'POST' && url.pathname === '/ext/no-suggest') {
@@ -279,7 +288,7 @@ function createExtApi(options) {
       if (!cleanText || looksSecret(cleanText) || scored.reason === 'filtered') return sendJson(res, 400, { error: 'This text cannot be saved.' }, origin);
       const memory = addMemory({ source: site, title, content: cleanText }, { handAdded: true });
       if (memory?.id != null) emitAdded(memory.id);
-      log(identity.client, { ok: true, count: memory?.id == null ? 0 : 1, latency: now() - started }, memory?.id == null ? [] : [memory.id]);
+      log(identity.client, { ok: true, count: memory?.id == null ? 0 : 1, latency: now() - started }, memory?.id == null ? [] : [memory.id], 'save');
       return sendJson(res, 200, { ok: true, id: memory?.id ?? null, source: site }, origin);
     }
     if (req.method === 'POST' && url.pathname === '/ext/chat-save-state') {
@@ -327,7 +336,7 @@ function createExtApi(options) {
         const finished = finishImport(importId);
         const ids = imported.insertedIds || [];
         for (const id of ids) emitAdded(id);
-        log(identity.client, { ok: true, count: ids.length, latency: now() - started }, ids);
+        log(identity.client, { ok: true, count: ids.length, latency: now() - started }, ids, 'save');
         return sendJson(res, 200, { ok: true, inserted: imported.inserted, skippedDuplicates: skippedDuplicates + imported.skipped, skippedLogs: prepared.skippedLogs, skippedSecrets: prepared.skippedSecrets, ids, source: prepared.source, importId: finished?.id ?? null }, origin);
       } catch (error) {
         try { undoExtensionChatSave(importId, identity.client); } catch {}

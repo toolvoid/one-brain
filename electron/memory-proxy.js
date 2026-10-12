@@ -148,6 +148,29 @@ function createMemoryProxy(options) {
     else try { fs.rmSync(keysPath, { force: true }); } catch {}
     return { deleted: true };
   }
+
+  async function testProviderKey(provider, key = '') {
+    if (!['groq', 'deepseek'].includes(provider)) throw new Error('Key testing is available for Groq and DeepSeek.');
+    const candidate = String(key || '').trim() || savedKey(provider);
+    if (!candidate) return { ok: false, reason: 'Enter or save a key first.' };
+    const model = provider === 'groq' ? 'openai/gpt-oss-20b' : 'deepseek-flash';
+    try {
+      const response = await fetchImpl(`${providerUrls[provider]}/chat/completions`, {
+        method: 'POST', headers: providerHeaders(provider, candidate, true), signal: AbortSignal.timeout(15000),
+        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'Reply with one token.' }],
+          ...(provider === 'groq' ? { max_completion_tokens: 1 } : { max_tokens: 1 }), stream: false })
+      });
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) return { ok: false, reason: `Key rejected or model access denied (HTTP ${response.status}).` };
+        if (response.status === 429) return { ok: false, reason: 'Provider rate limit reached (HTTP 429).' };
+        if (response.status === 404) return { ok: false, reason: `Provider model or endpoint unavailable (HTTP ${response.status}).` };
+        return { ok: false, reason: `Provider request failed (HTTP ${response.status}).` };
+      }
+      return { ok: true, reason: 'Key accepted.' };
+    } catch (error) {
+      return { ok: false, reason: error?.name === 'TimeoutError' || error?.name === 'AbortError' ? 'Provider request timed out.' : 'Could not reach the provider.' };
+    }
+  }
   function updateSettings(patch = {}) {
     const current = readSettings();
     const next = { ...current };
@@ -440,7 +463,7 @@ function createMemoryProxy(options) {
     return { server, port, endpoint: `http://127.0.0.1:${port}` };
   }
 
-  return { start, publicSettings, saveKey, deleteKey, updateSettings, handle, listModels, generateMemoryTitle, chatCompletion };
+  return { start, publicSettings, saveKey, deleteKey, testProviderKey, updateSettings, handle, listModels, generateMemoryTitle, chatCompletion };
 }
 
 module.exports = { PROVIDERS, PROVIDER_URLS, MEMORY_HEADER, requestQuery, appendMemoryMessage, createMemoryProxy };

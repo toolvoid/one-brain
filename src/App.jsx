@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import BrainGraph from './components/BrainGraph.jsx';
-import { MAX_IMPORT_ITEMS, isLogLikeChunk, parseImportText } from './lib/importers.js';
+import { MAX_IMPORT_ITEMS, isLogLikeChunk, parseImportText, parseImportFile, inferImportSource } from './lib/importers.js';
+import '../extension/src/smart-save.js';
 import { fallbackMemoryTitle, heuristicMemoryTitle, isChatModel, memorySourceForProvider } from './lib/chat-models.mjs';
 import { DEFAULT_LINK_VISIBILITY, graphLinkCounts, visibleGraphLinks } from './lib/graph-links.mjs';
 import { JOIN_ALL_MIN } from './lib/link-constants.json';
 import { runLinkMutation } from './lib/link-actions.mjs';
 import { multilineKeyAction } from './lib/multiline-key-action.mjs';
+import { buildConnectionRows, summarizeConnectionHealth, createConnectAllPlan, runConfirmedConnectAll } from './lib/connections-dashboard.mjs';
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 const SOURCE_COLORS = {
@@ -163,7 +165,11 @@ function ProviderKeysPanel({ clients }) {
   const [extensions, setExtensions] = useState([]);
   const [pairCode, setPairCode] = useState(null);
   const [extensionError, setExtensionError] = useState('');
+  const [quickSettings, setQuickSettings] = useState(null);
+  const [quickError, setQuickError] = useState('');
+  const [keyTests, setKeyTests] = useState({});
   useEffect(() => { window.brain.getMemoryProxySettings().then(setSettings).catch(() => setNotice('Proxy settings are unavailable.')); }, []);
+  useEffect(() => { window.brain.getQuickContextSettings().then((value) => { setQuickSettings(value); setQuickError(value.error || ''); }).catch(() => setQuickError('Quick context settings are unavailable.')); }, []);
   useEffect(() => { window.brain.getExtensionStatus().then(setExtensions).catch((error) => setExtensionError(error.message || 'Extension status is unavailable.')); }, [clients]);
   async function makePairCode() {
     try { setPairCode(await window.brain.createExtensionPairCode()); setExtensionError(''); }
@@ -190,12 +196,30 @@ function ProviderKeysPanel({ clients }) {
       setSettings(await window.brain.getMemoryProxySettings());
     } catch (error) { setNotice(error.message || 'Could not save provider key.'); }
   }
+  async function testKey(provider) {
+    setKeyTests((current) => ({ ...current, [provider]: { loading: true } }));
+    try { const result = await window.brain.testProviderKey(provider, keys[provider] || ''); setKeyTests((current) => ({ ...current, [provider]: { ok: result.ok, reason: result.reason } })); }
+    catch (error) { setKeyTests((current) => ({ ...current, [provider]: { ok: false, reason: error.message || 'Key test failed.' } })); }
+  }
+  async function saveQuickSettings() {
+    try { const result = await window.brain.updateQuickContextSettings(quickSettings); setQuickSettings(result); setQuickError(result.error || ''); }
+    catch (error) { setQuickError(error.message || 'Could not register this shortcut.'); }
+  }
   if (!settings) return <section className="clients-settings"><h2>Provider keys</h2><p className="empty-note">Loading proxy settings…</p></section>;
   return <section className="clients-settings proxy-settings">
     <header><h2>Provider keys</h2><small>Keys are encrypted locally and never read back into the UI.</small></header>
     <p className="connect-hint">Use <code>{settings.endpoint || 'http://127.0.0.1:3738'}/v1/&lt;provider&gt;</code> as base_url and this client’s One Brain token as api_key.</p>
-    {PROXY_PROVIDERS.map((provider) => <article className="proxy-key-row" key={provider}><label>{provider}<input type="password" autoComplete="new-password" value={keys[provider] || ''} onChange={(event) => setKeys((current) => ({ ...current, [provider]: event.target.value }))} placeholder={settings.providerKeyStatus?.[provider] ? 'Key saved' : 'Paste provider key'} /></label><button type="button" onClick={() => void save(provider)} disabled={!keys[provider]}>Save</button>{settings.providerKeyStatus?.[provider] && <button type="button" onClick={async () => { await window.brain.deleteProviderKey(provider); setSettings(await window.brain.getMemoryProxySettings()); }}>Remove</button>}</article>)}
+    {PROXY_PROVIDERS.map((provider) => <article className="proxy-key-row" key={provider}>
+      <label>{provider}<input type="password" autoComplete="new-password" value={keys[provider] || ''} onChange={(event) => setKeys((current) => ({ ...current, [provider]: event.target.value }))} placeholder={settings.providerKeyStatus?.[provider] ? 'Key saved' : 'Paste provider key'} /></label>
+      <div className="proxy-key-actions">
+        <button type="button" onClick={() => void save(provider)} disabled={!keys[provider]}>Save</button>
+        {['groq', 'deepseek'].includes(provider) && <button type="button" onClick={() => void testKey(provider)} disabled={keyTests[provider]?.loading || (!keys[provider] && !settings.providerKeyStatus?.[provider])}>{keyTests[provider]?.loading ? 'Testing…' : 'Test key'}</button>}
+        {settings.providerKeyStatus?.[provider] && <button type="button" onClick={async () => { await window.brain.deleteProviderKey(provider); setSettings(await window.brain.getMemoryProxySettings()); }}>Remove</button>}
+        {keyTests[provider] && !keyTests[provider].loading && <small role="status">{keyTests[provider].ok ? 'Pass' : 'Fail'} · {keyTests[provider].reason}</small>}
+      </div>
+    </article>)}
     <section className="extension-pair-card"><header><h3>Browser extension</h3><button type="button" onClick={() => void makePairCode()}>Pair</button></header><p className="connect-hint">Enter the code and local API address in the One Brain extension popup. New sites appear here for approval and source grants.</p>{pairCode && <p className="extension-pair-code" role="status">Pairing code <strong>{pairCode.code}</strong> · expires in 2 minutes<br />API address <code>{pairCode.endpoint}</code></p>}{extensions.map((item) => <article className="extension-site-row" key={item.site}><span><strong>{item.site}</strong><small>{item.active ? (item.status === 'approved' ? 'Connected' : 'Waiting for approval') : 'Not paired'}{item.origin ? ` · ${item.origin}` : ''}</small></span>{item.paired && <><button type="button" onClick={() => void rotateExtension(item.site)}>Rotate</button><button type="button" onClick={() => void revokeExtension(item.site)}>Revoke</button></>}</article>)}{extensionError && <p role="alert" className="empty-note">{extensionError}</p>}</section>
+    {quickSettings && <section className="extension-pair-card"><header><h3>Quick context</h3></header><p className="connect-hint">Open a small always-on-top context search from any app. The question is searched locally and is not logged.</p><label className="proxy-setting"><input type="checkbox" checked={quickSettings.enabled} onChange={(event) => setQuickSettings((current) => ({ ...current, enabled: event.target.checked }))} />Enable global shortcut</label><label className="proxy-setting">Shortcut<input value={quickSettings.shortcut} onChange={(event) => setQuickSettings((current) => ({ ...current, shortcut: event.target.value }))} placeholder="Control+Shift+Space" /></label><button type="button" onClick={() => void saveQuickSettings()}>Save shortcut</button>{quickError && <p role="alert" className="empty-note">{quickError}</p>}</section>}
     <h3>Memory injection</h3>
     <label className="proxy-setting"><input type="checkbox" checked={settings.enabled} onChange={(event) => void update({ enabled: event.target.checked })} />Enabled</label>
     <label className="proxy-setting"><input type="checkbox" checked={settings.dryRun} onChange={(event) => void update({ dryRun: event.target.checked })} />Dry run (measure retrieval, send unchanged request)</label>
@@ -205,6 +229,101 @@ function ProviderKeysPanel({ clients }) {
     <label className="proxy-setting">Cheap model<input value={settings.saveBackModel || ''} onChange={(event) => setSettings((value) => ({ ...value, saveBackModel: event.target.value }))} onBlur={() => void update({ saveBackModel: settings.saveBackModel })} /></label>
     {clients.filter((client) => client.verified).map((client) => <label className="proxy-setting" key={client.client}><input type="checkbox" checked={Boolean(settings.saveBackClients?.[client.client])} onChange={(event) => void update({ saveBackClients: { [client.client]: event.target.checked } })} />Allow save-back candidates for {client.client}</label>)}
     {notice && <p className="empty-note" role="status">{notice}</p>}
+  </section>;
+}
+
+function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContext, activity, counts, mcpConfig, onRefresh, onConnect, onDisconnect, onTest, onConnectAll, onRotateAll }) {
+  const [tab, setTab] = useState('connections');
+  const [filter, setFilter] = useState('');
+  const [notice, setNotice] = useState('');
+  const [pairCode, setPairCode] = useState(null);
+  const [testResults, setTestResults] = useState(null);
+  const [selectedConnection, setSelectedConnection] = useState(null);
+  const rows = buildConnectionRows({ mcp, clients, extensions, providers, quickContext, activity, counts });
+  const health = summarizeConnectionHealth(rows);
+  const filteredActivity = activity.filter((event) => !filter || event.client === filter);
+  useEffect(() => {
+    if (!selectedConnection) return undefined;
+    const close = () => setSelectedConnection(null);
+    const onKeyDown = (event) => { if (event.key === 'Escape') close(); };
+    const onVisibility = () => { if (document.visibilityState === 'hidden') close(); };
+    window.addEventListener('blur', close);
+    document.addEventListener('keydown', onKeyDown);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('blur', close);
+      document.removeEventListener('keydown', onKeyDown);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [selectedConnection]);
+  const relative = (value) => {
+    if (!value) return '—';
+    const ms = Date.now() - Date.parse(value);
+    if (!Number.isFinite(ms) || ms < 0) return new Date(value).toLocaleString();
+    const mins = Math.floor(ms / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins} min ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours} hr ago`;
+    return `${Math.floor(hours / 24)} days ago`;
+  };
+  async function connect(row) {
+    if (row.type.includes('MCP')) return onConnect(row.id);
+    if (row.site) {
+      try { setPairCode(await window.brain.createExtensionPairCode()); setNotice(`Pair ${row.name} with this one-time code.`); }
+      catch (error) { setNotice(error.message || 'Could not create a pairing code.'); }
+      return;
+    }
+    setNotice(row.manual ? 'Configure the Quick context shortcut in the settings below.' : 'Add the provider key in the settings below.');
+    document.querySelector('.proxy-settings')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+  async function testOne(row) {
+    let result;
+    if (row.type.includes('MCP')) result = await onTest(row.id);
+    else if (row.site) {
+      const item = extensions.find((entry) => entry.site === row.site);
+      result = { ok: Boolean(item?.paired && item.status === 'approved' && !item.layoutStatus?.broken), reason: item?.paired ? item.status === 'approved' ? item.layoutStatus?.broken ? 'Selectors broken; use Manual context.' : 'Extension pairing is active.' : 'Extension needs approval.' : 'Extension site is not paired.' };
+      await window.brain.logConnectionActivity({ client: row.name, action: 'test', ok: result.ok, reason: result.ok ? '' : item?.layoutStatus?.broken ? 'selectors_broken' : 'not_paired' });
+    } else if (row.provider) {
+      try { result = await window.brain.testProviderKey(row.provider, ''); await window.brain.logConnectionActivity({ client: row.name, action: 'test', ok: result.ok, reason: result.ok ? '' : 'invalid_key' }); }
+      catch (error) { result = { ok: false, reason: error.message || 'Key test failed.' }; }
+    } else {
+      result = { ok: Boolean(quickContext.enabled && quickContext.registered), reason: quickContext.enabled && quickContext.registered ? `Quick context is active on ${quickContext.shortcut}.` : 'Quick context hotkey is disabled or unavailable.' };
+      await window.brain.logConnectionActivity({ client: row.name, action: 'test', ok: result.ok, reason: result.ok ? '' : 'needs_restart' });
+    }
+    await onRefresh();
+    setNotice(`${row.name}: ${result.ok ? 'Pass' : 'Fail'} · ${result.reason}`);
+    return result;
+  }
+  async function testAll() {
+    setNotice('Testing connections…');
+    const results = [];
+    for (const row of rows) results.push({ name: row.name, ...await testOne(row) });
+    setTestResults(results);
+    setNotice(`Tested ${results.length} connections · ${results.filter((item) => item.ok).length} passed, ${results.filter((item) => !item.ok).length} failed.`);
+    await onRefresh();
+  }
+  async function openSite(row) {
+    const urls = { claude: 'https://claude.ai', chatgpt: 'https://chatgpt.com', gemini: 'https://gemini.google.com', deepseek: 'https://chat.deepseek.com', groq: 'https://console.groq.com/playground' };
+    if (row.site && urls[row.site]) window.open(urls[row.site], '_blank', 'noopener,noreferrer');
+  }
+  return <section className="connections-dashboard">
+    <header className="connections-header"><div><h2>Connections</h2><p>Connection status, capabilities and recent usage.</p></div><button type="button" onClick={() => void onRefresh()}>Refresh</button></header>
+    <div className="connection-health"><strong>{health.healthy} of {health.total} connections healthy</strong>{health.broken.length > 0 && <small>{health.broken.map((row) => `${row.name}: ${row.reason}`).join(' · ')}</small>}</div>
+    <nav className="connection-tabs"><button type="button" aria-pressed={tab === 'connections'} onClick={() => setTab('connections')}>Connections</button><button type="button" aria-pressed={tab === 'activity'} onClick={() => setTab('activity')}>Activity log</button><button type="button" onClick={() => void onConnectAll()}>Connect all detected</button><button type="button" onClick={() => void testAll()}>Test all</button></nav>
+    {notice && <p className="connection-notice" role="status">{notice}</p>}
+    {pairCode && <p className="extension-pair-code" role="status">Pairing code <strong>{pairCode.code}</strong> · expires in 2 minutes<br />API address <code>{pairCode.endpoint}</code></p>}
+    {testResults && <div className="connection-test-results">{testResults.map((result) => <small key={result.name}>{result.name}: {result.ok ? 'Pass' : 'Fail'} · {result.reason}</small>)}</div>}
+    {tab === 'connections' ? <>
+      <div className="connection-compact-list">{rows.map((row) => <article className="connection-compact-row" key={row.id}>
+        <div className="connection-compact-heading"><div><strong>{row.name}</strong><small className="connection-type">{row.type}</small></div><span className={`connection-status ${row.status.toLowerCase().replaceAll(' ', '-')}`}>{row.status}</span></div>
+        {row.reason && <small className="connection-compact-reason">{row.reason}</small>}
+        <div className="connection-compact-meta"><span>{row.lastActivity ? `${row.lastActivity.action} ${relative(row.lastActivity.time)}` : 'No activity'}</span><span>{row.counts.searches} searches · {row.counts.saves} saves today</span></div>
+        <button type="button" className="connection-details-button" onClick={() => setSelectedConnection(row)}>View details</button>
+      </article>)}</div>
+      <section className="connection-security"><h3>Security</h3><p>Stdio bridge: loopback listener at <code>127.0.0.1:{mcpConfig?.port || '—'}</code>. Every request requires a valid client token.</p><button type="button" onClick={onRotateAll}>Rotate token</button></section>
+    </> : <section className="connection-activity"><header><h3>Recent activity (up to 200 events)</h3><label>Filter by client<select value={filter} onChange={(event) => setFilter(event.target.value)}><option value="">All clients</option>{[...new Set(activity.map((event) => event.client))].sort().map((client) => <option key={client}>{client}</option>)}</select></label><button type="button" onClick={async () => { await window.brain.clearConnectionActivity(); await onRefresh(); }}>Clear log</button></header>{filteredActivity.map((event) => <article key={`${event.time}-${event.client}-${event.action}`}><time>{new Date(event.time).toLocaleString()}</time><strong>{event.client}</strong><span>{event.action}</span><span>{event.ok ? 'OK' : 'Fail'}</span><small>{event.reason || '—'}</small></article>)}{filteredActivity.length === 0 && <p className="empty-note">No connection activity yet.</p>}</section>}
+    {selectedConnection && createPortal(<div className="connection-window-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedConnection(null); }}><section className="connection-detail-window" role="dialog" aria-modal="true" aria-labelledby="connection-detail-title"><header><div><h2 id="connection-detail-title">{selectedConnection.name}</h2><small>{selectedConnection.type}</small></div><button type="button" aria-label="Close connection details" onClick={() => setSelectedConnection(null)}>×</button></header><div className="connection-detail-status"><span className={`connection-status ${selectedConnection.status.toLowerCase().replaceAll(' ', '-')}`}>{selectedConnection.status}</span><p>{selectedConnection.reason || 'No issues reported.'}</p></div><section className="connection-detail-works"><h3>Works</h3>{['Search', 'Save', 'Auto-insert'].map((feature) => <div key={feature}><strong>{selectedConnection.work[feature].supported ? '✓' : '—'} {feature}</strong>{!selectedConnection.work[feature].supported && <small>{selectedConnection.work[feature].reason || 'Not supported'}</small>}</div>)}</section><div className="connection-detail-activity"><strong>Last activity</strong><span>{selectedConnection.lastActivity ? `${selectedConnection.lastActivity.action} ${relative(selectedConnection.lastActivity.time)}` : 'No activity yet'}</span><strong>Today</strong><span>{selectedConnection.counts.searches} searches · {selectedConnection.counts.saves} saves</span></div><footer><button type="button" onClick={() => void connect(selectedConnection)}>Connect</button><button type="button" onClick={() => void onDisconnect(selectedConnection)}>Disconnect</button><button type="button" onClick={() => void testOne(selectedConnection)}>Test connection</button>{selectedConnection.site && <button type="button" onClick={() => void openSite(selectedConnection)}>Open site</button>}</footer></section></div>, document.body)}
   </section>;
 }
 
@@ -482,6 +601,7 @@ function ChatView({ onBack, onManageProviders, onOpenMemory, memoryTitles }) {
 
 function connectorPreviewText(edit) {
   if (edit.path.startsWith('Local token for ') || edit.path.startsWith('Secure token for ') || edit.path.startsWith('Copyable setup for ')) return edit.after;
+  if (edit.path.endsWith('.token')) return edit.after;
   if (edit.path.endsWith('AGENTS.md') || edit.path.endsWith('GEMINI.md')) {
     const match = edit.after.match(/<!-- ONE-BRAIN:BEGIN -->[\s\S]*?<!-- ONE-BRAIN:END -->/);
     return match ? match[0] : 'Remove the marked One Brain instruction block.';
@@ -507,13 +627,18 @@ function normalizeImportedContent(content) {
   return String(content || '').normalize('NFKC').replace(/\r\n?/g, '\n').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
-function readFileText(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ''));
-    reader.onerror = () => reject(new Error('Could not read this file.'));
-    reader.readAsText(file);
-  });
+function importItemsWithFilters(allItems, { skipLogs = true, smart = false } = {}) {
+  const sourceItems = Array.isArray(allItems) ? allItems : [];
+  const logSkipped = sourceItems.filter((item) => isLogLikeChunk(item.content)).length;
+  let items = skipLogs ? sourceItems.filter((item) => !isLogLikeChunk(item.content)) : sourceItems;
+  let smartDropped = 0;
+  if (smart && globalThis.OneBrainSmartSave?.prepareSmartSave) {
+    const result = globalThis.OneBrainSmartSave.prepareSmartSave(items.map((item, index) => ({ id: String(index), role: 'user', text: item.content })), { importance: 'Normal' });
+    const kept = new Set(result.kept.map((item) => Number(item.id)));
+    smartDropped = result.droppedCount;
+    items = items.filter((_item, index) => kept.has(index));
+  }
+  return { items, logSkipped, smartDropped };
 }
 
 function App() {
@@ -560,6 +685,8 @@ function App() {
   const [importPrivate, setImportPrivate] = useState(false);
   const [importFile, setImportFile] = useState(null);
   const [importText, setImportText] = useState('');
+  const [importSmart, setImportSmart] = useState(false);
+  const [importChunkSize, setImportChunkSize] = useState(1200);
   const [includeAssistant, setIncludeAssistant] = useState(false);
   const [skipLogText, setSkipLogText] = useState(true);
   const [conversationPartCount, setConversationPartCount] = useState(0);
@@ -591,6 +718,11 @@ function App() {
   const [sqlRunning, setSqlRunning] = useState(false);
   const [mcpConfig, setMcpConfig] = useState(null);
   const [connectorCards, setConnectorCards] = useState([]);
+  const [connectionActivity, setConnectionActivity] = useState([]);
+  const [connectionCounts, setConnectionCounts] = useState({});
+  const [extensionConnectionSites, setExtensionConnectionSites] = useState([]);
+  const [providerConnectionSettings, setProviderConnectionSettings] = useState({ providerKeyStatus: {} });
+  const [quickConnectionSettings, setQuickConnectionSettings] = useState({ enabled: false, registered: false });
   const [connectorAction, setConnectorAction] = useState(null);
   const [connectorSnippet, setConnectorSnippet] = useState(null);
   const [copied, setCopied] = useState('');
@@ -702,6 +834,16 @@ function App() {
     setConnectorCards(rows); return rows;
   }
 
+  async function refreshConnectionDashboard() {
+    const [mcp, profiles, extensions, providerSettings, quick, activity, counts] = await Promise.all([
+      window.brain.listConnectors(), window.brain.listClients(), window.brain.getExtensionStatus(),
+      window.brain.getMemoryProxySettings(), window.brain.getQuickContextSettings(), window.brain.listConnectionActivity(), window.brain.getConnectionCounts()
+    ]);
+    setConnectorCards(mcp); setClients(profiles); setExtensionConnectionSites(extensions);
+    setProviderConnectionSettings(providerSettings); setQuickConnectionSettings(quick); setConnectionActivity(activity); setConnectionCounts(counts);
+    setMcpConfig(await window.brain.getMcpConfig());
+  }
+
   async function refreshMcpConfig() {
     setMcpConfigLoading(true); setMcpConfigError(false);
     try { setMcpConfig(await window.brain.getMcpConfig()); }
@@ -726,9 +868,53 @@ function App() {
     setConnectorAction({ operation: 'disconnect', client, files });
   }
 
+  async function connectAllDetected() {
+    const plan = createConnectAllPlan(connectorCards);
+    if (!plan.clients.length) { window.alert('No detected MCP clients need a connection.'); return; }
+    setConnectorAction({ operation: 'connect-all', ...plan });
+  }
+
+  async function previewRotateAllTokens() {
+    const files = await window.brain.previewConnectionTokenRotation();
+    if (!files.length) { window.alert('No active MCP client tokens to rotate.'); return; }
+    setConnectorAction({ operation: 'rotate-all', client: null, files });
+  }
+
+  async function disconnectConnection(row) {
+    if (row.type.includes('MCP')) return previewDisconnectConnector(row.id);
+    if (row.site) {
+      if (!window.confirm(`Disconnect ${row.name} and revoke its extension token?`)) return;
+      try { await window.brain.revokeExtension(row.site); await refreshConnectionDashboard(); }
+      catch (error) { window.alert(error.message || 'Could not disconnect the extension.'); }
+      return;
+    }
+    if (row.manual) {
+      try { await window.brain.updateQuickContextSettings({ enabled: false }); await refreshConnectionDashboard(); }
+      catch (error) { window.alert(error.message || 'Could not disable Quick context.'); }
+      return;
+    }
+    if (row.provider && window.confirm(`Remove the saved ${row.provider} API key?`)) {
+      try { await window.brain.deleteProviderKey(row.provider); await refreshConnectionDashboard(); }
+      catch (error) { window.alert(error.message || 'Could not remove provider key.'); }
+    }
+  }
+
+  async function testMcpConnection(client) {
+    try {
+      const result = await window.brain.testConnector(client);
+      await refreshConnectionDashboard();
+      return result;
+    } catch (error) { return { ok: false, reason: error.message || 'Connection test failed.' }; }
+  }
+
   async function confirmConnectorAction() {
     if (!connectorAction) return;
-    if (connectorAction.operation === 'connect') {
+    if (connectorAction.operation === 'rotate-all') {
+      const result = await window.brain.rotateConnectionTokens();
+      window.alert(`Rotated ${result.rotated} MCP client tokens. Reconnect each MCP client.`);
+    } else if (connectorAction.operation === 'connect-all') {
+      await runConfirmedConnectAll(connectorAction, { confirmed: true, write: (client) => window.brain.connectConnector(client) });
+    } else if (connectorAction.operation === 'connect') {
       await window.brain.connectConnector(connectorAction.client);
       const client = connectorCards.find((item) => item.id === connectorAction.client);
       if (client?.kind === 'snippet') {
@@ -739,7 +925,7 @@ function App() {
     else if (connectorAction.operation === 'revoke-token') await window.brain.revokeConnectorToken(connectorAction.client);
     else await window.brain.disconnectConnector(connectorAction.client);
     setConnectorAction(null);
-    await Promise.all([refreshConnectors(), refreshClients()]);
+    await Promise.all([refreshConnectors(), refreshClients(), refreshConnectionDashboard()]);
   }
 
   async function showConnectorSnippet(client, operation = 'connect') {
@@ -758,6 +944,7 @@ function App() {
 
   function openConnectSettings() {
     setConnectOpen(true);
+    void refreshConnectionDashboard().catch(() => {});
     void refreshConnectors().catch(() => {});
     void refreshClients().then((rows) => {
       const pending = rows.find((client) => client.status === 'pending');
@@ -1089,12 +1276,16 @@ function App() {
     try {
       const pasted = importText.trim();
       if (!pasted && !importFile) throw new Error('Choose a file or paste conversation text first.');
-      const rawText = pasted ? importText : await readFileText(importFile);
       const fileName = pasted ? 'Pasted text.txt' : importFile.name;
-      const parsed = parseImportText(rawText, fileName, includeAssistant, skipLogText);
+      const parsed = pasted ? parseImportText(importText, fileName, includeAssistant, skipLogText, importChunkSize) : await parseImportFile(importFile, includeAssistant, skipLogText, importChunkSize);
       if (parsed.error) throw new Error(parsed.error);
-      const items = parsed.items.map((item) => ({ ...item, source: importSource }));
-      setImportParsed({ ...parsed, items, allItems: (parsed.allItems || parsed.items).map((item) => ({ ...item, source: importSource })) });
+      const detectedSource = parsed.detectedSource || inferImportSource(fileName);
+      const effectiveSource = SOURCES.includes(detectedSource) ? detectedSource : importSource;
+      if (effectiveSource !== importSource) setImportSource(effectiveSource);
+      const allItems = parsed.allItems || parsed.items;
+      const filtered = importItemsWithFilters(allItems, { skipLogs: skipLogText, smart: importSmart });
+      const items = filtered.items.map((item) => ({ ...item, source: effectiveSource }));
+      setImportParsed({ ...parsed, detectedSource, items, allItems: allItems.map((item) => ({ ...item, source: effectiveSource })), logSkipped: filtered.logSkipped, smartDropped: filtered.smartDropped, total: items.length });
       setConfirmLargeImport(false);
       if (!parsed.total) setImportError('No importable chunks found. Chunks shorter than 40 characters are skipped.');
     } catch (error) {
@@ -1107,9 +1298,8 @@ function App() {
     setSkipLogText(checked);
     setImportParsed((current) => {
       if (!current?.allItems) return current;
-      const logSkipped = current.allItems.filter((item) => isLogLikeChunk(item.content)).length;
-      const items = checked ? current.allItems.filter((item) => !isLogLikeChunk(item.content)) : current.allItems;
-      return { ...current, items, total: items.length, logSkipped };
+      const filtered = importItemsWithFilters(current.allItems, { skipLogs: checked, smart: importSmart });
+      return { ...current, items: filtered.items, total: filtered.items.length, logSkipped: filtered.logSkipped, smartDropped: filtered.smartDropped };
     });
   }
 
@@ -1219,32 +1409,12 @@ function App() {
         <header className="sidebar-header"><strong>One Brain</strong><nav aria-label="Main views"><button title="Open Chat" type="button" onClick={() => { setInsightsOpen(false); setChatOpen(true); }}>Chat</button><button title="Open Insights" type="button" onClick={openInsights}>Insights</button><button title="Pending memories" type="button" onClick={() => { setPendingOpen(true); setConnectOpen(false); void refreshPendingMemories().catch(() => {}); }}>Pending ({pendingMemories.length})</button><button title="Settings" aria-label="Settings" type="button" onClick={openConnectSettings}>⚙</button></nav></header>
         {pendingOpen ? <><header className="detail-header"><button className="back-button" type="button" onClick={() => setPendingOpen(false)}>‹</button><span>Pending memories</span></header><PendingMemoryInbox items={pendingMemories} onRefresh={refreshPendingMemories} loading={pendingLoading} loadError={pendingLoadError} /></> : connectOpen ? (
           <section className="connect-view">
-            <header className="detail-header"><button className="back-button" type="button" onClick={() => setConnectOpen(false)}>‹</button><span>Connect AI</span>{suggestions.length > 0 && <button className="header-suggestions" type="button" onClick={() => { setConnectOpen(false); setSuggestionsOpen(true); }}>Suggestions ({suggestions.length})</button>}</header>
+            <header className="detail-header"><button className="back-button" type="button" onClick={() => setConnectOpen(false)}>‹</button><span>Connections</span>{suggestions.length > 0 && <button className="header-suggestions" type="button" onClick={() => { setConnectOpen(false); setSuggestionsOpen(true); }}>Suggestions ({suggestions.length})</button>}</header>
+            <ConnectionsDashboard mcp={connectorCards} clients={clients} extensions={extensionConnectionSites} providers={providerConnectionSettings} quickContext={quickConnectionSettings} activity={connectionActivity} counts={connectionCounts} mcpConfig={mcpConfig} onRefresh={refreshConnectionDashboard} onConnect={(id) => previewConnector(id)} onDisconnect={disconnectConnection} onTest={testMcpConnection} onConnectAll={connectAllDetected} onRotateAll={previewRotateAllTokens} />
             {mcpConfig ? <>
-              <h1>One Brain MCP</h1>
-              <p className="connect-hint">Your local MCP server is ready for AI clients on this device.</p>
-              <p className="connect-hint mcp-port-status">Listening on port <strong>{mcpConfig.port}</strong></p>
-              <label className="connect-field">Endpoint<code>{mcpConfig.endpoint}</code></label>
               {embeddingStatus.state === 'error' && <section className="clients-settings embedding-retry-card"><header><h2>Semantic search model</h2><button type="button" onClick={() => void retryEmbedding()} disabled={embeddingRetrying}>{embeddingRetrying ? 'Retrying…' : 'Retry'}</button></header><p>{embeddingStatus.message}</p></section>}
-              <section className="clients-settings">
-                <header><h2>Connect AI</h2><button type="button" onClick={() => { void refreshConnectors(); }}>Refresh</button></header>
-                {connectorCards.map((client) => <article className="connector-card" key={client.id}>
-                  <div className="client-heading"><strong>{client.name}</strong><span className={`client-status ${client.status}`}>{client.status}</span></div>
-                  <small>Last seen {dateLabel(client.lastSeen) || '—'}</small>
-                  <small>Token: {client.tokenStatus || 'none'}</small>
-                  {client.configError && <small className="import-error">{client.configError}</small>}
-                  <div className="connector-actions">
-                    <button type="button" disabled={Boolean(client.configError)} onClick={() => void previewConnector(client.id)}>Connect</button>
-                    <button type="button" onClick={() => void previewDisconnectConnector(client.id)}>Disconnect</button>
-                    {client.tokenStatus === 'active' && <button type="button" onClick={() => setConnectorAction({ operation: 'rotate-token', client: client.id, files: [{ path: `Secure token for ${client.name}`, before: '', after: 'Generate a new private token. The old token becomes invalid immediately; the token value is never shown.', changed: true }] })}>Rotate token</button>}
-                    {client.tokenStatus === 'active' && <button type="button" onClick={() => setConnectorAction({ operation: 'revoke-token', client: client.id, files: [{ path: `Secure token for ${client.name}`, before: '', after: 'Revoke this client token immediately and remove its private token file.', changed: true }] })}>Revoke</button>}
-                    {client.kind === 'snippet' && <button type="button" disabled={client.tokenStatus !== 'active'} onClick={() => void copyConnectorSnippet(client.id)}>Copy</button>}
-                  </div>
-                  {connectorSnippet?.client === client.id && <div className="connector-snippet"><strong>{connectorSnippet.operation === 'connect' ? 'Copy into the client' : 'Remove One Brain from the client'}</strong><pre>{connectorSnippet.snippet}</pre><button type="button" onClick={() => copyText(connectorSnippet.snippet, `connector-${client.id}`)}>{copied === `connector-${client.id}` ? 'Copied' : 'Copy snippet'}</button></div>}
-                </article>)}
-              </section>
               <ProviderKeysPanel clients={clients} />
-            </> : <ChannelNotice channel="Connect AI settings" loading={mcpConfigLoading} error={mcpConfigError || (!mcpConfigLoading && !mcpConfig)} onRetry={() => void refreshMcpConfig()} />}
+            </> : <ChannelNotice channel="Connection settings" loading={mcpConfigLoading} error={mcpConfigError || (!mcpConfigLoading && !mcpConfig)} onRetry={() => void refreshMcpConfig()} />}
             <section className="clients-settings">
               <header><h2>Connected AIs</h2><button type="button" onClick={() => { void refreshClients(); }}>Refresh</button></header>
               {clients.map((client) => <article className="client-card" key={client.client}>
@@ -1378,13 +1548,13 @@ function App() {
           </>
         )}
       </aside>
-      {!insightsOpen && !chatOpen && <button className="sidebar-toggle" type="button" aria-label={sidebarCollapsed ? 'Expand memories sidebar' : 'Collapse memories sidebar'} aria-expanded={!sidebarCollapsed} onClick={() => setSidebarCollapsed((collapsed) => !collapsed)} style={{ left: sidebarCollapsed ? 32 : 'min(360px, 92vw)' }}>{sidebarCollapsed ? '›' : '‹'}</button>}
+      {!insightsOpen && !chatOpen && <button className="sidebar-toggle" type="button" aria-label={sidebarCollapsed ? 'Expand memories sidebar' : 'Collapse memories sidebar'} aria-expanded={!sidebarCollapsed} onClick={() => setSidebarCollapsed((collapsed) => !collapsed)} style={{ left: sidebarCollapsed ? 0 : 'min(440px, calc(100vw - 42px))' }}>{sidebarCollapsed ? '›' : '‹'}</button>}
       {suggestionToast && <button className="suggestion-toast" type="button" onClick={() => { setSuggestionToast(false); setSuggestionsOpen(true); }}>1 possible link found - Review</button>}
       {linkErrorToast && <button className="suggestion-toast" role="alert" type="button" onClick={() => setLinkErrorToast('')}>{linkErrorToast} · Dismiss</button>}
 
       {privacyNoticeOpen && createPortal(<div className="modal-backdrop notice-backdrop"><section className="consent-modal" role="dialog" aria-modal="true" aria-labelledby="provider-notice-title"><h2 id="provider-notice-title">Privacy notice</h2><p>When a cloud AI reads a memory through One Brain, that text is sent to that AI's provider.</p><button className="save-button" type="button" onClick={dismissPrivacyNotice}>Got it</button></section></div>, document.body)}
 
-      {connectorAction && createPortal(<div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setConnectorAction(null); }}><section className="connector-confirm" role="dialog" aria-modal="true" aria-labelledby="connector-confirm-title"><header><h2 id="connector-confirm-title">Confirm {connectorAction.operation}</h2><button type="button" aria-label="Close" onClick={() => setConnectorAction(null)}>×</button></header><p>Review the One Brain changes for {connectorCards.find((item) => item.id === connectorAction.client)?.name || connectorAction.client}.</p><div className="connector-preview-list">{connectorAction.files.map((edit) => <article key={edit.path}><strong>{edit.path}</strong><small>{edit.changed ? 'Will change' : 'Already up to date'}</small><pre>{connectorPreviewText(edit)}</pre></article>)}</div><footer><button type="button" className="cancel-button" onClick={() => setConnectorAction(null)}>Cancel</button><button type="button" className="save-button" onClick={() => void confirmConnectorAction()}>Confirm {connectorAction.operation}</button></footer></section></div>, document.body)}
+      {connectorAction && createPortal(<div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setConnectorAction(null); }}><section className="connector-confirm" role="dialog" aria-modal="true" aria-labelledby="connector-confirm-title"><header><h2 id="connector-confirm-title">Confirm {connectorAction.operation}</h2><button type="button" aria-label="Close" onClick={() => setConnectorAction(null)}>×</button></header><p>Review the One Brain changes for {connectorCards.find((item) => item.id === connectorAction.client)?.name || connectorAction.client || 'all affected connections'}.</p><div className="connector-preview-list">{connectorAction.files.map((edit) => <article key={edit.path}><strong>{edit.path}</strong><small>{edit.changed ? 'Will change' : 'Already up to date'}</small><pre>{connectorPreviewText(edit)}</pre></article>)}</div><footer><button type="button" className="cancel-button" onClick={() => setConnectorAction(null)}>Cancel</button><button type="button" className="save-button" onClick={() => void confirmConnectorAction()}>Confirm {connectorAction.operation}</button></footer></section></div>, document.body)}
 
       {pendingClient && !privacyNoticeOpen && createPortal(<div className="modal-backdrop"><section className="consent-modal" role="dialog" aria-modal="true" aria-labelledby="client-consent-title"><header><h2 id="client-consent-title">Approve connected AI</h2></header><p><strong>{pendingClient}</strong> is waiting to connect.</p><fieldset><legend>May read these sources</legend>{SOURCES.map((source) => <label className="consent-source" key={source}><input type="checkbox" checked={pendingReadSources.includes(source)} onChange={(event) => setPendingReadSources((current) => event.target.checked ? [...current, source] : current.filter((item) => item !== source))} />{source}</label>)}</fieldset><label className="consent-write-source">Write memories as<select value={pendingWriteSource} onChange={(event) => setPendingWriteSource(event.target.value)}>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label><footer><button type="button" className="client-block" onClick={handleBlockClient}>Block</button><button type="button" className="save-button" onClick={handleApproveClient}>Approve</button></footer></section></div>, document.body)}
 
@@ -1403,13 +1573,17 @@ function App() {
           </> : <>
             <label>Target source<select value={importSource} onChange={(event) => { setImportSource(event.target.value); setImportParsed(null); setImportSummary(''); setConfirmLargeImport(false); }}>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label>
             <label className="import-check"><input type="checkbox" checked={importPrivate} onChange={(event) => setImportPrivate(event.target.checked)} />Mark all as private</label>
-            <label>Conversation file<input type="file" accept=".json,.txt,.md,application/json,text/plain,text/markdown" onChange={(event) => { setImportFile(event.target.files?.[0] || null); setImportText(''); setImportParsed(null); setImportSummary(''); setImportError(''); setConfirmLargeImport(false); }} /></label>
+            <label>Conversation file<input type="file" accept=".json,.txt,.md,.zip,application/json,text/plain,text/markdown,application/zip" onChange={(event) => { setImportFile(event.target.files?.[0] || null); setImportText(''); setImportParsed(null); setImportSummary(''); setImportError(''); setConfirmLargeImport(false); }} /></label>
             <label className="import-check"><input type="checkbox" checked={includeAssistant} onChange={(event) => { setIncludeAssistant(event.target.checked); setImportParsed(null); setConfirmLargeImport(false); }} />Include assistant replies</label>
             <label className="import-check"><input type="checkbox" checked={skipLogText} onChange={(event) => { toggleSkipLogText(event.target.checked); setConfirmLargeImport(false); }} />Skip terminal/log text</label>
+            <label className="import-check"><input type="checkbox" checked={importSmart} onChange={(event) => { const checked = event.target.checked; setImportSmart(checked); setImportParsed((current) => { if (!current?.allItems) return current; const filtered = importItemsWithFilters(current.allItems, { skipLogs: skipLogText, smart: checked }); return { ...current, items: filtered.items.map((item) => ({ ...item, source: importSource })), total: filtered.items.length, logSkipped: filtered.logSkipped, smartDropped: filtered.smartDropped }; }); }} />Apply Smart mode filters</label>
+            <label>Split size<select value={importChunkSize} onChange={(event) => { setImportChunkSize(Number(event.target.value)); setImportParsed(null); setConfirmLargeImport(false); }}><option value="1200">Up to 1,200 characters</option><option value="600">Up to 600 characters</option></select></label>
             <label>Or paste raw text<textarea rows="4" placeholder="Paste conversation text here..." value={importText} onChange={(event) => { setImportText(event.target.value); if (event.target.value) setImportFile(null); setImportParsed(null); setImportSummary(''); setConfirmLargeImport(false); }} /></label>
             {importParsed && <section className="import-preview">
               <strong>Preview</strong>
+              {importParsed.detectedSource && <p>Detected source: {importParsed.detectedSource} · change Target source above to override.</p>}
               {skipLogText && importParsed.logSkipped > 0 && <p>{importParsed.logSkipped} chunks look like logs and will be skipped</p>}
+              {importSmart && <p>Smart mode dropped {importParsed.smartDropped || 0} low-importance chunks.</p>}
               <p>{importParsed.total} chunks after skipping · {importDuplicateCount} look like duplicates</p>
               {importParsed.rawTotal > 1500 && <label className="large-import-check"><input type="checkbox" checked={confirmLargeImport} onChange={(event) => setConfirmLargeImport(event.target.checked)} />I understand this is a large import</label>}
               {importParsed.capped && <p className="import-warning">Import is capped at {MAX_IMPORT_ITEMS.toLocaleString()} chunks; only the first {MAX_IMPORT_ITEMS.toLocaleString()} will be imported.</p>}
@@ -1431,7 +1605,7 @@ function App() {
       <style>{`
         html, body, #root { width:100%;height:100%;margin:0;overflow:hidden; }
         .memory-app { position:relative;width:100vw;height:100vh;background:#05070f;color:#e8edf7;font:13px/1.45 system-ui,sans-serif; }
-        .memory-panel { box-sizing:border-box;position:absolute;z-index:5;inset:0 auto 0 0;width:min(360px,92vw);padding:16px 15px;overflow-y:auto;background:rgba(9,13,22,.96);border-right:1px solid rgba(175,195,224,.17);backdrop-filter:blur(16px);transition:transform 250ms ease; }
+        .memory-panel { box-sizing:border-box;position:absolute;z-index:5;inset:0 auto 0 0;width:min(440px,calc(100vw - 42px));padding:16px 15px;overflow-y:auto;background:rgba(9,13,22,.96);border-right:1px solid rgba(175,195,224,.17);backdrop-filter:blur(16px);transition:transform 250ms ease; }
         .sidebar-header { display:flex;align-items:center;justify-content:space-between;margin:0 0 13px;padding:0 1px;color:#edf3fc;font-size:14px; }
         .sidebar-header button,.sql-toggle,.run-sql-button { border:1px solid rgba(143,196,255,.25);border-radius:6px;padding:6px 10px;color:#c7e1ff;background:#182a40;font:11px system-ui,sans-serif;cursor:pointer; }
         .database-load-error { display:grid;gap:7px;margin:0 0 10px;padding:9px;border:1px solid rgba(255,140,140,.32);border-radius:7px;color:#ffc1bd;background:rgba(78,29,34,.35);font-size:10px;overflow-wrap:anywhere; }.database-load-error button { justify-self:start;border:1px solid rgba(255,170,160,.25);border-radius:5px;padding:5px 7px;color:#ffe0dc;background:#40252c;font:10px system-ui,sans-serif;cursor:pointer; }
@@ -1521,8 +1695,9 @@ function App() {
         .sql-error { margin:10px 0 0;color:#ff9292;font-size:11px; }
         .run-sql-card .insight-table-wrap { margin-top:12px; }
         @media(max-width:620px) { .insights-view { padding:16px 12px 30px; }.insights-grid { grid-template-columns:1fr; }.insight-card { padding:11px; }.insight-bar-row { grid-template-columns:95px 1fr 24px;gap:5px; }.evaluation-add { flex-wrap:wrap; }.evaluation-add label { flex-basis:100%; } }
-        .memory-panel.is-collapsed { transform:translateX(calc(-100% + 34px)); }
-        .sidebar-toggle { position:absolute;z-index:8;top:50%;transform:translate(-50%,-50%);width:26px;height:54px;padding:0;border:1px solid rgba(175,195,224,.26);border-radius:0 9px 9px 0;color:#c9d9ef;background:rgba(20,29,45,.92);font:23px/1 system-ui,sans-serif;cursor:pointer;transition:left 250ms ease; }
+        .memory-panel.is-collapsed { transform:translateX(-100%); }
+        .sidebar-toggle { position:absolute;z-index:8;top:50%;transform:translateY(-50%);width:28px;height:54px;padding:0;border:1px solid rgba(175,195,224,.26);border-radius:0 9px 9px 0;color:#d6e3ed;background:#17232e;font:23px/1 system-ui,sans-serif;cursor:pointer;transition:left 250ms ease,background .16s,border-color .16s; }
+        .sidebar-toggle:hover { border-color:#54817e;background:#1a302f; }
         .search-row { display:flex;gap:8px; }
         .suggestions-button { flex:0 0 auto;border:1px solid rgba(85,199,189,.35);border-radius:7px;padding:0 8px;color:#a7e2dc;background:rgba(31,92,88,.24);font:10px system-ui,sans-serif;white-space:nowrap;cursor:pointer; }
         .suggestions-button:hover { background:rgba(31,92,88,.4); }
@@ -1642,6 +1817,19 @@ function App() {
         .connector-preview-list small { color:#92a3b8;font-size:9px; }
         .connector-preview-list pre,.connector-snippet pre { max-height:190px;overflow:auto;margin:0;padding:9px;border:1px solid rgba(175,195,224,.13);border-radius:6px;color:#c7d4e5;background:#080e18;font:10px/1.45 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text; }
         .connector-confirm footer { justify-content:flex-end; }
+        .connections-dashboard { display:grid;gap:10px;margin:8px 0 18px;min-width:0; }
+        .connections-header,.connection-tabs,.connection-security,.connection-activity header { display:flex;align-items:center;justify-content:space-between;gap:8px; }
+        .connections-header h2,.connection-security h3,.connection-activity h3 { margin:0;color:#e5edf8;font-size:13px; }.connections-header p { margin:3px 0 0;color:#8d9bb0;font-size:10px; }
+        .connections-dashboard button { border:1px solid rgba(143,196,255,.22);border-radius:5px;padding:5px 7px;color:#c7e1ff;background:#182a40;font:9px system-ui,sans-serif;cursor:pointer; }
+        .connection-health { display:grid;gap:4px;padding:9px;border:1px solid rgba(111,198,146,.26);border-radius:7px;background:rgba(34,91,58,.16);color:#b9efcc;font-size:11px; }.connection-health small { color:#f0b5ae;font-size:9px; }
+        .connection-tabs { justify-content:flex-start;flex-wrap:wrap; }.connection-tabs button[aria-pressed=true] { color:#fff;background:#314d71; }
+        .connection-notice,.connection-test-results { margin:0;padding:7px;border:1px solid rgba(143,196,255,.18);border-radius:6px;color:#cad8eb;background:#121e30;font-size:10px; }.connection-test-results { display:grid;gap:4px; }
+        .connection-compact-list { display:grid;gap:7px;min-width:0; }.connection-compact-row { display:grid;gap:6px;min-width:0;padding:9px;border:1px solid rgba(175,195,224,.14);border-radius:7px;background:rgba(15,24,37,.7); }.connection-compact-heading { display:flex;align-items:flex-start;justify-content:space-between;gap:7px; }.connection-compact-heading > div { display:grid;gap:3px;min-width:0; }.connection-compact-heading strong { color:#e2eaf5;font-size:11px;overflow-wrap:anywhere; }.connection-compact-reason { color:#f0b5ae;font-size:9px;line-height:1.4; }.connection-compact-meta { display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap;color:#91a0b4;font-size:9px; }.connection-details-button { justify-self:start; }
+        .connection-type { color:#91a4bb!important; }.connection-status { display:inline-block;padding:3px 5px;border-radius:5px;color:#d7e4f4;background:#26364d;font-size:9px;white-space:nowrap; }.connection-status.connected,.connection-status.paired { color:#b7f0ca;background:#173b2c; }.connection-status.broken,.connection-status.selectors-broken,.connection-status.needs-reconnect,.connection-status.needs-restart { color:#ffcbc3;background:#48272a; }.connection-status.not-installed,.connection-status.not-paired,.connection-status.not-connected { color:#d1d6df;background:#343b49; }
+        .connection-works { display:grid;gap:4px;min-width:180px; }.connection-works span { color:#b9c9dc; }.connection-works span:first-letter { color:#9ce0b9; }.connection-works small { display:block;padding-left:14px;color:#8393a7;font-size:8px; }
+        .connection-security,.connection-activity { display:grid;gap:7px;padding:9px;border:1px solid rgba(175,195,224,.14);border-radius:7px;background:rgba(15,24,37,.7); }.connection-security p { margin:0;color:#aab9cb;font-size:10px;line-height:1.5; }.connection-security code { color:#cde3ff; }
+        .connection-window-backdrop { position:fixed;z-index:1200;inset:0;display:grid;place-items:center;padding:16px;background:rgba(3,7,13,.68); }.connection-detail-window { display:grid;gap:13px;width:min(620px,100%);max-height:min(84vh,780px);overflow:auto;padding:18px;border:1px solid rgba(143,196,255,.3);border-radius:12px;background:#111a28;box-shadow:0 20px 70px rgba(0,0,0,.5);color:#dce6f2; }.connection-detail-window > header { display:flex;justify-content:space-between;align-items:flex-start;gap:12px; }.connection-detail-window h2 { margin:0;color:#eef5ff;font-size:17px; }.connection-detail-window header small { display:block;margin-top:4px;color:#91a4bb;font-size:10px; }.connection-detail-window header button { font-size:16px; }.connection-detail-status p { margin:7px 0 0;color:#aab9cb;font-size:11px;line-height:1.5; }.connection-detail-works { display:grid;gap:7px; }.connection-detail-works h3 { margin:0;color:#e2eaf5;font-size:12px; }.connection-detail-works > div { display:grid;gap:3px;padding:8px;border:1px solid rgba(175,195,224,.12);border-radius:6px;background:rgba(255,255,255,.025);font-size:11px; }.connection-detail-works small { color:#91a0b4;font-size:9px; }.connection-detail-activity { display:grid;grid-template-columns:auto 1fr;gap:7px 12px;color:#aab9cb;font-size:10px; }.connection-detail-activity strong { color:#e2eaf5; }.connection-detail-window footer { display:flex;gap:6px;flex-wrap:wrap; }
+        .connection-activity header { flex-wrap:wrap; }.connection-activity header label { display:flex;align-items:center;gap:5px;color:#aab9cb;font-size:9px; }.connection-activity article { display:grid;grid-template-columns:1fr 1fr 1fr 35px 1fr;gap:6px;padding:6px 0;border-top:1px solid rgba(175,195,224,.1);color:#c6d2e2;font-size:9px; }.connection-activity article small,.connection-activity time { color:#8697ad;font-size:8px; }
         .client-card { display:grid;gap:8px;margin-top:10px;padding:10px;border:1px solid rgba(175,195,224,.14);border-radius:8px;background:rgba(20,29,43,.45); }
         .client-heading { display:flex;justify-content:space-between;gap:8px;color:#e1eaf6;font-size:11px; }
         .client-heading strong { overflow-wrap:anywhere; }
@@ -1831,6 +2019,93 @@ function App() {
         select,select option { color:var(--text)!important;background:var(--panel)!important;color-scheme:dark; }.channel-load-notice,.embedding-error,.chat-error { color:#f3c977!important;font-size:13px!important; }.embedding-status { display:none!important; }
         .brain-tooltip { color:var(--text)!important;background:#111827!important;border-color:var(--border)!important;box-shadow:none!important; }
         @media (max-width:700px) { .sidebar-header nav { grid-template-columns:repeat(2,minmax(0,1fr)); }.chat-layout { grid-template-columns:minmax(0,1fr)!important;grid-template-rows:minmax(115px,25vh) minmax(0,1fr)!important; }.chat-controls { flex-wrap:wrap!important; }.new-chat-controls > * { flex:1 1 180px; } }
+        /* Product-wide visual system */
+        :root { --bg:#0b0f16;--panel:#111720;--panel-raised:#151e29;--border:#263241;--text:#e8edf4;--muted:#9aa8b8;--accent:#71c7c0;--warning:#e9bb69; }
+        html,body,#root { min-height:100%;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+        body { letter-spacing:.005em;-webkit-font-smoothing:antialiased; }
+        .memory-app,.chat-view,.insights-view { background:var(--bg)!important; }
+        .memory-panel { box-sizing:border-box;width:min(440px,calc(100vw - 42px))!important;padding:20px 19px 24px!important;border-right:1px solid var(--border)!important;background:linear-gradient(180deg,#121923 0%,#0f151e 100%)!important; }
+        .sidebar-header { gap:13px!important;margin-bottom:16px!important; }
+        .sidebar-header > strong { font-size:16px!important;letter-spacing:-.025em;color:#f2f6fa!important; }
+        .sidebar-header nav { gap:7px!important; }
+        .sidebar-header button { min-height:34px!important;border:1px solid #293647!important;border-radius:8px!important;background:#171f2a!important;color:#b9c6d4!important;font-size:11px!important;transition:background .16s,border-color .16s,color .16s; }
+        .sidebar-header button:hover,.connections-dashboard button:hover,.clients-settings button:hover,.detail-actions button:hover { border-color:#46615f!important;background:#1b2a31!important;color:#e6fffb!important; }
+        .search-row { margin:12px 0 10px!important; }
+        .search-row input,.picker input,.add-modal input,.add-modal select,.add-modal textarea { border:1px solid #2a3746!important;border-radius:9px!important;background:#0d131b!important;color:var(--text)!important; }
+        .search-row input:focus,.picker input:focus,.add-modal input:focus,.add-modal textarea:focus { border-color:#65aaa6!important;box-shadow:0 0 0 3px rgba(99,184,177,.12)!important;outline:0; }
+        .add-button,.settings-button { border:1px solid #334252!important;border-radius:9px!important;background:#18232e!important;color:#d4e2e7!important;transition:all .16s; }
+        .add-button:hover,.settings-button:hover { border-color:#65aaa6!important;background:#1c302f!important; }
+        .source-filters { gap:6px!important;margin:11px 0 8px!important; }
+        .filter-chip,.semantic-toggle { min-height:29px;padding:5px 9px!important;border:1px solid #293544!important;background:#121a24!important;color:#aab7c5!important;font-size:10px!important;transition:all .15s; }
+        .filter-chip.is-selected,.semantic-toggle.is-on { border-color:#477b79!important;background:#19302f!important;color:#a9e4de!important; }
+        .result-list { gap:3px!important;margin-top:10px!important; }
+        .result-item { min-height:55px;padding:9px 8px!important;border:1px solid transparent!important;border-radius:9px!important;transition:background .15s,border-color .15s; }
+        .result-item:hover,.result-item[aria-current=true] { border-color:#283a47!important;background:#141e29!important; }
+        .result-copy strong { font-size:12px!important;font-weight:600!important; }
+        .result-copy small { color:#95a4b4!important;font-size:10px!important; }
+        .detail-header { gap:10px!important;margin:0 0 20px!important;padding-bottom:12px;border-bottom:1px solid var(--border);font-size:12px!important;font-weight:600;color:#d6e0e9!important; }
+        .back-button { width:32px!important;height:32px!important;border:1px solid #2a3848!important;border-radius:9px!important;background:#17212c!important;color:#d9e5ed!important; }
+        .detail-view h1 { margin:11px 0 16px!important;font-size:20px!important;line-height:1.35!important;letter-spacing:-.02em; }
+        .detail-content { font-size:13px!important;line-height:1.75!important;color:#d0d9e2!important; }
+        .detail-actions { flex-wrap:wrap;gap:7px!important;margin:18px 0 22px!important; }
+        .detail-actions button,.section-heading button,.save-button,.connections-dashboard button,.clients-settings > header button,.proxy-key-row button,.extension-pair-card button,.pending-memory-inbox button { min-height:32px;border:1px solid #304052!important;border-radius:8px!important;padding:7px 10px!important;background:#192532!important;color:#d5e2ed!important;font:11px system-ui,sans-serif!important;transition:all .15s; }
+        .detail-actions .danger-button,.evaluation-table .evaluation-delete { border-color:#553637!important;background:#2a1d21!important;color:#efb4af!important; }
+        .detail-links,.related-section { margin-top:18px;padding-top:14px;border-color:var(--border)!important; }
+        .detail-links h2,.related-section h2 { font-size:12px!important;color:#e2e9ef!important; }
+        .linked-item,.related-item,.picker-result { border-color:#273442!important;border-radius:8px!important;background:#121a23!important; }
+        .connect-view,.pending-memory-inbox,.suggestions-view { padding-bottom:16px; }
+        .connections-dashboard,.clients-settings,.client-card,.pending-memory-inbox article,.suggestion-card,.insight-card,.evaluation-panel,.connection-security,.connection-activity,.extension-pair-card { border:1px solid #283442!important;border-radius:11px!important;background:#111821!important; }
+        .clients-settings { box-sizing:border-box;width:100%;min-width:0;margin-top:16px!important;padding:14px!important; }
+        .connections-dashboard { gap:12px!important;padding:12px!important; }
+        .connections-header h2,.clients-settings h2,.insight-card h2 { font-size:14px!important;letter-spacing:-.01em; }
+        .connections-header p,.clients-settings > header small { color:#9aa8b8!important;font-size:10px!important; }
+        .connection-health { border:1px solid #31564f!important;border-radius:9px!important;background:#13241f!important;color:#bce5d3!important; }
+        .connection-tabs { gap:6px!important;padding-bottom:8px;border-bottom:1px solid var(--border); }
+        .connection-tabs button[aria-pressed=true] { border-color:#477b79!important;background:#19302f!important;color:#b8ece7!important; }
+        .connection-compact-row,.client-card,.pending-memory-inbox article,.suggestion-card { border-color:#2a3745!important;border-radius:10px!important;background:#141c26!important; }
+        .connection-compact-row { padding:11px!important; }
+        .connection-status { border-radius:999px!important;padding:4px 8px!important;font-size:9px!important;font-weight:650;letter-spacing:.02em; }
+        .connection-detail-window,.add-modal,.chat-grant-modal,.consent-modal,.connector-confirm { border:1px solid #344352!important;border-radius:14px!important;background:#121a24!important;box-shadow:0 24px 80px rgba(0,0,0,.55)!important; }
+        .connection-detail-window { padding:22px!important; }
+        .connection-window-backdrop,.modal-backdrop { backdrop-filter:blur(5px);background:rgba(3,7,12,.72)!important; }
+        .proxy-key-row { box-sizing:border-box;display:grid;grid-template-columns:minmax(0,1fr);align-items:stretch!important;gap:8px;width:100%;min-width:0;padding:12px 0;border-bottom:1px solid var(--border); }
+        .proxy-key-row label { box-sizing:border-box;display:grid;grid-column:1;min-width:0;width:100%;gap:6px;color:#b8c5d2;font-size:10px;font-weight:550; }
+        .proxy-key-row input { box-sizing:border-box;display:block;width:100%;max-width:100%;min-width:0; }
+        .proxy-key-actions { display:flex;grid-column:1;align-items:center;justify-content:flex-start;gap:7px;min-width:0;width:100%;flex-wrap:wrap; }
+        .proxy-key-actions button { min-width:0;white-space:nowrap; }
+        .proxy-key-actions small { flex-basis:100%;min-width:0;overflow-wrap:anywhere;text-align:left; }
+        .proxy-key-row input,.proxy-setting input:not([type=checkbox]),.proxy-setting select,.clients-settings select { min-height:34px!important;border:1px solid #2d3a49!important;border-radius:8px!important;background:#0d141c!important;color:var(--text)!important; }
+        .proxy-settings { gap:10px!important;overflow-wrap:anywhere; }
+        .proxy-settings > h3 { margin:8px 0 0!important;padding-top:12px;border-top:1px solid var(--border);font-size:11px!important;letter-spacing:.02em; }
+        .proxy-settings .connect-hint { margin:0;padding:9px 10px;border:1px solid #263544;border-radius:8px;background:#0f161f;line-height:1.55; }
+        .proxy-setting { min-height:36px;padding:5px 0;border-bottom:1px solid rgba(38,50,65,.65); }
+        .extension-pair-card { padding:12px!important; }
+        .extension-site-row { gap:8px!important;padding:8px 0!important; }
+        .client-card { padding:12px!important; }
+        .client-card fieldset { border-color:#2b3948!important;border-radius:8px; }
+        .pending-memory-inbox article { padding:12px!important; }
+        .insights-view { padding:28px clamp(16px,4vw,54px)!important; }
+        .insights-header { max-width:1500px;margin-bottom:22px!important; }
+        .insights-header h1 { font-size:25px!important;letter-spacing:-.03em; }
+        .insight-card { padding:16px!important; }
+        .insight-card > header { padding-bottom:10px;border-bottom:1px solid var(--border); }
+        .insight-stat strong { font-size:32px!important;letter-spacing:-.04em; }
+        .evaluation-add input,.evaluation-note input,.run-sql-card textarea,.chat-compose textarea { border:1px solid #2d3a49!important;border-radius:9px!important;background:#0d141c!important;color:var(--text)!important; }
+        .evaluation-table th { color:#aebdca!important; }
+        .evaluation-table td,.evaluation-table th,.insight-table td,.insight-table th { border-color:#283442!important; }
+        .chat-topbar { min-height:58px!important;padding:10px 20px!important;background:#111821!important; }
+        .chat-topbar h1 { font-size:15px!important;letter-spacing:-.01em; }
+        .chat-layout { gap:0!important;background:#0b1017!important; }
+        .chat-list { padding:16px!important;background:#111821!important; }
+        .chat-message { border:1px solid #2a3745!important;border-radius:12px!important;background:#141c26!important; }
+        .chat-message.user { background:#17272a!important; }
+        .chat-compose { border:1px solid #2b3947!important;border-radius:12px!important;background:#111821!important; }
+        .chat-compose textarea { line-height:1.6!important; }
+        button,input,textarea,select { font-family:inherit; }
+        button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible,summary:focus-visible { outline:2px solid #72c8c0!important;outline-offset:2px!important; }
+        button:disabled { opacity:.48!important;cursor:not-allowed!important; }
+        ::selection { color:#071110;background:#87d9d0; }
+        @media(max-width:700px) { .memory-panel { padding:16px 14px 20px!important; }.connections-dashboard { padding:10px!important; }.insights-view { padding:18px 12px!important; }.connection-detail-window { padding:16px!important; } }
       `}</style>
     </main>
   );

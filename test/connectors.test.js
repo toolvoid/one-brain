@@ -114,3 +114,32 @@ test('connection test spawns the configured stdio bridge and checks search_memor
     assert.equal(connectors.isConnected('codex', [{ client: 'Codex', verified: true, status: 'pending' }]), false);
   } finally { cleanup(home); }
 });
+
+test('connect-all previews temp configs, waits for explicit confirmation, then tests the stdio search flow', async () => {
+  const { createConnectAllPlan, runConfirmedConnectAll } = await import('../src/lib/connections-dashboard.mjs');
+  const home = tempHome();
+  try {
+    fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
+    fs.mkdirSync(path.join(home, '.gemini'), { recursive: true });
+    const env = { PATH: '' };
+    const discovered = connectors.discoverClients(home, '/synthetic/app', [], [], env).filter((item) => ['codex', 'gemini'].includes(item.id));
+    const plan = createConnectAllPlan(discovered.map((item) => ({ ...item, previewFiles: connectors.previewClient(item.id, home, '/synthetic/app', env) })));
+    assert.equal(plan.clients.length, 2);
+    for (const file of plan.files) assert.ok(file.path.includes(home));
+    let writes = 0;
+    await runConfirmedConnectAll(plan, { write: async () => { writes++; } });
+    assert.equal(writes, 0);
+    assert.equal(fs.existsSync(path.join(home, '.codex', 'config.toml')), false);
+    await runConfirmedConnectAll(plan, { confirmed: true, write: async (client) => { connectors.connectClient(client, home, '/synthetic/app', env); writes++; } });
+    assert.equal(writes, 2);
+    assert.ok(fs.existsSync(path.join(home, '.codex', 'config.toml')));
+    assert.ok(fs.existsSync(path.join(home, '.gemini', 'settings.json')));
+    fs.mkdirSync(path.join(home, 'tokens'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'tokens', 'gemini.token'), `${'a'.repeat(64)}\n`);
+    const result = connectors.testConnector('gemini', '/synthetic/app', home, env, { run: (_command, _args, input) => {
+      assert.match(input, /"name":"search_memory"/);
+      return { status: 0, stdout: `${JSON.stringify({ jsonrpc: '2.0', id: 2, result: { content: [{ type: 'text', text: 'synthetic-only' }] } })}\n` };
+    } });
+    assert.deepEqual(result, { ok: true, reason: 'search_memory succeeded.' });
+  } finally { cleanup(home); }
+});

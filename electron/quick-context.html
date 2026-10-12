@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Quick context</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;padding:16px;background:#0b1020;color:#e5e7eb;font:13px/1.45 system-ui,sans-serif}h1{font-size:17px;margin:0 0 10px}label{display:grid;gap:6px;margin:8px 0}textarea{width:100%;resize:vertical;min-height:76px;padding:9px;border:1px solid #34445b;border-radius:7px;background:#101a2a;color:#eff6ff;font:inherit}button{border:1px solid #3c6389;border-radius:6px;padding:7px 10px;color:#e2f1ff;background:#173452;font:inherit;cursor:pointer}button:disabled{opacity:.45}.toolbar,footer{display:flex;justify-content:space-between;gap:8px}.results{display:grid;gap:7px;max-height:330px;overflow:auto;margin:10px 0}.result{display:grid;grid-template-columns:auto 1fr;gap:8px;padding:9px;border:1px solid #253247;border-radius:7px;background:#101827}.result input{margin-top:3px}.result strong{display:block}.result p{margin:4px 0 0;color:#a9b8ca}.status{min-height:18px;color:#b5c4d8}footer{justify-content:flex-end}
+  </style>
+</head>
+<body>
+  <h1>Quick context</h1>
+  <label>Question<textarea id="query" autofocus></textarea></label>
+  <div class="toolbar"><span class="status" id="status" aria-live="polite"></span><button id="search">Search</button></div>
+  <div class="results" id="results"></div>
+  <footer><button id="copy" disabled>Copy</button></footer>
+  <script src="quick-context-window.js"></script>
+</body>
+</html>

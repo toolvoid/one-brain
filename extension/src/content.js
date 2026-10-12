@@ -2,7 +2,7 @@
 
 (() => {
   try { globalThis.__oneBrainContentCleanup?.(); } catch {}
-  const SITE = location.hostname === 'chatgpt.com' ? 'chatgpt' : location.hostname === 'claude.ai' ? 'claude' : location.hostname === 'gemini.google.com' ? 'gemini' : null;
+  const SITE = location.hostname === 'chatgpt.com' ? 'chatgpt' : location.hostname === 'claude.ai' ? 'claude' : location.hostname === 'gemini.google.com' ? 'gemini' : location.hostname === 'chat.deepseek.com' ? 'deepseek' : location.hostname === 'console.groq.com' && location.pathname.startsWith('/playground') ? 'groq' : null;
   const API = globalThis.browser || globalThis.chrome;
   const adapter = SITE && globalThis.OneBrainAdapters?.[SITE];
   const editorTools = globalThis.OneBrainEditorInsertion;
@@ -10,7 +10,9 @@
   const backgroundMessage = globalThis.OneBrainBackgroundMessage;
   const smartSave = globalThis.OneBrainSmartSave;
   const insertionGuardModule = globalThis.OneBrainInsertionGuard;
-  if (!SITE || !API || !adapter || !editorTools || !searchIntent || !backgroundMessage || !smartSave || !insertionGuardModule) return;
+  const manualContext = globalThis.OneBrainManualContext;
+  const layoutFallbackModule = globalThis.OneBrainLayoutFallback;
+  if (!SITE || !API || !adapter || !editorTools || !searchIntent || !backgroundMessage || !smartSave || !insertionGuardModule || !manualContext || !layoutFallbackModule) return;
   const timers = new Set();
   const eventController = new AbortController();
   let stopped = false, staleToastShown = false, adapterCleanup = () => {};
@@ -171,6 +173,60 @@
   }
 
   function closeSuggestionPanel() { modal?.remove(); modal = null; }
+
+  async function openManualContext() {
+    closeSuggestionPanel();
+    modal = document.createElement('section');
+    modal.className = 'one-brain-extension-modal one-brain-extension-ui';
+    modal.innerHTML = '<div class="one-brain-extension-dialog"><h2>Manual context</h2><label>Question<textarea data-query rows="3"></textarea></label><button type="button" data-search>Search</button><div data-results></div><p data-empty hidden>No strong matches</p><footer><button type="button" data-close>Close</button><button type="button" data-copy disabled>Copy</button></footer></div>';
+    const panel = modal, queryInput = panel.querySelector('[data-query]'), resultRoot = panel.querySelector('[data-results]');
+    panel.querySelector('[data-close]').addEventListener('click', closeSuggestionPanel);
+    panel.querySelector('[data-search]').addEventListener('click', async () => {
+      const query = manualContext.stripContextBlocks(queryInput.value).trim();
+      resultRoot.replaceChildren(); panel.querySelector('[data-empty]').hidden = true; panel.querySelector('[data-copy]').disabled = true;
+      if (!query) { panel.querySelector('[data-empty]').hidden = false; return; }
+      try {
+        const found = await askBackground({ type: 'search-memories', site: SITE, query, limit: 5 });
+        if (!found?.ok) { toast(found?.error || 'Could not search One Brain.', true); return; }
+        const memories = (found.memories || []).slice(0, 5);
+        if (!manualContext.hasStrongMatches(memories)) { panel.querySelector('[data-empty]').hidden = false; return; }
+        memories.forEach((memory) => {
+          const row = document.createElement('label'), check = document.createElement('input'), title = document.createElement('strong'), snippet = document.createElement('textarea');
+          check.type = 'checkbox'; check.checked = true; check.addEventListener('change', syncCopy);
+          title.textContent = String(memory.title || 'Untitled memory'); snippet.value = String(memory.snippet || '');
+          row.append(check, title, snippet); resultRoot.append(row);
+        });
+        syncCopy();
+      } catch { panel.querySelector('[data-empty]').hidden = false; }
+    });
+    function syncCopy() { panel.querySelector('[data-copy]').disabled = !resultRoot.querySelector('input:checked'); }
+    panel.querySelector('[data-copy]').addEventListener('click', async () => {
+      const memories = [...resultRoot.querySelectorAll('label')].filter((row) => row.querySelector('input').checked).map((row) => ({ source: SITE, title: row.querySelector('strong').textContent, snippet: row.querySelector('textarea').value }));
+      const block = manualContext.buildManualBlock(memories);
+      try { await navigator.clipboard.writeText(block); closeSuggestionPanel(); toast('Context copied.'); }
+      catch { toast('Clipboard unavailable. Allow clipboard access and try again.', true); }
+    });
+    document.body.append(panel); queryInput.focus();
+  }
+
+  let manualButton = null;
+  const layoutFallback = layoutFallbackModule.createLayoutFallback(() => {
+      if (stopped) return;
+      toast("One Brain can't read this site's page layout (site changed)", true);
+      manualButton = createButton('Manual context', () => { void openManualContext(); }, 'one-brain-manual-context');
+      document.body.append(manualButton);
+  });
+  let lastLayoutBroken = null;
+  function checkAdapterLayout() {
+    if (stopped) return false;
+    const matched = adapter.selfCheck();
+    const working = Boolean(matched?.input && matched?.send);
+    if (lastLayoutBroken !== !working) {
+      lastLayoutBroken = !working;
+      void askBackground({ type: 'adapter-self-check-report', site: SITE, matched });
+    }
+    return layoutFallback.check(working);
+  }
 
   async function openSuggestions(trigger) {
     const editor = adapter.getInputElement();
@@ -533,6 +589,8 @@
 
   void loadConfig();
   void loadChatState();
-  void askBackground({ type: 'adapter-self-check-report', site: SITE, matched: adapter.selfCheck() });
-  adapterCleanup = adapter.observe(() => { if (stopped) return; refreshButtons(); confirmSentMessages(); void syncChatRoute(); });
+  const cleanupContentObserver = adapter.observe(() => { if (stopped) return; refreshButtons(); confirmSentMessages(); void syncChatRoute(); });
+  const cleanupLayoutObserver = adapter.observe(() => { checkAdapterLayout(); });
+  adapterCleanup = () => { cleanupContentObserver?.(); cleanupLayoutObserver?.(); };
+  checkAdapterLayout();
 })();

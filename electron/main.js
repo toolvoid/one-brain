@@ -1,13 +1,16 @@
-const { app, BrowserWindow, ipcMain, Menu, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, safeStorage, globalShortcut, clipboard } = require('electron');
 const path = require('path');
+const fs = require('node:fs');
 const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
-const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getMcpClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, getMemoryEmbeddingVector, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, listRecentImports, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, addMemory, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, undoImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
+const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getMcpClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, getMemoryEmbeddingVector, getMemory, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, listRecentImports, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, addMemory, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
 const { startMcpServer } = require('./mcp-server');
 const { createEmbedder } = require('./embedder');
 const connectors = require('./connectors');
-const { createClientToken, revokeClientTokenFile } = require('./client-tokens');
+const { createClientToken, revokeClientTokenFile, tokenPath } = require('./client-tokens');
 const { createMemoryProxy } = require('./memory-proxy');
 const { createExtApi } = require('./ext-api');
+const { prepareQuickContext, buildQuickContextBlock } = require('./quick-context');
+const { createConnectionActivity } = require('./connection-activity');
 
 let mcpConnection;
 let memoryProxy;
@@ -16,6 +19,77 @@ let embedder;
 let embedderGeneration = 0;
 let embeddingStatus = { state: 'loading' };
 const chatControllers = new Map();
+let quickContextWindow = null;
+let quickContextShortcut = null;
+let quickContextRegistrationError = '';
+let connectionActivity = null;
+function getConnectorTokenStates() {
+  return listClientTokenStates().map((item) => {
+    try { return { ...item, file_mtime: fs.statSync(path.join(app.getPath('userData'), 'tokens', `${item.client.replaceAll(':', '~3a')}.token`)).mtimeMs }; }
+    catch { return item; }
+  });
+}
+const QUICK_CONTEXT_DEFAULTS = { enabled: true, shortcut: 'Control+Shift+Space' };
+const quickContextSettingsPath = () => path.join(app.getPath('userData'), 'quick-context-settings.json');
+
+function readQuickContextSettings() {
+  try { return { ...QUICK_CONTEXT_DEFAULTS, ...JSON.parse(fs.readFileSync(quickContextSettingsPath(), 'utf8')) }; }
+  catch { return { ...QUICK_CONTEXT_DEFAULTS }; }
+}
+
+function persistQuickContextSettings(settings) {
+  const file = quickContextSettingsPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
+  try { fs.chmodSync(file, 0o600); } catch {}
+}
+
+function createQuickContextWindow() {
+  if (quickContextWindow && !quickContextWindow.isDestroyed()) { quickContextWindow.show(); quickContextWindow.focus(); return; }
+  quickContextWindow = new BrowserWindow({ width: 470, height: 570, minWidth: 390, minHeight: 420, alwaysOnTop: true, skipTaskbar: true,
+    title: 'Quick context', autoHideMenuBar: true,
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false } });
+  quickContextWindow.loadFile(path.join(__dirname, 'quick-context.html'));
+  quickContextWindow.on('closed', () => { quickContextWindow = null; });
+}
+
+function applyQuickContextSettings(next) {
+  const previous = quickContextShortcut;
+  if (previous) globalShortcut.unregister(previous);
+  quickContextShortcut = null;
+  if (next.enabled) {
+    const accelerator = String(next.shortcut || '').trim();
+    if (!accelerator || !globalShortcut.register(accelerator, createQuickContextWindow)) {
+      if (previous && readQuickContextSettings().enabled && globalShortcut.register(previous, createQuickContextWindow)) quickContextShortcut = previous;
+      quickContextRegistrationError = 'That shortcut is unavailable. Choose a different key combination.';
+      throw new Error('That shortcut is unavailable. Choose a different key combination.');
+    }
+    quickContextShortcut = accelerator;
+  }
+  quickContextRegistrationError = '';
+  persistQuickContextSettings(next);
+  return next;
+}
+
+ipcMain.handle('quick-context:settings', () => ({ ...readQuickContextSettings(), registered: Boolean(quickContextShortcut), error: quickContextRegistrationError }));
+ipcMain.handle('quick-context:update-settings', (_event, patch = {}) => {
+  const current = readQuickContextSettings();
+  const next = { enabled: typeof patch.enabled === 'boolean' ? patch.enabled : current.enabled,
+    shortcut: typeof patch.shortcut === 'string' ? patch.shortcut.trim().slice(0, 80) : current.shortcut };
+  const saved = applyQuickContextSettings(next);
+  return { ...saved, registered: Boolean(quickContextShortcut), error: quickContextRegistrationError };
+});
+ipcMain.handle('quick-context:search', async (_event, query) => prepareQuickContext({ query, searchMemories, getMemory,
+  getVector: getMemoryEmbeddingVector,
+  embedText: (text) => embedder?.embed(text) || Promise.reject(new Error('Local embedder is unavailable.')) }));
+ipcMain.handle('quick-context:copy', (_event, memories) => {
+  const safe = (Array.isArray(memories) ? memories : []).slice(0, 5).map((item) => ({ source: String(item?.source || ''), title: String(item?.title || '').slice(0, 160), snippet: String(item?.snippet || '').slice(0, 350), selected: item?.selected !== false, private: Boolean(item?.private), no_suggest: Boolean(item?.no_suggest) }));
+  const block = buildQuickContextBlock(safe);
+  if (!block) return { ok: false };
+  clipboard.writeText(block);
+  return { ok: true };
+});
+ipcMain.handle('quick-context:close', (event) => { BrowserWindow.fromWebContents(event.sender)?.close(); return true; });
 
 Menu.setApplicationMenu(null);
 
@@ -79,18 +153,48 @@ ipcMain.handle('memories:search', async (_event, query, source, limit, offset, c
 });
 ipcMain.handle('memories:count-by-source', () => countBySource());
 ipcMain.handle('mcp:config', () => mcpConnection ? { endpoint: mcpConnection.config.endpoint, port: mcpConnection.config.port } : null);
-ipcMain.handle('connectors:list', () => connectors.discoverClients(app.getPath('home'), app.getAppPath(), listClients(), listClientTokenStates()));
+ipcMain.handle('connectors:list', () => connectors.discoverClients(app.getPath('home'), app.getAppPath(), listClients(), getConnectorTokenStates()));
+ipcMain.handle('connections:activity', (_event, client) => connectionActivity?.list(String(client || '').slice(0, 120)) || []);
+ipcMain.handle('connections:counts', () => Object.fromEntries(require('./connection-activity').CLIENTS.map((client) => [client, connectionActivity?.counts(client) || { searches: 0, saves: 0 }])));
+ipcMain.handle('connections:clear-activity', () => connectionActivity?.clear() || { cleared: false });
+ipcMain.handle('connections:log', (_event, event) => connectionActivity?.add(event) || null);
+ipcMain.handle('connections:rotate-all', () => {
+  const active = listClientTokenStates().filter((item) => !item.revoked && connectors.CLIENTS.some((client) => client.id === item.client));
+  for (const token of active) {
+    createClientToken(app.getPath('userData'), token.client, storeClientTokenHash);
+    connectionActivity?.add({ client: connectors.CLIENTS.find((item) => item.id === token.client)?.name, action: 'rotate_token', ok: true });
+  }
+  return { rotated: active.length };
+});
+ipcMain.handle('connections:rotate-preview', () => listClientTokenStates()
+  .filter((item) => !item.revoked && connectors.CLIENTS.some((client) => client.id === item.client))
+  .map((item) => ({ path: tokenPath(app.getPath('userData'), item.client), before: 'Current token will become invalid immediately.', after: 'Generate a replacement token. The token value is never displayed.', changed: true })));
 ipcMain.handle('connectors:preview', (_event, client) => connectors.previewClient(client, app.getPath('home'), app.getAppPath()));
 ipcMain.handle('connectors:connect', (_event, client) => {
   if (!connectors.detectConnector(client, app.getPath('home'), app.getAppPath())) throw new Error(`${connectors.CLIENTS.find((item) => item.id === client)?.name || 'Client'} is not installed.`);
   createClientToken(app.getPath('userData'), client, storeClientTokenHash);
-  return connectors.connectClient(client, app.getPath('home'), app.getAppPath());
+  const files = connectors.connectClient(client, app.getPath('home'), app.getAppPath());
+  connectionActivity?.add({ client: connectors.CLIENTS.find((item) => item.id === client)?.name, action: 'connect', ok: true });
+  return files;
 });
-ipcMain.handle('connectors:rotate-token', (_event, client) => createClientToken(app.getPath('userData'), client, storeClientTokenHash));
-ipcMain.handle('connectors:test', (_event, client) => connectors.testConnector(client, app.getAppPath(), app.getPath('userData')));
+ipcMain.handle('connectors:rotate-token', (_event, client) => {
+  const result = createClientToken(app.getPath('userData'), client, storeClientTokenHash);
+  connectionActivity?.add({ client: connectors.CLIENTS.find((item) => item.id === client)?.name, action: 'rotate_token', ok: true });
+  return result;
+});
+ipcMain.handle('connectors:test', (_event, client) => {
+  const result = connectors.testConnector(client, app.getAppPath(), app.getPath('userData'));
+  connectionActivity?.add({ client: connectors.CLIENTS.find((item) => item.id === client)?.name, action: 'test', ok: result.ok, reason: result.reason === 'One Brain app is not running.' ? 'app_not_running' : result.ok ? '' : 'request_failed' });
+  return result;
+});
 ipcMain.handle('connectors:revoke-token', (_event, client) => revokeClientTokenFile(app.getPath('userData'), client, revokeClientToken));
 ipcMain.handle('connectors:disconnect-preview', (_event, client) => connectors.disconnectPreview(client, app.getPath('home'), app.getAppPath()));
-ipcMain.handle('connectors:disconnect', (_event, client) => connectors.disconnectClient(client, app.getPath('home'), app.getAppPath()));
+ipcMain.handle('connectors:disconnect', (_event, client) => {
+  const result = connectors.disconnectClient(client, app.getPath('home'), app.getAppPath());
+  revokeClientTokenFile(app.getPath('userData'), client, revokeClientToken);
+  connectionActivity?.add({ client: connectors.CLIENTS.find((item) => item.id === client)?.name, action: 'disconnect', ok: true });
+  return result;
+});
 ipcMain.handle('connectors:snippet', (_event, client) => connectors.snippetFor(client, app.getAppPath()));
 ipcMain.handle('embeddings:status', () => embeddingStatus);
 ipcMain.handle('embeddings:retry', async () => {
@@ -124,8 +228,21 @@ ipcMain.handle('extension:pair-code', () => ({ ...extensionApi.createPairCode(),
 ipcMain.handle('extension:revoke', (_event, site) => extensionApi.revokeSite(site));
 ipcMain.handle('extension:rotate', (_event, site) => extensionApi.rotateSite(site));
 ipcMain.handle('memory-proxy:update-settings', (_event, values) => memoryProxy.updateSettings(values));
-ipcMain.handle('memory-proxy:save-key', (_event, provider, key) => memoryProxy.saveKey(provider, key));
-ipcMain.handle('memory-proxy:delete-key', (_event, provider) => memoryProxy.deleteKey(provider));
+ipcMain.handle('memory-proxy:save-key', (_event, provider, key) => {
+  const result = memoryProxy.saveKey(provider, key);
+  if (provider === 'groq' || provider === 'deepseek') connectionActivity?.add({ client: provider === 'groq' ? 'Groq API' : 'DeepSeek API', action: 'connect', ok: true });
+  return result;
+});
+ipcMain.handle('memory-proxy:delete-key', (_event, provider) => {
+  const result = memoryProxy.deleteKey(provider);
+  if (provider === 'groq' || provider === 'deepseek') connectionActivity?.add({ client: provider === 'groq' ? 'Groq API' : 'DeepSeek API', action: 'disconnect', ok: true });
+  return result;
+});
+ipcMain.handle('memory-proxy:test-key', async (_event, provider, key) => {
+  const result = await memoryProxy.testProviderKey(provider, key);
+  connectionActivity?.add({ client: provider === 'groq' ? 'Groq API' : 'DeepSeek API', action: 'test', ok: result.ok, reason: result.ok ? '' : 'invalid_key' });
+  return result;
+});
 ipcMain.handle('chat:models', (_event, provider, refresh) => memoryProxy.listModels(provider, refresh));
 ipcMain.handle('chat:generate-title', (_event, provider, model, text) => memoryProxy.generateMemoryTitle(provider, model, text));
 ipcMain.handle('chat:grant', (_event, provider) => getChatGrant(provider));
@@ -213,8 +330,18 @@ app.whenReady().then(async () => {
   if (databaseStatus.message) console.error(databaseStatus.message);
 
   startEmbedder();
+  try { applyQuickContextSettings(readQuickContextSettings()); } catch { /* Keep the app usable if the OS reserves the selected shortcut. */ }
 
   const userDataPath = app.getPath('userData');
+  connectionActivity = createConnectionActivity(userDataPath);
+  const recordDashboardEvent = (event, memoryIds) => {
+    recordProxyEvent(event, memoryIds);
+    const site = String(event.client || '').replace(/^ext:/, '');
+    const labels = { chatgpt: 'ChatGPT web', claude: 'Claude web', gemini: 'Gemini web', deepseek: 'DeepSeek web', groq: 'Groq playground' };
+    const providerClient = event.provider === 'groq' ? 'Groq API' : event.provider === 'deepseek' ? 'DeepSeek API' : null;
+    const action = ['search', 'save'].includes(event.tool) ? event.tool : providerClient ? 'search' : 'test';
+    connectionActivity.add({ client: providerClient || labels[site] || 'One Brain', action, ok: Boolean(event.ok), reason: event.error === 'pending_approval' ? 'needs_approval' : event.error === 'unknown_token' ? 'not_paired' : event.error ? 'request_failed' : '' });
+  };
   extensionApi = createExtApi({ userDataPath, authenticateClientToken, getClientTokenState, getClientProfile: getProxyClientProfile,
     getMcpClientProfile: (client, identity) => {
       const profile = getMcpClientProfile(client, identity);
@@ -227,14 +354,14 @@ app.whenReady().then(async () => {
     searchMemoriesForClient, getMemoryForClient, getMemoryEmbeddingVector, setMemoryNoSuggest,
     createImport, importMemories, finishImport, getExtensionChatSave, undoExtensionChatSave,
     embedText: (text) => embedder?.embed(text) || Promise.reject(new Error('Local embedder is unavailable.')),
-    addMemory, recordProxyEvent,
+    addMemory, recordProxyEvent: recordDashboardEvent,
     emitRetrieved: (ids) => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:retrieved', ids); },
     emitAdded: (id) => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:changed', { type: 'add', id }); },
     emitRemoved: (id) => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:changed', { type: 'delete', id }); }
   });
 
   memoryProxy = createMemoryProxy({ userDataPath, safeStorage, authenticateClientToken, extensionApi,
-    getClientProfile: getProxyClientProfile, searchMemoriesForClient, getMemoryForClient, recordProxyEvent,
+    getClientProfile: getProxyClientProfile, searchMemoriesForClient, getMemoryForClient, recordProxyEvent: recordDashboardEvent,
     addPendingMemory: async (item) => {
       const result = await addPendingMemory(item);
       if (result.added) for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:pending-memories-changed');
@@ -249,7 +376,7 @@ app.whenReady().then(async () => {
   startMcpServer(app.getPath('userData'), app.getAppPath(), {
     searchMemoriesForClient, getEmbeddingVector: getMemoryEmbeddingVector,
     embedText: (text) => embedder?.embed(text) || Promise.reject(new Error('Local embedder is unavailable.')),
-    listMemories, addMemory
+    listMemories, addMemory, connectionActivity
   }).then((connection) => {
     mcpConnection = connection;
     createWindow();
@@ -267,6 +394,7 @@ app.whenReady().then(async () => {
 });
 
 app.on('before-quit', () => {
+  globalShortcut.unregisterAll();
   if (mcpConnection?.server.listening) mcpConnection.server.close();
   embedder?.close();
 });

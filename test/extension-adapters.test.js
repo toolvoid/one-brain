@@ -45,7 +45,8 @@ function parseFixture(html) {
   return root;
 }
 
-for (const site of ['chatgpt', 'claude', 'gemini']) {
+require('../extension/src/adapters/shared.js');
+for (const site of ['chatgpt', 'claude', 'gemini', 'deepseek', 'groq']) {
   test(`${site} adapter reads message elements and matches selectors on a synthetic HTML fixture`, () => {
     const adapter = require(`../extension/src/adapters/${site}.js`);
     const fixture = fs.readFileSync(path.join(__dirname, `../extension/test/fixtures/${site}.html`), 'utf8');
@@ -56,5 +57,49 @@ for (const site of ['chatgpt', 'claude', 'gemini']) {
     assert.equal(adapter.getLastAssistantMessage(root).role, 'assistant');
     if (site === 'claude') assert.equal(messages.find((message) => message.role === 'user')?.role, 'user');
     assert.equal(Boolean(adapter.selfCheck(root).messages), true);
+    if (['deepseek', 'groq'].includes(site)) {
+      assert.equal(typeof adapter.findInput, 'function');
+      assert.equal(typeof adapter.readDraft, 'function');
+      assert.equal(typeof adapter.writeDraft, 'function');
+      assert.equal(typeof adapter.findSendButton, 'function');
+      assert.equal(typeof adapter.readRecentMessages, 'function');
+      assert.equal(typeof adapter.readChatKey, 'function');
+    }
   });
 }
+
+test('DeepSeek and Groq adapter fallback notifies once and switches to manual mode', () => {
+  const fallbackModule = require('../extension/src/layout-fallback.js');
+  let toastCount = 0;
+  const fallback = fallbackModule.createLayoutFallback(() => toastCount++);
+  assert.equal(fallback.check(false), false);
+  assert.equal(fallback.check(false), false);
+  assert.equal(toastCount, 1);
+  assert.equal(fallback.isManual(), true);
+});
+
+test('DeepSeek and Groq insert one marked block after synthetic typing and strip it before save', () => {
+  const insertion = require('../extension/src/editor-insertion.js');
+  const guardModule = require('../extension/src/insertion-guard.js');
+  const smart = require('../extension/src/smart-save.js');
+  for (const site of ['deepseek', 'groq']) {
+    const fixture = parseFixture(fs.readFileSync(path.join(__dirname, `../extension/test/fixtures/${site}.html`), 'utf8'));
+    const adapter = require(`../extension/src/adapters/${site}.js`);
+    const guard = guardModule.createInsertionGuard();
+    assert.ok(adapter.findInput(fixture));
+    assert.ok(adapter.findSendButton(fixture));
+    let now = 0, draft = 'Synthetic question about a local browser memory setup.', scheduledAt = null, inserted = 0;
+    for (let event = 0; event < 10; event++) { now += 100; scheduledAt = now + 1200; }
+    now = 5000;
+    if (scheduledAt <= now && !insertion.hasContextBlocks(draft) && guard.attempt(adapter.readChatKey(), now).allowed) {
+      draft = `${insertion.composeBlock([{ source: 'codex', title: 'Synthetic setup', text: 'Use local storage.' }])}\n\n${draft}`;
+      inserted++;
+    }
+    for (let event = 0; event < 10; event++) if (!insertion.hasContextBlocks(draft)) inserted++;
+    assert.equal(inserted, 1);
+    assert.equal((draft.match(/\(end of One Brain context\)/g) || []).length, 1);
+    const saved = smart.prepareSmartSave([{ id: site, role: 'user', text: draft }]).kept[0].text;
+    assert.doesNotMatch(saved, /CONTEXT FROM MY ONE BRAIN|end of One Brain context/);
+    assert.equal(insertion.stripContextBlocks(draft), 'Synthetic question about a local browser memory setup.');
+  }
+});

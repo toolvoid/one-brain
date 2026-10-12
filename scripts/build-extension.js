@@ -5,11 +5,14 @@ const path = require('node:path');
 const { createHash, createPrivateKey, createPublicKey, generateKeyPairSync } = require('node:crypto');
 
 const ROOT = path.resolve(__dirname, '..');
-const hosts = ['http://127.0.0.1/*', 'https://chatgpt.com/*', 'https://claude.ai/*', 'https://gemini.google.com/*'];
+const hosts = ['http://127.0.0.1/*', 'https://chatgpt.com/*', 'https://claude.ai/*', 'https://gemini.google.com/*', 'https://chat.deepseek.com/*', 'https://console.groq.com/*'];
+const common = ['src/adapters/shared.js', 'src/context-blocks.js', 'src/background-message.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/smart-save.js', 'src/insertion-guard.js', 'src/manual-context.js', 'src/layout-fallback.js'];
 const contentScripts = [
-  { matches: ['https://chatgpt.com/*'], js: ['src/adapters/chatgpt.js', 'src/context-blocks.js', 'src/background-message.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/smart-save.js', 'src/insertion-guard.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
-  { matches: ['https://claude.ai/*'], js: ['src/adapters/claude.js', 'src/context-blocks.js', 'src/background-message.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/smart-save.js', 'src/insertion-guard.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
-  { matches: ['https://gemini.google.com/*'], js: ['src/adapters/gemini.js', 'src/context-blocks.js', 'src/background-message.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/smart-save.js', 'src/insertion-guard.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' }
+  { matches: ['https://chatgpt.com/*'], js: [...common, 'src/adapters/chatgpt.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
+  { matches: ['https://claude.ai/*'], js: [...common, 'src/adapters/claude.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
+  { matches: ['https://gemini.google.com/*'], js: [...common, 'src/adapters/gemini.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
+  { matches: ['https://chat.deepseek.com/*'], js: [...common, 'src/adapters/deepseek.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
+  { matches: ['https://console.groq.com/playground*'], js: [...common, 'src/adapters/groq.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' }
 ];
 
 function chromeKey(keyDirectory) {
@@ -42,7 +45,7 @@ function build(browser, { root = ROOT } = {}) {
   const manifest = {
     manifest_version: 3,
     name: 'One Brain',
-    version: '1.1.0',
+    version: '1.2.0',
     description: 'Save selected chat messages to your local One Brain memory.',
     permissions: ['storage'],
     host_permissions: hosts,

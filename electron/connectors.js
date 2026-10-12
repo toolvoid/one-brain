@@ -73,6 +73,8 @@ function discoverClients(homeDir, appPath, profiles = [], tokenStates = [], env 
     const found = checks[client.id];
     const result = { ...client, status: profile ? 'connected' : found ? 'found' : 'not found', lastSeen: profile?.last_seen || null,
       tokenStatus: token ? (token.revoked ? 'revoked' : 'active') : 'none', paths: paths[client.id] || {} };
+    if (token) { result.tokenCreatedAt = token.created_at || null; result.tokenModifiedAt = Number(token.file_mtime) || null; }
+    result.needsReconnect = Boolean(profile && token && Number.isFinite(result.tokenModifiedAt) && result.tokenModifiedAt > Date.parse(profile.last_seen || ''));
     if (client.kind === 'managed') {
       try { result.previewFiles = previewClient(client.id, homeDir, appPath, env); }
       catch { result.configError = 'Configuration is invalid or unsupported. One Brain will not modify this file.'; }
@@ -475,9 +477,15 @@ function testConnector(clientId, appPath, userDataPath, env = process.env, optio
   ].map((message) => JSON.stringify(message)).join('\n') + '\n';
   const run = options.run || ((command, args, input) => spawnSync(command, args, { input, encoding: 'utf8', timeout: 10000, windowsHide: true, env }));
   const result = run(server.command, server.args, messages);
-  if (result.error || result.status !== 0) return { ok: false, reason: 'MCP server did not complete the local search check.' };
+  if (result.error || result.status !== 0) {
+    const refused = result.error?.code === 'ECONNREFUSED' || /ECONNREFUSED|fetch failed.*127\.0\.0\.1/i.test(String(result.stderr || ''));
+    return { ok: false, reason: refused ? 'One Brain app is not running.' : 'MCP server did not complete the local search check.' };
+  }
   const response = String(result.stdout || '').split(/\r?\n/).map((line) => { try { return JSON.parse(line); } catch { return null; } }).find((message) => message?.id === 2);
-  if (!response || response.error || response.result?.isError) return { ok: false, reason: 'MCP search_memory did not return successfully. Check app approval and local API availability.' };
+  if (!response || response.error || response.result?.isError) {
+    if (/Could not reach One Brain MCP/i.test(String(result.stderr || ''))) return { ok: false, reason: 'One Brain app is not running.' };
+    return { ok: false, reason: 'MCP search_memory did not return successfully. Check app approval and local API availability.' };
+  }
   return { ok: true, reason: 'search_memory succeeded.' };
 }
 
