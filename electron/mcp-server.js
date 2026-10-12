@@ -5,8 +5,10 @@ const { randomBytes, randomUUID, timingSafeEqual } = require('node:crypto');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { z } = require('zod/v4');
-const { addMemory, getMcpClientProfile, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, recordEvent, authenticateClientToken } = require('./db');
+const { addMemory, getMcpClientProfile, searchMemoriesForClient, getMemoryForClient, countBySourceForClient, recordEvent, authenticateClientToken, getMemoryEmbeddingVector } = require('./db');
 const { INSTRUCTIONS } = require('./connectors');
+const { createMcpToolHandlers, mcpActivityMetadata } = require('./mcp-tools');
+const { listMemories } = require('./db');
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -19,8 +21,15 @@ function notifyRenderer(channel, payload) {
   }
 }
 
-function createMcpServer(identity) {
+function createMcpServer(identity, dependencies = {}) {
   const server = new McpServer({ name: 'one-brain', version: '1.0.0', instructions: INSTRUCTIONS });
+  const tools = createMcpToolHandlers({ ...dependencies,
+    searchMemoriesForClient: dependencies.searchMemoriesForClient || searchMemoriesForClient,
+    addMemory: dependencies.addMemory || addMemory,
+    getEmbeddingVector: dependencies.getEmbeddingVector || getMemoryEmbeddingVector,
+    listMemories: dependencies.listMemories || listMemories,
+    notifyRetrieved: (ids) => notifyRenderer('brain:retrieved', ids),
+    notifyAdded: (id) => notifyRenderer('brain:changed', { type: 'add', id }) });
   const registerTrackedTool = (name, definition, handler) => server.registerTool(name, definition, async (args) => {
     const startedAt = Date.now();
     const client = identity.eventClient;
@@ -32,34 +41,40 @@ function createMcpServer(identity) {
       if (profile.status === 'blocked') outcome = { denied: true, result: { isError: true, content: [{ type: 'text', text: 'This client is blocked in the One Brain app.' }] }, count: 0 };
       else if (profile.status !== 'approved') outcome = { denied: true, result: { isError: true, content: [{ type: 'text', text: 'Waiting for approval in the One Brain app' }] }, count: 0 };
       else outcome = await handler(args, profile);
-      if (outcome.denied) recordEvent({ kind: 'permission_denied', tool: name, client, ...eventIdentity, source: outcome.source || args.source || null,
-        query: name === 'search_memories' ? args.query : null, ok: 0, error: outcome.reason || 'permission_denied' });
-      recordEvent({ kind: 'mcp_call', tool: name, client, ...eventIdentity, source: outcome.source || args.source || null,
-        query: name === 'search_memories' ? args.query : null, result_count: outcome.count ?? 0,
-        top_score: outcome.topScore ?? null, latency_ms: Date.now() - startedAt,
-        ok: !outcome.result?.isError, error: outcome.result?.isError ? 'Tool returned an error.' : null }, outcome.ids || []);
+      if (outcome.denied) recordEvent(mcpActivityMetadata({ kind: 'permission_denied', tool: name, client, identity: eventIdentity,
+        source: outcome.source || args.source || null, resultCount: outcome.count ?? 0, ok: false, error: outcome.reason || 'permission_denied' }));
+      recordEvent({ ...mcpActivityMetadata({ tool: name, client, identity: eventIdentity, source: outcome.source || args.source || null,
+        resultCount: outcome.count ?? 0, latencyMs: Date.now() - startedAt, ok: !outcome.result?.isError,
+        error: outcome.result?.isError ? 'Tool returned an error.' : null }), top_score: outcome.topScore ?? null }, outcome.ids || []);
       return outcome.result;
     } catch (error) {
-      recordEvent({ kind: 'mcp_call', tool: name, client, ...eventIdentity, source: args.source || null,
-        query: name === 'search_memories' ? args.query : null, result_count: 0, latency_ms: Date.now() - startedAt,
-        ok: false, error: error?.name || 'Tool failed.' });
+      recordEvent(mcpActivityMetadata({ tool: name, client, identity: eventIdentity, source: args.source || null,
+        resultCount: 0, latencyMs: Date.now() - startedAt, ok: false, error: error?.name || 'Tool failed.' }));
       throw error;
     }
   });
 
   registerTrackedTool('search_memories', {
-    description: 'Search One Brain memories by title and content.',
+    description: 'Search One Brain for relevant memories. Call this before answering when the user refers to past context, preferences, projects, earlier chats, or One Brain.',
     inputSchema: {
       query: z.string().describe('Words to search for. Prefixes are matched.'),
       source: z.enum(SOURCES).optional().describe('Optional AI source filter.'),
       limit: z.number().int().min(1).max(50).optional().describe('Maximum results, up to 50.')
     }
   }, async ({ query, source, limit }, profile) => {
-    const { memories, denied } = await searchMemoriesForClient(query, source, limit || 50, profile);
-    const safeMemories = memories.map(({ private: _private, ...memory }) => memory);
-    notifyRenderer('brain:retrieved', safeMemories.map((memory) => memory.id));
-    return { result: { content: [{ type: 'text', text: JSON.stringify(safeMemories) }] }, count: safeMemories.length, topScore: safeMemories[0]?.score, source, denied, ids: safeMemories.map((memory) => memory.id) };
+    const outcome = await tools.search_memory({ query, source, limit: Math.min(5, limit || 5) }, profile);
+    return outcome;
   });
+
+  registerTrackedTool('search_memory', {
+    description: 'Search One Brain memory before responding whenever the user refers to their past context, earlier conversations, projects or preferences.',
+    inputSchema: { query: z.string().min(1).describe('The current question or topic to match against relevant memories.'), limit: z.number().int().min(1).max(5).optional().describe('Maximum number of relevant memories (up to five).') }
+  }, (args, profile) => tools.search_memory(args, profile));
+
+  registerTrackedTool('list_recent', {
+    description: 'List recent, non-private memories that are allowed for this client; memories marked no-suggest are omitted.',
+    inputSchema: { limit: z.number().int().min(1).max(50).optional().describe('Maximum recent memories to return.') }
+  }, (args, profile) => tools.list_recent(args, profile));
 
   registerTrackedTool('get_memory', {
     description: 'Get a memory with its full content and linked memory IDs.',
@@ -73,21 +88,20 @@ function createMcpServer(identity) {
   });
 
   registerTrackedTool('add_memory', {
-    description: 'Add a memory to One Brain. Matching titles are auto-linked.',
+    description: 'Save durable user context to One Brain. Context blocks and secret-looking text are removed or rejected.',
     inputSchema: {
       source: z.enum(SOURCES).describe('AI source that created the memory.'),
       title: z.string().optional().describe('Optional short title.'),
       content: z.string().min(1).describe('Memory content.')
     }
   }, async ({ source: _requestedSource, title, content }, profile) => {
-    if (!profile.write_source) return { result: { isError: true, content: [{ type: 'text', text: 'No write source is configured for this client.' }] }, count: 0, denied: true, reason: 'write_source_missing' };
-    const source = profile.write_source;
-    const memory = addMemory({ source, title, content }, { event: false });
-    if (memory.private) return { result: { isError: true, content: [{ type: 'text', text: 'This memory cannot be returned through MCP.' }] }, count: 0, denied: true, reason: 'private_memory' };
-    notifyRenderer('brain:changed', { type: 'add', id: memory.id });
-    const { private: _private, ...safeMemory } = memory;
-    return { result: { content: [{ type: 'text', text: JSON.stringify(safeMemory) }] }, count: 1, source, ids: [memory.id] };
+    return tools.save_memory({ source: _requestedSource, title, text: content }, profile);
   });
+
+  registerTrackedTool('save_memory', {
+    description: 'Save durable context to One Brain. Use the configured write source; secrets are rejected and inserted context blocks are stripped.',
+    inputSchema: { text: z.string().min(1).describe('The durable fact, preference, decision or project context to save.'), title: z.string().optional().describe('Optional short title.'), source: z.enum(SOURCES).optional().describe('Requested memory source; the app uses this client’s configured write source.') }
+  }, (args, profile) => tools.save_memory(args, profile));
 
   registerTrackedTool('list_sources', {
     description: 'List the six AI memory sources with their memory counts.',
@@ -165,7 +179,7 @@ function sameSessionIdentity(auth, session) {
   return auth.kind === session.identity.kind && (auth.kind === 'legacy' || auth.client === session.identity.client);
 }
 
-async function handleRequest(request, response, token) {
+async function handleRequest(request, response, token, dependencies) {
   if (!isLocalHost(request.headers.host)) {
     sendJson(response, 403, { error: 'Host must be localhost.' });
     return;
@@ -210,7 +224,7 @@ async function handleRequest(request, response, token) {
         : { kind: 'legacy', profileClient: reportedName, eventClient: 'legacy-unverified', verified: false, reportedName };
       const profile = getMcpClientProfile(identity.profileClient, { verified: identity.verified, reported_name: identity.reportedName, eventClient: identity.eventClient });
       if (profile.created) notifyRenderer('brain:client-pending', { client: profile.client, verified: identity.verified, reported_name: identity.reportedName });
-      const mcpServer = createMcpServer(identity);
+      const mcpServer = createMcpServer(identity, dependencies);
       let transport;
       transport = new StreamableHTTPServerTransport({ sessionIdGenerator: randomUUID, enableJsonResponse: true,
         onsessioninitialized: (id) => mcpSessions.set(id, { transport, mcpServer, identity }) });
@@ -233,9 +247,9 @@ async function handleRequest(request, response, token) {
   }
 }
 
-function listen(port, token) {
+function listen(port, token, dependencies) {
   return new Promise((resolve, reject) => {
-    const server = http.createServer((request, response) => { void handleRequest(request, response, token); });
+    const server = http.createServer((request, response) => { void handleRequest(request, response, token, dependencies); });
     server.once('error', reject);
     server.once('close', () => {
       for (const session of mcpSessions.values()) {
@@ -251,7 +265,7 @@ function listen(port, token) {
   });
 }
 
-async function startMcpServer(userDataPath, appPath) {
+async function startMcpServer(userDataPath, appPath, dependencies = {}) {
   fs.mkdirSync(userDataPath, { recursive: true });
   const tokenPath = path.join(userDataPath, 'mcp-token');
   let token;
@@ -269,7 +283,7 @@ async function startMcpServer(userDataPath, appPath) {
   let server;
   let lastError;
   for (const port of candidates) {
-    try { server = await listen(port, token); break; }
+    try { server = await listen(port, token, dependencies); break; }
     catch (error) {
       lastError = error;
       if (error.code !== 'EADDRINUSE' && port !== 0) throw error;

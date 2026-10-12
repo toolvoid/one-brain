@@ -1,7 +1,9 @@
 'use strict';
 
 (() => {
-  const HEADER = 'Context from my One Brain (background, may be outdated). Also use your own memory of me and our past chats, and tell me if they conflict:';
+  const blocks = globalThis.OneBrainContextBlocks || (typeof require === 'function' ? require('./context-blocks.js') : null);
+  const HEADER = blocks.HEADER;
+  const END = blocks.END;
   const MAX_CONTEXT_TOKENS = 1500;
   const MAX_CONTEXT_CHARS = MAX_CONTEXT_TOKENS * 4;
 
@@ -11,21 +13,21 @@
   }
 
   function composeBlock(memories, { maxTokens = MAX_CONTEXT_TOKENS, format = 'context' } = {}) {
-    const header = format === 'bullet' ? HEADER : HEADER;
-    let block = header;
     const maxChars = Math.max(4, Math.floor(Number(maxTokens) || MAX_CONTEXT_TOKENS) * 4);
+    let block = HEADER;
     for (const memory of memories) {
-      const marker = format === 'bullet' ? '- ' : '';
+      const marker = '- ';
       const row = `\n${marker}[${String(memory.source || 'memory')}] ${String(memory.title || 'Untitled memory')}: ${String(memory.text ?? memory.snippet ?? '').replace(/\s+/g, ' ').trim()}`;
+      if (block.length + row.length + END.length + 1 > maxChars) break;
       block += row;
     }
-    return block;
+    return `${block}\n${END}`;
   }
 
   function contextEstimate(block) { return Math.ceil(String(block).length / 4); }
 
   function nextEditorText(current, block) {
-    const draft = String(current || '');
+    const draft = blocks.stripContextBlocks(current);
     return `${String(block)}\n\n${draft}`;
   }
 
@@ -78,7 +80,7 @@
     return true;
   }
 
-  const api = Object.freeze({ HEADER, MAX_CONTEXT_TOKENS, MAX_CONTEXT_CHARS, editorText, composeBlock, contextEstimate, nextEditorText, insertTextarea, insertContentEditable, replaceEditor, undoInsertion });
+  const api = Object.freeze({ HEADER, END, MAX_CONTEXT_TOKENS, MAX_CONTEXT_CHARS, editorText, composeBlock, contextEstimate, stripContextBlocks: blocks.stripContextBlocks, hasContextBlocks: blocks.hasContextBlocks, nextEditorText, insertTextarea, insertContentEditable, replaceEditor, undoInsertion });
   if (typeof module !== 'undefined') module.exports = api;
   if (typeof globalThis !== 'undefined') globalThis.OneBrainEditorInsertion = api;
 })();

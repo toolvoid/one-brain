@@ -1232,8 +1232,9 @@ function App() {
                   <div className="client-heading"><strong>{client.name}</strong><span className={`client-status ${client.status}`}>{client.status}</span></div>
                   <small>Last seen {dateLabel(client.lastSeen) || '—'}</small>
                   <small>Token: {client.tokenStatus || 'none'}</small>
+                  {client.configError && <small className="import-error">{client.configError}</small>}
                   <div className="connector-actions">
-                    <button type="button" onClick={() => void previewConnector(client.id)}>Connect</button>
+                    <button type="button" disabled={Boolean(client.configError)} onClick={() => void previewConnector(client.id)}>Connect</button>
                     <button type="button" onClick={() => void previewDisconnectConnector(client.id)}>Disconnect</button>
                     {client.tokenStatus === 'active' && <button type="button" onClick={() => setConnectorAction({ operation: 'rotate-token', client: client.id, files: [{ path: `Secure token for ${client.name}`, before: '', after: 'Generate a new private token. The old token becomes invalid immediately; the token value is never shown.', changed: true }] })}>Rotate token</button>}
                     {client.tokenStatus === 'active' && <button type="button" onClick={() => setConnectorAction({ operation: 'revoke-token', client: client.id, files: [{ path: `Secure token for ${client.name}`, before: '', after: 'Revoke this client token immediately and remove its private token file.', changed: true }] })}>Revoke</button>}

@@ -149,6 +149,14 @@ test('extension origin fallback authenticates requests when the browser omits Or
   assert.equal((await response.json()).approval, 'approved');
 });
 
+test('search works with the explicit extension-origin fallback when Origin is absent', async (t) => {
+  const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
+  const token = await h.pair('claude');
+  const response = await h.request('/ext/search', { method: 'POST', site: 'claude', token, originHeader: '', extensionOriginHeader: h.origin, body: { query: 'synthetic fixture' } });
+  assert.equal(response.status, 200);
+  assert.equal(Array.isArray((await response.json()).memories), true);
+});
+
 test('unknown tokens return reason-coded 401 and log only reason, client, and hash prefix', async (t) => {
   const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
   const response = await h.request('/ext/ping', { token: '9'.repeat(64) });
@@ -201,7 +209,7 @@ test('save forces the source from the paired site and search excludes private re
   const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
   const token = await h.pair();
   h.profiles.get('ext:chatgpt').allowedSources = ['chatgpt'];
-  h.memories.push({ id: 1, source: 'chatgpt', title: 'Synthetic public', content: 'Synthetic fixture body', private: false, score: 0.9 }, { id: 2, source: 'chatgpt', title: 'Synthetic private', content: 'Synthetic private fixture body', private: true, score: 0.88 }, { id: 3, source: 'claude', title: 'Synthetic ungranted', content: 'Synthetic ungranted fixture body', private: false, score: 0.85 });
+  h.memories.push({ id: 1, source: 'chatgpt', title: 'Synthetic public', content: 'Synthetic fixture body with enough words to pass the minimum content length filter.', private: false, score: 0.9 }, { id: 2, source: 'chatgpt', title: 'Synthetic private', content: 'Synthetic private fixture body with enough content for filtering.', private: true, score: 0.88 }, { id: 3, source: 'claude', title: 'Synthetic ungranted', content: 'Synthetic ungranted fixture body with enough content for filtering.', private: false, score: 0.85 });
   let response = await h.request('/ext/search', { method: 'POST', token, body: { query: 'synthetic' } });
   let result = await response.json();
   assert.equal(response.status, 200);
@@ -220,7 +228,7 @@ test('save forces the source from the paired site and search excludes private re
 test('extension panel can mark an allowed memory never-suggest and search then excludes it', async (t) => {
   const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
   const token = await h.pair();
-  h.memories.push({ id: 11, source: 'chatgpt', title: 'Synthetic memory', content: 'Synthetic fixture body', private: false, no_suggest: false, score: 0.9 });
+  h.memories.push({ id: 11, source: 'chatgpt', title: 'Synthetic memory', content: 'Synthetic fixture body with enough words to pass the minimum content length filter.', private: false, no_suggest: false, score: 0.9 });
   let response = await h.request('/ext/search', { method: 'POST', token, body: { query: 'Synthetic fixture', limit: 5 } });
   let result = await response.json();
   assert.deepEqual(result.memories.map((item) => item.id), [11]);

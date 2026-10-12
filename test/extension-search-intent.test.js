@@ -34,3 +34,10 @@ test('an unreachable API result cannot open an insertion path', () => {
   assert.equal(canShowSearchResult(undefined), false);
   assert.equal(canShowSearchResult({ ok: true, memories: [] }), true);
 });
+
+test('intent and query ignore inserted context in the draft and recent messages', () => {
+  const insertion=require('../extension/src/editor-insertion.js');
+  const block=insertion.composeBlock([{source:'codex',title:'Fixture',text:'One Brain prior preference'}]);
+  assert.equal(detectMemoryIntent(block),false);
+  assert.equal(buildSearchQuery(`${block}\n\nFind my preference`,[`${block}\n\nMy project uses SQLite`]),'Find my preference\nMy project uses SQLite');
+});

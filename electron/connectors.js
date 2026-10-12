@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 
 const INSTRUCTIONS = 'At the start of a task or when the user mentions memory, past conversations, or One Brain, call search_memories. After meaningful work, save only durable facts (decisions, setup, fixes, preferences) with add_memory and a short clear title. Never save secrets, logs, UI tweaks, personality descriptions, or guesses about the user; check for duplicates first.';
 const BEGIN = '<!-- ONE-BRAIN:BEGIN -->';
@@ -10,8 +11,8 @@ const CLIENTS = [
   { id: 'codex', name: 'Codex', kind: 'managed' },
   { id: 'vscode', name: 'VS Code Copilot', kind: 'managed' },
   { id: 'gemini', name: 'Gemini CLI', kind: 'managed' },
-  { id: 'claude-code', name: 'Claude Code', kind: 'snippet' },
-  { id: 'claude-desktop', name: 'Claude Desktop', kind: 'snippet' }
+  { id: 'claude-code', name: 'Claude Code', kind: 'managed' },
+  { id: 'claude-desktop', name: 'Claude Desktop', kind: 'managed' }
 ];
 
 function instructionBlock() { return `${BEGIN}\n${INSTRUCTIONS}\n${END}`; }
@@ -35,38 +36,48 @@ function instructionPath(homeDir, client) {
 
 function resolveNode(env = process.env) { return executableOnPath('node', env) || 'node'; }
 
-function clientPaths(homeDir, appPath) {
+function clientPaths(homeDir, appPath, { platform = process.platform, env = process.env } = {}) {
+  const desktopRoot = platform === 'win32'
+    ? path.join(env.APPDATA || path.join(homeDir, 'AppData', 'Roaming'), 'Claude')
+    : platform === 'darwin'
+      ? path.join(homeDir, 'Library', 'Application Support', 'Claude')
+      : path.join(homeDir, '.config', 'Claude');
   return {
     codex: { config: path.join(homeDir, '.codex', 'config.toml'), instructions: instructionPath(homeDir, 'codex') },
     vscode: { config: path.join(homeDir, '.config', 'Code', 'User', 'mcp.json') },
     gemini: { config: path.join(homeDir, '.gemini', 'settings.json'), instructions: instructionPath(homeDir, 'gemini') },
-    'claude-code': {}, 'claude-desktop': {},
+    'claude-code': { config: path.join(homeDir, '.claude.json'), cli: executableOnPath('claude', env) },
+    'claude-desktop': { config: path.join(desktopRoot, 'claude_desktop_config.json'), root: desktopRoot },
     bridge: path.resolve(appPath, 'scripts', 'mcp-stdio.js')
   };
 }
 
 function discoverClients(homeDir, appPath, profiles = [], tokenStates = [], env = process.env) {
   if (!Array.isArray(tokenStates)) { env = tokenStates; tokenStates = []; }
-  const paths = clientPaths(homeDir, appPath);
+  const paths = clientPaths(homeDir, appPath, { env });
   const have = (file) => { try { return fs.existsSync(file); } catch { return false; } };
   const checks = {
     codex: have(path.dirname(paths.codex.config)) || Boolean(executableOnPath('codex', env)),
     vscode: have(path.dirname(paths.vscode.config)) || Boolean(executableOnPath('code', env)),
     gemini: have(path.dirname(paths.gemini.config)) || Boolean(executableOnPath('gemini', env)),
-    'claude-code': have(path.join(homeDir, '.claude')) || Boolean(executableOnPath('claude', env)),
-    'claude-desktop': have(path.join(homeDir, '.config', 'Claude')) || have(path.join(homeDir, 'Library', 'Application Support', 'Claude'))
+    'claude-code': have(paths['claude-code'].config) || have(path.join(homeDir, '.claude')) || Boolean(paths['claude-code'].cli),
+    'claude-desktop': have(paths['claude-desktop'].root)
   };
   const aliases = {
     codex: ['codex'], vscode: ['vscode', 'visualstudiocode', 'copilot'], gemini: ['geminicli', 'gemini'],
     'claude-code': ['claudecode'], 'claude-desktop': ['claudedesktop']
   };
   return CLIENTS.map((client) => {
-    const profile = profiles.find((item) => item.verified && aliases[client.id].some((needle) => String(item.client || '').toLowerCase().replace(/[^a-z0-9]/g, '').includes(needle)));
+    const profile = profiles.find((item) => item.verified && item.status === 'approved' && aliases[client.id].some((needle) => String(item.client || '').toLowerCase().replace(/[^a-z0-9]/g, '').includes(needle)));
     const token = tokenStates.find((item) => item.client === client.id);
     const found = checks[client.id];
-    return { ...client, status: profile ? 'connected' : found ? 'found' : 'not found', lastSeen: profile?.last_seen || null,
-      tokenStatus: token ? (token.revoked ? 'revoked' : 'active') : 'none', paths: paths[client.id] || {},
-      ...((client.kind === 'managed') ? { previewFiles: previewClient(client.id, homeDir, appPath, env) } : {}) };
+    const result = { ...client, status: profile ? 'connected' : found ? 'found' : 'not found', lastSeen: profile?.last_seen || null,
+      tokenStatus: token ? (token.revoked ? 'revoked' : 'active') : 'none', paths: paths[client.id] || {} };
+    if (client.kind === 'managed') {
+      try { result.previewFiles = previewClient(client.id, homeDir, appPath, env); }
+      catch { result.configError = 'Configuration is invalid or unsupported. One Brain will not modify this file.'; }
+    }
+    return result;
   });
 }
 
@@ -76,15 +87,76 @@ function serverJson(appPath, env, clientId) {
 
 function tomlString(value) { return JSON.stringify(value); }
 
+function parseTomlDottedKey(raw) {
+  const value = String(raw || '').trim(); const parts = []; let index = 0;
+  while (index < value.length) {
+    while (/\s/.test(value[index] || '')) index++;
+    const quote = value[index]; let part = '';
+    if (quote === '"' || quote === "'") {
+      index++;
+      let closed = false;
+      while (index < value.length) {
+        const char = value[index++];
+        if (char === quote) { closed = true; break; }
+        if (quote === '"' && char === '\\' && index < value.length) part += value[index++];
+        else part += char;
+      }
+      if (!closed) return null;
+    } else {
+      const match = value.slice(index).match(/^[A-Za-z0-9_-]+/);
+      if (!match) return null;
+      part = match[0]; index += part.length;
+    }
+    parts.push(part);
+    while (/\s/.test(value[index] || '')) index++;
+    if (index === value.length) break;
+    if (value[index++] !== '.') return null;
+    if (index === value.length) return null;
+  }
+  return parts.length ? parts : null;
+}
+
+function tomlTableParts(line) {
+  const clean = String(line || '').trim().replace(/\s+#.*$/, '').trim();
+  if (!clean.startsWith('[')) return null;
+  const array = clean.startsWith('[[');
+  const opening = array ? 2 : 1, closing = array ? 2 : 1;
+  if (!clean.endsWith(']'.repeat(closing))) return null;
+  const inner = clean.slice(opening, -closing).trim();
+  const parts = parseTomlDottedKey(inner);
+  return parts ? { parts, array } : null;
+}
+
+function tomlAssignment(line) {
+  let quote = null, escaped = false;
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index];
+    if (quote) {
+      if (quote === '"' && char === '\\' && !escaped) { escaped = true; continue; }
+      if (char === quote && !escaped) quote = null;
+      escaped = false;
+    } else if (char === '"' || char === "'") quote = char;
+    else if (char === '=') {
+      const key = parseTomlDottedKey(line.slice(0, index));
+      return key ? { key, value: line.slice(index + 1).trim() } : null;
+    }
+  }
+  return null;
+}
+
+function sameTomlPath(left, right) { return left.length === right.length && left.every((part, index) => part === right[index]); }
+
 function mergeTomlServer(input, command, args) {
+  validateToml(input);
   const argumentList = Array.isArray(args) ? args : [args];
   const tomlArgs = `[${argumentList.map((arg) => tomlString(arg)).join(', ')}]`;
   const section = '[mcp_servers.one-brain]';
   const lines = input.split(/(?<=\n)/);
   let start = -1, end = lines.length;
   for (let i = 0; i < lines.length; i++) {
-    if (/^\s*\[mcp_servers\.one-brain\]\s*(?:#.*)?(?:\r?\n)?$/.test(lines[i])) { start = i; continue; }
-    if (start >= 0 && /^\s*\[/.test(lines[i])) { end = i; break; }
+    const table = tomlTableParts(lines[i]);
+    if (table && !table.array && sameTomlPath(table.parts, ['mcp_servers', 'one-brain'])) { start = i; continue; }
+    if (start >= 0 && table) { end = i; break; }
   }
   if (start >= 0) {
     const body = lines.slice(start + 1, end); let sawCommand = false, sawArgs = false;
@@ -114,11 +186,80 @@ function mergeTomlServer(input, command, args) {
   return lines.join('');
 }
 
+function validateToml(input) {
+  let section = '';
+  const keys = new Set();
+  let valueBuffer = '';
+  function withoutComment(raw) {
+    let quote = null, triple = false, escaped = false;
+    for (let i = 0; i < raw.length; i++) {
+      const char = raw[i];
+      if (quote) {
+        if (triple && raw.slice(i, i + 3) === quote.repeat(3) && !escaped) { i += 2; quote = null; triple = false; }
+        else if (!triple && char === quote && !escaped) quote = null;
+        escaped = char === '\\' && !escaped;
+        if (char !== '\\') escaped = false;
+      } else if (char === '"' || char === "'") {
+        quote = char; triple = raw.slice(i, i + 3) === char.repeat(3); if (triple) i += 2;
+      } else if (char === '#') return raw.slice(0, i);
+    }
+    return raw;
+  }
+  function valueState(value) {
+    const stack = []; let quote = null, triple = false, escaped = false;
+    for (let i = 0; i < value.length; i++) {
+      const char = value[i];
+      if (quote) {
+        if (triple && value.slice(i, i + 3) === quote.repeat(3) && !escaped) { i += 2; quote = null; triple = false; }
+        else if (!triple && char === quote && !escaped) quote = null;
+        escaped = char === '\\' && !escaped; if (char !== '\\') escaped = false;
+        continue;
+      }
+      if (char === '"' || char === "'") { quote = char; triple = value.slice(i, i + 3) === char.repeat(3); if (triple) i += 2; continue; }
+      if (char === '[' || char === '{') stack.push(char);
+      else if (char === ']' || char === '}') {
+        const opening = stack.pop();
+        if ((char === ']' && opening !== '[') || (char === '}' && opening !== '{')) throw new Error('Invalid TOML value.');
+      }
+    }
+    return { complete: !quote && stack.length === 0, quote, stack };
+  }
+  for (const [index, rawLine] of String(input || '').split(/\r?\n/).entries()) {
+    const raw = index === 0 ? rawLine.replace(/^\uFEFF/, '') : rawLine;
+    const line = withoutComment(raw);
+    const trimmed = line.trim();
+    if (!trimmed && !valueBuffer) continue;
+    if (!valueBuffer && trimmed.startsWith('[')) {
+      const table = tomlTableParts(trimmed);
+      if (!table) throw new Error(`Invalid TOML table on line ${index + 1}.`);
+      section = table.parts.join('.'); keys.clear(); continue;
+    }
+    if (!valueBuffer) {
+      const assignment = tomlAssignment(trimmed);
+      if (!assignment) throw new Error(`Invalid TOML assignment on line ${index + 1}.`);
+      const key = `${section}.${assignment.key.join('.')}`;
+      if (keys.has(key)) throw new Error(`Duplicate TOML key on line ${index + 1}.`);
+      keys.add(key); valueBuffer = assignment.value;
+    } else valueBuffer += ` ${trimmed}`;
+    const state = valueState(valueBuffer);
+    if (state.complete) {
+      const value = valueBuffer.trim();
+      if (!value || (!/^(?:"|')/.test(value) && !/^(?:true|false|[-+]?\d|\{|\[)/.test(value) && !/^\d{4}-\d\d-\d\d(?:[Tt ]|$)/.test(value))) {
+        throw new Error(`Invalid TOML value on line ${index + 1}.`);
+      }
+      valueBuffer = '';
+    }
+  }
+  if (valueBuffer) throw new Error('Incomplete TOML value.');
+  return true;
+}
+
 function removeTomlServer(input) {
   const lines = input.split(/(?<=\n)/); let start = -1, end = lines.length;
   for (let i = 0; i < lines.length; i++) {
-    if (/^\s*\[mcp_servers\.one-brain\]\s*(?:#.*)?(?:\r?\n)?$/.test(lines[i])) { start = i; continue; }
-    if (start >= 0 && /^\s*\[/.test(lines[i])) { end = i; break; }
+    const table = tomlTableParts(lines[i]);
+    if (table && !table.array && sameTomlPath(table.parts, ['mcp_servers', 'one-brain'])) { start = i; continue; }
+    if (start >= 0 && table) { end = i; break; }
   }
   if (start < 0) return input;
   lines.splice(start, end - start);
@@ -163,7 +304,7 @@ function instructionPreview(file, enabled) {
 function previewClient(clientId, homeDir, appPath, env = process.env) {
   const client = CLIENTS.find((item) => item.id === clientId);
   if (!client) throw new Error(`Unsupported client: ${clientId}`);
-  const paths = clientPaths(homeDir, appPath); const server = serverJson(appPath, env, clientId); const edits = [];
+  const paths = clientPaths(homeDir, appPath, { env }); const server = serverJson(appPath, env, clientId); const edits = [];
   if (clientId === 'codex') {
     const file = paths.codex.config; const before = readIfExists(file);
     const after = mergeTomlServer(before, server.command, server.args); edits.push({ path: file, before, after, changed: before !== after });
@@ -175,6 +316,12 @@ function previewClient(clientId, homeDir, appPath, env = process.env) {
     const file = paths.gemini.config; const before = readIfExists(file);
     const after = mergeJsonServer(before, 'mcpServers', server); edits.push({ path: file, before, after, changed: before !== after });
     edits.push(instructionPreview(paths.gemini.instructions, true));
+  } else if (clientId === 'claude-desktop') {
+    const file = paths['claude-desktop'].config; const before = readIfExists(file);
+    const after = mergeJsonServer(before, 'mcpServers', server); edits.push({ path: file, before, after, changed: before !== after });
+  } else if (clientId === 'claude-code') {
+    const file = paths['claude-code'].config; const before = readIfExists(file);
+    const after = mergeJsonServer(before, 'mcpServers', server); edits.push({ path: file, before, after, changed: before !== after });
   } else if (client.kind === 'snippet') {
     return [
       { path: `Local token for ${client.name}`, before: '', after: `Create a private token file at userData/tokens/${clientId}.token and write this client's SHA-256 hash to the local database. The token value is never shown.`, changed: true },
@@ -192,21 +339,54 @@ function makeBackup(file, now = new Date()) {
   return backup;
 }
 
+function validateConfigFile(file, contents) {
+  const extension = path.extname(file).toLowerCase();
+  if (extension === '.json') {
+    const parsed = JSON.parse(contents);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Expected a JSON object in client configuration.');
+  } else if (extension === '.toml') validateToml(contents);
+}
+
+function writeAtomic(file, contents) {
+  const existingMode = fs.existsSync(file) ? fs.statSync(file).mode & 0o777 : 0o600;
+  const temporary = `${file}.one-brain-${process.pid}-${Date.now()}.tmp`;
+  const fd = fs.openSync(temporary, 'wx', existingMode);
+  try { fs.writeFileSync(fd, contents, 'utf8'); fs.fsyncSync(fd); }
+  finally { fs.closeSync(fd); }
+  fs.chmodSync(temporary, existingMode);
+  fs.renameSync(temporary, file);
+}
+
 function applyEdits(edits) {
   const changed = edits.filter((edit) => edit.changed);
-  for (const edit of changed) fs.mkdirSync(path.dirname(edit.path), { recursive: true });
-  for (const edit of changed) if (fs.existsSync(edit.path)) makeBackup(edit.path);
-  for (const edit of changed) fs.writeFileSync(edit.path, edit.after, { encoding: 'utf8', mode: 0o600 });
+  for (const edit of changed) validateConfigFile(edit.path, edit.after);
+  for (const edit of changed) fs.mkdirSync(path.dirname(edit.path), { recursive: true, mode: 0o700 });
+  const backups = new Map();
+  for (const edit of changed) if (fs.existsSync(edit.path)) backups.set(edit.path, makeBackup(edit.path));
+  const created = [];
+  try {
+    for (const edit of changed) {
+      if (!backups.has(edit.path)) created.push(edit.path);
+      writeAtomic(edit.path, edit.after);
+      validateConfigFile(edit.path, fs.readFileSync(edit.path, 'utf8'));
+      if (fs.readFileSync(edit.path, 'utf8') !== edit.after) throw new Error(`Could not verify connector configuration: ${edit.path}`);
+    }
+  } catch (error) {
+    for (const [file, backup] of backups) { try { writeAtomic(file, fs.readFileSync(backup, 'utf8')); } catch {} }
+    for (const file of created) { try { fs.rmSync(file, { force: true }); } catch {} }
+    throw error;
+  }
   return changed.map((edit) => edit.path);
 }
 
 function disconnectPreview(clientId, homeDir, appPath = process.cwd(), env = process.env) {
-  const paths = clientPaths(homeDir, ''); const edits = [];
+  const paths = clientPaths(homeDir, '', { env }); const edits = [];
   const connectTransform = (file, input) => {
     const server = serverJson(appPath, env, clientId);
     if (clientId === 'codex' && file === paths.codex.config) return mergeTomlServer(input, server.command, server.args);
     if (clientId === 'vscode' && file === paths.vscode.config) return mergeJsonServer(input, 'servers', server);
     if (clientId === 'gemini' && file === paths.gemini.config) return mergeJsonServer(input, 'mcpServers', server);
+    if ((clientId === 'claude-code' || clientId === 'claude-desktop') && file === paths[clientId].config) return mergeJsonServer(input, 'mcpServers', server);
     if (file === paths.codex.instructions || file === paths.gemini.instructions) return replaceInstructionBlock(input, true);
     return input;
   };
@@ -229,6 +409,8 @@ function disconnectPreview(clientId, homeDir, appPath = process.cwd(), env = pro
   else if (clientId === 'gemini') {
     add(paths.gemini.config, (value) => removeJsonServer(value, 'mcpServers'));
     add(paths.gemini.instructions, (value) => replaceInstructionBlock(value, false));
+  } else if (clientId === 'claude-code' || clientId === 'claude-desktop') {
+    add(paths[clientId].config, (value) => removeJsonServer(value, 'mcpServers'));
   } else throw new Error(`Unsupported managed client: ${clientId}`);
   return edits;
 }
@@ -240,4 +422,63 @@ function snippetFor(clientId, appPath, env = process.env) {
   throw new Error(`Unsupported snippet client: ${clientId}`);
 }
 
-module.exports = { INSTRUCTIONS, CLIENTS, instructionBlock, clientPaths, resolveNode, discoverClients, mergeTomlServer, removeTomlServer, mergeJsonServer, removeJsonServer, replaceInstructionBlock, previewClient, disconnectPreview, applyEdits, snippetFor };
+function detectConnector(clientId, homeDir, appPath, env = process.env) {
+  const client = CLIENTS.find((item) => item.id === clientId);
+  if (!client) throw new Error(`Unsupported client: ${clientId}`);
+  const paths = clientPaths(homeDir, appPath, { env });
+  const exists = (file) => { try { return fs.existsSync(file); } catch { return false; } };
+  if (clientId === 'claude-code') return Boolean(paths['claude-code'].cli || exists(path.join(homeDir, '.claude')) || exists(paths['claude-code'].config));
+  if (clientId === 'claude-desktop') return exists(paths['claude-desktop'].root);
+  if (clientId === 'codex') return exists(path.dirname(paths.codex.config)) || Boolean(executableOnPath('codex', env));
+  if (clientId === 'gemini') return exists(path.dirname(paths.gemini.config)) || Boolean(executableOnPath('gemini', env));
+  return exists(path.dirname(paths[clientId].config)) || Boolean(executableOnPath('code', env));
+}
+
+function connectClient(clientId, homeDir, appPath, env = process.env, options = {}) {
+  if (!detectConnector(clientId, homeDir, appPath, env)) throw new Error(`${CLIENTS.find((item) => item.id === clientId)?.name || clientId} is not installed.`);
+  const paths = clientPaths(homeDir, appPath, { env });
+  const cli = paths['claude-code']?.cli;
+  if (clientId === 'claude-code' && cli) {
+    const config = paths['claude-code'].config;
+    if (fs.existsSync(config)) makeBackup(config);
+    const server = serverJson(appPath, env, clientId);
+    const run = options.runCli || ((file, args) => spawnSync(file, args, { encoding: 'utf8', windowsHide: true }));
+    const result = run(cli, ['mcp', 'add', '--scope', 'user', '--transport', 'stdio', 'one-brain', '--', server.command, ...server.args]);
+    if (result.error || result.status !== 0) throw new Error('Claude Code could not add the One Brain MCP server.');
+    const saved = JSON.parse(readIfExists(config) || '{}');
+    if (!saved.mcpServers?.['one-brain']) throw new Error('Claude Code configuration did not contain the One Brain server after adding it.');
+    return [config];
+  }
+  return applyEdits(previewClient(clientId, homeDir, appPath, env));
+}
+
+function disconnectClient(clientId, homeDir, appPath, env = process.env) {
+  if (!detectConnector(clientId, homeDir, appPath, env)) return [];
+  return applyEdits(disconnectPreview(clientId, homeDir, appPath, env));
+}
+
+function isConnected(clientId, profiles = []) {
+  const aliases = { codex: ['codex'], vscode: ['vscode', 'visualstudiocode', 'copilot'], gemini: ['geminicli', 'gemini'], 'claude-code': ['claudecode'], 'claude-desktop': ['claudedesktop'] };
+  const names = aliases[clientId];
+  if (!names) throw new Error(`Unsupported client: ${clientId}`);
+  return profiles.some((item) => item.verified && item.status === 'approved' && names.some((needle) => String(item.client || '').toLowerCase().replace(/[^a-z0-9]/g, '').includes(needle)));
+}
+
+function testConnector(clientId, appPath, userDataPath, env = process.env, options = {}) {
+  const file = path.join(userDataPath, 'tokens', `${clientId.replaceAll(':', '~3a')}.token`);
+  if (!fs.existsSync(file)) return { ok: false, reason: 'No local token is stored for this connector.' };
+  const server = serverJson(appPath, env, clientId);
+  const messages = [
+    { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'one-brain-connection-test', version: '1.0.0' } } },
+    { jsonrpc: '2.0', method: 'notifications/initialized' },
+    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'search_memory', arguments: { query: 'One Brain connection check', limit: 1 } } }
+  ].map((message) => JSON.stringify(message)).join('\n') + '\n';
+  const run = options.run || ((command, args, input) => spawnSync(command, args, { input, encoding: 'utf8', timeout: 10000, windowsHide: true, env }));
+  const result = run(server.command, server.args, messages);
+  if (result.error || result.status !== 0) return { ok: false, reason: 'MCP server did not complete the local search check.' };
+  const response = String(result.stdout || '').split(/\r?\n/).map((line) => { try { return JSON.parse(line); } catch { return null; } }).find((message) => message?.id === 2);
+  if (!response || response.error || response.result?.isError) return { ok: false, reason: 'MCP search_memory did not return successfully. Check app approval and local API availability.' };
+  return { ok: true, reason: 'search_memory succeeded.' };
+}
+
+module.exports = { INSTRUCTIONS, CLIENTS, instructionBlock, clientPaths, resolveNode, discoverClients, detectConnector, isConnected, connectClient, disconnectClient, testConnector, mergeTomlServer, removeTomlServer, mergeJsonServer, removeJsonServer, replaceInstructionBlock, previewClient, disconnectPreview, applyEdits, snippetFor, validateToml };

@@ -7,9 +7,9 @@ const { createHash, createPrivateKey, createPublicKey, generateKeyPairSync } = r
 const ROOT = path.resolve(__dirname, '..');
 const hosts = ['http://127.0.0.1/*', 'https://chatgpt.com/*', 'https://claude.ai/*', 'https://gemini.google.com/*'];
 const contentScripts = [
-  { matches: ['https://chatgpt.com/*'], js: ['src/adapters/chatgpt.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
-  { matches: ['https://claude.ai/*'], js: ['src/adapters/claude.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
-  { matches: ['https://gemini.google.com/*'], js: ['src/adapters/gemini.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' }
+  { matches: ['https://chatgpt.com/*'], js: ['src/adapters/chatgpt.js', 'src/context-blocks.js', 'src/background-message.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/smart-save.js', 'src/insertion-guard.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
+  { matches: ['https://claude.ai/*'], js: ['src/adapters/claude.js', 'src/context-blocks.js', 'src/background-message.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/smart-save.js', 'src/insertion-guard.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
+  { matches: ['https://gemini.google.com/*'], js: ['src/adapters/gemini.js', 'src/context-blocks.js', 'src/background-message.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/smart-save.js', 'src/insertion-guard.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' }
 ];
 
 function chromeKey(keyDirectory) {

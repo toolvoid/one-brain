@@ -18,7 +18,7 @@ function wordMatch(query, memory) {
   for (const term of q) if (term.length > 1 && m.has(term)) return true;
   return false;
 }
-async function rankExtensionResults({ query, memories, limit = 5, minScore = 0.015, excludeIds = [], getVector = () => null, maxPerConversation = 2, duplicateThreshold = 0.92 } = {}) {
+async function rankExtensionResults({ query, memories, limit = 5, minScore = 0.015, excludeIds = [], getVector = () => null, maxPerConversation = 2, duplicateThreshold = 0.9 } = {}) {
   const excluded = new Set((excludeIds || []).map(String));
   const allowed = (memories || []).filter((memory) => memory && !memory.private && !memory.no_suggest && !excluded.has(String(memory.id)) && Number.isFinite(Number(memory.score)));
   allowed.sort((a, b) => Number(b.score) - Number(a.score));
@@ -42,7 +42,7 @@ async function rankExtensionResults({ query, memories, limit = 5, minScore = 0.0
     const matchedWords = wordMatch(query, memory);
     const item = {
       id: memory.id, source: memory.source, title: memory.title || 'Untitled memory',
-      snippet: String(memory.content || memory.snippet || '').replace(/\s+/g, ' ').trim().slice(0, 240),
+      snippet: String(memory.snippet || memory.content || '').replace(/\s+/g, ' ').trim().slice(0, 350),
       score: Number(memory.score), reason: matchedWords && memory.matchedSemantic ? 'both' : matchedWords ? 'matched words' : 'similar meaning'
     };
     chosen.push(item);

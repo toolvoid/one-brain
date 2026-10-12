@@ -82,14 +82,15 @@ ipcMain.handle('mcp:config', () => mcpConnection ? { endpoint: mcpConnection.con
 ipcMain.handle('connectors:list', () => connectors.discoverClients(app.getPath('home'), app.getAppPath(), listClients(), listClientTokenStates()));
 ipcMain.handle('connectors:preview', (_event, client) => connectors.previewClient(client, app.getPath('home'), app.getAppPath()));
 ipcMain.handle('connectors:connect', (_event, client) => {
+  if (!connectors.detectConnector(client, app.getPath('home'), app.getAppPath())) throw new Error(`${connectors.CLIENTS.find((item) => item.id === client)?.name || 'Client'} is not installed.`);
   createClientToken(app.getPath('userData'), client, storeClientTokenHash);
-  const edits = connectors.previewClient(client, app.getPath('home'), app.getAppPath());
-  return connectors.CLIENTS.find((item) => item.id === client)?.kind === 'snippet' ? [] : connectors.applyEdits(edits);
+  return connectors.connectClient(client, app.getPath('home'), app.getAppPath());
 });
 ipcMain.handle('connectors:rotate-token', (_event, client) => createClientToken(app.getPath('userData'), client, storeClientTokenHash));
+ipcMain.handle('connectors:test', (_event, client) => connectors.testConnector(client, app.getAppPath(), app.getPath('userData')));
 ipcMain.handle('connectors:revoke-token', (_event, client) => revokeClientTokenFile(app.getPath('userData'), client, revokeClientToken));
 ipcMain.handle('connectors:disconnect-preview', (_event, client) => connectors.disconnectPreview(client, app.getPath('home'), app.getAppPath()));
-ipcMain.handle('connectors:disconnect', (_event, client) => connectors.applyEdits(connectors.disconnectPreview(client, app.getPath('home'), app.getAppPath())));
+ipcMain.handle('connectors:disconnect', (_event, client) => connectors.disconnectClient(client, app.getPath('home'), app.getAppPath()));
 ipcMain.handle('connectors:snippet', (_event, client) => connectors.snippetFor(client, app.getAppPath()));
 ipcMain.handle('embeddings:status', () => embeddingStatus);
 ipcMain.handle('embeddings:retry', async () => {
@@ -245,7 +246,11 @@ app.whenReady().then(async () => {
     for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:memory-proxy-ready', connection);
   } catch (error) { console.error('Could not start One Brain memory proxy:', error?.name || 'Error'); }
 
-  startMcpServer(app.getPath('userData'), app.getAppPath()).then((connection) => {
+  startMcpServer(app.getPath('userData'), app.getAppPath(), {
+    searchMemoriesForClient, getEmbeddingVector: getMemoryEmbeddingVector,
+    embedText: (text) => embedder?.embed(text) || Promise.reject(new Error('Local embedder is unavailable.')),
+    listMemories, addMemory
+  }).then((connection) => {
     mcpConnection = connection;
     createWindow();
     console.log(`One Brain MCP listening at ${connection.config.endpoint}`);

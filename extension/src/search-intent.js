@@ -1,6 +1,7 @@
 'use strict';
 
 (() => {
+  const blocks = globalThis.OneBrainContextBlocks || (typeof require === 'function' ? require('./context-blocks.js') : null);
   const DEFAULT_MEMORY_PHRASES = Object.freeze([
     'remember', 'do you remember', 'last time', 'earlier', 'previously', 'about me', 'my memory', 'one brain',
     'yaad', 'yaad hai', 'pichli baar', 'pehle', 'mere baare mein', 'meri memory', 'maine bataya tha', 'mera project', 'mera naam'
@@ -8,13 +9,13 @@
   const FOLLOW_UP = /\b(?:isko|uska|that|it|aur\s+detail\s+mein|continue)\b/i;
   function normalize(value) { return String(value || '').replace(/\s+/g, ' ').trim(); }
   function buildSearchQuery(draft, recent = []) {
-    const text = normalize(draft);
-    const history = (Array.isArray(recent) ? recent : []).slice(-2).map((item) => normalize(typeof item === 'string' ? item : item?.text)).filter(Boolean).map((item) => item.slice(0, 300));
+    const text = normalize(blocks.stripContextBlocks(draft));
+    const history = (Array.isArray(recent) ? recent : []).slice(-2).map((item) => normalize(blocks.stripContextBlocks(typeof item === 'string' ? item : item?.text))).filter(Boolean).map((item) => item.slice(0, 300));
     if (!history.length || (text.length >= 40 && !FOLLOW_UP.test(text))) return text.slice(0, 4000);
     return [text, ...history].filter(Boolean).join('\n').slice(0, 4000);
   }
   function detectMemoryIntent(text, phrases = DEFAULT_MEMORY_PHRASES) {
-    const normalized = normalize(text).toLocaleLowerCase();
+    const normalized = normalize(blocks.stripContextBlocks(text)).toLocaleLowerCase();
     if (!normalized) return false;
     return phrases.some((phrase) => {
       const term = normalize(phrase).toLocaleLowerCase();

@@ -32,6 +32,7 @@ contextBridge.exposeInMainWorld('brain', {
   listConnectors: () => ipcRenderer.invoke('connectors:list'),
   previewConnector: (client) => ipcRenderer.invoke('connectors:preview', client),
   connectConnector: (client) => ipcRenderer.invoke('connectors:connect', client),
+  testConnector: (client) => ipcRenderer.invoke('connectors:test', client),
   previewDisconnectConnector: (client) => ipcRenderer.invoke('connectors:disconnect-preview', client),
   disconnectConnector: (client) => ipcRenderer.invoke('connectors:disconnect', client),
   getConnectorSnippet: (client) => ipcRenderer.invoke('connectors:snippet', client),

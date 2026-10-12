@@ -4,6 +4,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { createHash, randomInt } = require('node:crypto');
 const { rankExtensionResults } = require('./ext-search');
+const { prepareSearchMemories } = require('./ext-context');
+const contextBlocks = require('../extension/src/context-blocks');
+const smartSave = require('../extension/src/smart-save');
 const { splitChatMessages, contentHash, looksSecret } = require('./ext-chat');
 
 const SITES = Object.freeze({ chatgpt: 'chatgpt', claude: 'claude', gemini: 'gemini' });
@@ -128,7 +131,15 @@ function createExtApi(options) {
     const options = body.options && typeof body.options === 'object' ? body.options : {};
     const rawTitle = String(body.title || `Saved ${site} chat`).slice(0, 160);
     const safeTitle = looksSecret(rawTitle) ? `Saved ${site} chat` : rawTitle;
-    const parsed = await splitChatMessages({ messages: body.messages.filter((message) => message && typeof message.text === 'string'), include, split, title: safeTitle, skipLogs: options.skipLogs !== false, skipSecrets: options.skipSecrets !== false, embedText });
+    let parsed;
+    if (Array.isArray(body.selectedItems)) {
+      const importer = await import('../src/lib/importers.js');
+      const items = body.selectedItems.slice(0, 100).map((item) => ({ title: String(item.title || safeTitle).slice(0, 160), content: contextBlocks.stripContextBlocks(item.content) })).filter((item) => item.content.trim().length >= 25 && !looksSecret(item.title) && !looksSecret(item.content) && !importer.isLogLikeChunk(item.content));
+      parsed = { items, skippedLogs: 0, skippedSecrets: body.selectedItems.length - items.length };
+    } else {
+      const messages = body.messages.filter((message) => message && typeof message.text === 'string').map((message) => ({...message,text:contextBlocks.stripContextBlocks(message.text)}));
+      parsed = await splitChatMessages({ messages, include, split, title: safeTitle, skipLogs: options.skipLogs !== false, skipSecrets: options.skipSecrets !== false, embedText });
+    }
     let items = parsed.items.map((item) => ({ ...item, source }));
     const priorHashes = new Set(existing.hashes || []);
     const oldDuplicates = items.filter((item) => priorHashes.has(contentHash(item.content))).length;
@@ -240,7 +251,10 @@ function createExtApi(options) {
       const excludeIds = Array.isArray(body.excludeIds) ? body.excludeIds.slice(0, 500) : [];
       const minScore = body.minScore == null ? 0.015 : Math.max(0, Math.min(1, Number(body.minScore) || 0));
       const result = query ? await searchMemoriesForClient(query, 'all', Math.min(50, limit * 10), profile) : { memories: [] };
-      const memories = await rankExtensionResults({ query, memories: (result.memories || []).filter((memory) => !memory.private && !memory.no_suggest && profile.allowedSources?.includes(memory.source)), limit, minScore, excludeIds, getVector: getEmbeddingVector });
+      const importer = await import('../src/lib/importers.js');
+      const safeMemories = (result.memories || []).filter((memory) => profile.allowedSources?.includes(memory.source) && String(memory.content || '').trim().length >= 25 && String(memory.title || '').trim().toLowerCase() !== String(memory.content || '').trim().toLowerCase() && !importer.isLogLikeChunk(String(memory.content || '')));
+      const queryVector = typeof embedText === 'function' ? await embedText(query).catch(() => null) : null;
+      const memories = await prepareSearchMemories({ query, memories: safeMemories, limit, excludeIds, getVector: getEmbeddingVector, queryVector, embedText, floor: 0.12 });
       emitRetrieved(memories.map((memory) => memory.id));
       log(identity.client, { ok: true, count: memories.length, latency: now() - started }, memories.map((memory) => memory.id));
       return sendJson(res, 200, { memories }, origin);
@@ -260,7 +274,10 @@ function createExtApi(options) {
         return sendJson(res, 400, { error: 'A valid site, kind, and text are required.' }, origin);
       }
       const title = String(body.title || `Saved from ${site}`).trim().slice(0, 200) || `Saved from ${site}`;
-      const memory = addMemory({ source: site, title, content: body.text.trim() }, { handAdded: true });
+      const cleanText = contextBlocks.stripContextBlocks(body.text).trim();
+      const scored = smartSave.scoreMessage(cleanText);
+      if (!cleanText || looksSecret(cleanText) || scored.reason === 'filtered') return sendJson(res, 400, { error: 'This text cannot be saved.' }, origin);
+      const memory = addMemory({ source: site, title, content: cleanText }, { handAdded: true });
       if (memory?.id != null) emitAdded(memory.id);
       log(identity.client, { ok: true, count: memory?.id == null ? 0 : 1, latency: now() - started }, memory?.id == null ? [] : [memory.id]);
       return sendJson(res, 200, { ok: true, id: memory?.id ?? null, source: site }, origin);
@@ -286,6 +303,7 @@ function createExtApi(options) {
       const items = prepared.items;
       const preview = { count: items.length, totalChars: items.reduce((sum, item) => sum + item.content.length, 0),
         firstLines: items.slice(0, 5).map((item) => `${looksSecret(item.title) ? '[secret-looking title hidden]' : item.title}: ${looksSecret(item.content.split(/\r?\n/, 1)[0]) ? '[secret-looking content hidden]' : item.content.split(/\r?\n/, 1)[0].slice(0, 180)}`),
+        items: items.map(({title,content})=>({title:looksSecret(title)?'[secret-looking title hidden]':title,content:looksSecret(content)?'[secret-looking content hidden]':content})),
         skippedLogs: prepared.skippedLogs, skippedSecrets: prepared.skippedSecrets, skippedDuplicates: prepared.oldDuplicates,
         savedBefore: prepared.existing.saved };
       log(identity.client, { ok: true, count: preview.count, latency: now() - started });
