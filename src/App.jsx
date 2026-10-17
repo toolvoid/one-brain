@@ -239,6 +239,7 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
   const [pairCode, setPairCode] = useState(null);
   const [testResults, setTestResults] = useState(null);
   const [selectedConnection, setSelectedConnection] = useState(null);
+  const [dismissedRows, setDismissedRows] = useState(() => new Set());
   const rows = buildConnectionRows({ mcp, clients, extensions, providers, quickContext, activity, counts });
   const health = summarizeConnectionHealth(rows);
   const filteredActivity = activity.filter((event) => !filter || event.client === filter);
@@ -256,6 +257,10 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
       document.removeEventListener('visibilitychange', onVisibility);
     };
   }, [selectedConnection]);
+  useEffect(() => {
+    const timer = setInterval(() => { if (document.visibilityState === 'visible') void onRefresh(); }, 30000);
+    return () => clearInterval(timer);
+  }, [onRefresh]);
   const relative = (value) => {
     if (!value) return '—';
     const ms = Date.now() - Date.parse(value);
@@ -295,6 +300,24 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
     setNotice(`${row.name}: ${result.ok ? 'Pass' : 'Fail'} · ${result.reason}`);
     return result;
   }
+  async function checkExtension(row) {
+    const started = Date.now();
+    try {
+      await window.brain.checkExtension(row.site);
+      setNotice(`Checking ${row.name}…`);
+      while (Date.now() - started < 15000) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const latest = (await window.brain.getExtensionStatus()).find((item) => item.site === row.site);
+        if (latest?.health?.selfCheck?.at && Date.parse(latest.health.selfCheck.at) >= started) {
+          await onRefresh();
+          const stale = latest.health.tabContentScriptVersion && latest.health.contentScriptVersion && latest.health.tabContentScriptVersion !== latest.health.contentScriptVersion;
+          setNotice(`${row.name}: ${stale ? 'Reload this page' : `self-check received · ${Object.values(latest.health.selfCheck.matched || {}).filter((count) => count > 0).length} selectors matched`}.`);
+          return;
+        }
+      }
+      setNotice('Extension not responding: open a supported site, reload that page, or reload the extension');
+    } catch (error) { setNotice(error.message || 'Extension check could not start.'); }
+  }
   async function testAll() {
     setNotice('Testing connections…');
     const results = [];
@@ -309,21 +332,25 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
   }
   return <section className="connections-dashboard">
     <header className="connections-header"><div><h2>Connections</h2><p>Connection status, capabilities and recent usage.</p></div><button type="button" onClick={() => void onRefresh()}>Refresh</button></header>
-    <div className="connection-health"><strong>{health.healthy} of {health.total} connections healthy</strong>{health.broken.length > 0 && <small>{health.broken.map((row) => `${row.name}: ${row.reason}`).join(' · ')}</small>}</div>
+    <div className="connection-health"><strong>{health.healthy} healthy · {health.needAction} need action · {health.notSetUp} not set up</strong></div>
     <nav className="connection-tabs"><button type="button" aria-pressed={tab === 'connections'} onClick={() => setTab('connections')}>Connections</button><button type="button" aria-pressed={tab === 'activity'} onClick={() => setTab('activity')}>Activity log</button><button type="button" onClick={() => void onConnectAll()}>Connect all detected</button><button type="button" onClick={() => void testAll()}>Test all</button></nav>
     {notice && <p className="connection-notice" role="status">{notice}</p>}
     {pairCode && <p className="extension-pair-code" role="status">Pairing code <strong>{pairCode.code}</strong> · expires in 2 minutes<br />API address <code>{pairCode.endpoint}</code></p>}
     {testResults && <div className="connection-test-results">{testResults.map((result) => <small key={result.name}>{result.name}: {result.ok ? 'Pass' : 'Fail'} · {result.reason}</small>)}</div>}
     {tab === 'connections' ? <>
-      <div className="connection-compact-list">{rows.map((row) => <article className="connection-compact-row" key={row.id}>
+      <div className="connection-compact-list">{rows.filter((row) => !dismissedRows.has(row.id)).map((row) => <article className="connection-compact-row" key={row.id}>
         <div className="connection-compact-heading"><div><strong>{row.name}</strong><small className="connection-type">{row.type}</small></div><span className={`connection-status ${row.status.toLowerCase().replaceAll(' ', '-')}`}>{row.status}</span></div>
         {row.reason && <small className="connection-compact-reason">{row.reason}</small>}
+        {row.healthDetails && <small className="connection-compact-meta">Ping {relative(row.healthDetails.pingAt)} · token {row.healthDetails.tokenValid ? 'valid' : 'invalid'} · approval {row.healthDetails.approval} · origin {row.healthDetails.receivedOrigin || '—'} / expected {row.healthDetails.expectedOrigin || '—'} · API {row.healthDetails.apiVersion || '—'} · build {row.healthDetails.buildId || '—'} · host permission {row.healthDetails.hostPermission === true ? 'granted' : row.healthDetails.hostPermission === false ? 'missing' : 'unknown'} · self-check {row.healthDetails.selfCheck ? `${Object.values(row.healthDetails.selfCheck.matched || {}).filter((count) => count > 0).length} selectors matched ${relative(row.healthDetails.selfCheck.at)}` : 'not run'} · last successful {row.healthDetails.lastSuccessfulUse ? `${row.healthDetails.lastSuccessfulUse.action} ${relative(row.healthDetails.lastSuccessfulUse.time)}` : 'search/save not recorded'}</small>}
+        {row.site && <button type="button" className="connection-check-extension" onClick={() => void checkExtension(row)}>Check extension</button>}
+        {['needs_restart', 'failing'].includes(row.healthStatus) && <div className="connection-row-actions">{row.healthStatus === 'needs_restart' && <button type="button" onClick={() => void connect(row)}>Reconnect</button>}<button type="button" onClick={() => void testOne(row)}>Test</button>{row.healthStatus === 'needs_restart' && <button type="button" onClick={() => void copyText(`Restart ${row.name} so it reloads the One Brain MCP bridge configuration.`, `restart-${row.id}`)}>Copy restart steps</button>}</div>}
+        {['not_set_up', 'not_installed', 'manual_only'].includes(row.healthStatus) && <button type="button" className="connection-dismiss" aria-label={`Dismiss ${row.name}`} onClick={() => setDismissedRows((current) => new Set([...current, row.id]))}>Dismiss</button>}
         <div className="connection-compact-meta"><span>{row.lastActivity ? `${row.lastActivity.action} ${relative(row.lastActivity.time)}` : 'No activity'}</span><span>{row.counts.searches} searches · {row.counts.saves} saves today</span></div>
         <button type="button" className="connection-details-button" onClick={() => setSelectedConnection(row)}>View details</button>
       </article>)}</div>
       <section className="connection-security"><h3>Security</h3><p>Stdio bridge: loopback listener at <code>127.0.0.1:{mcpConfig?.port || '—'}</code>. Every request requires a valid client token.</p><button type="button" onClick={onRotateAll}>Rotate token</button></section>
-    </> : <section className="connection-activity"><header><h3>Recent activity (up to 200 events)</h3><label>Filter by client<select value={filter} onChange={(event) => setFilter(event.target.value)}><option value="">All clients</option>{[...new Set(activity.map((event) => event.client))].sort().map((client) => <option key={client}>{client}</option>)}</select></label><button type="button" onClick={async () => { await window.brain.clearConnectionActivity(); await onRefresh(); }}>Clear log</button></header>{filteredActivity.map((event) => <article key={`${event.time}-${event.client}-${event.action}`}><time>{new Date(event.time).toLocaleString()}</time><strong>{event.client}</strong><span>{event.action}</span><span>{event.ok ? 'OK' : 'Fail'}</span><small>{event.reason || '—'}</small></article>)}{filteredActivity.length === 0 && <p className="empty-note">No connection activity yet.</p>}</section>}
-    {selectedConnection && createPortal(<div className="connection-window-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedConnection(null); }}><section className="connection-detail-window" role="dialog" aria-modal="true" aria-labelledby="connection-detail-title"><header><div><h2 id="connection-detail-title">{selectedConnection.name}</h2><small>{selectedConnection.type}</small></div><button type="button" aria-label="Close connection details" onClick={() => setSelectedConnection(null)}>×</button></header><div className="connection-detail-status"><span className={`connection-status ${selectedConnection.status.toLowerCase().replaceAll(' ', '-')}`}>{selectedConnection.status}</span><p>{selectedConnection.reason || 'No issues reported.'}</p></div><section className="connection-detail-works"><h3>Works</h3>{['Search', 'Save', 'Auto-insert'].map((feature) => <div key={feature}><strong>{selectedConnection.work[feature].supported ? '✓' : '—'} {feature}</strong>{!selectedConnection.work[feature].supported && <small>{selectedConnection.work[feature].reason || 'Not supported'}</small>}</div>)}</section><div className="connection-detail-activity"><strong>Last activity</strong><span>{selectedConnection.lastActivity ? `${selectedConnection.lastActivity.action} ${relative(selectedConnection.lastActivity.time)}` : 'No activity yet'}</span><strong>Today</strong><span>{selectedConnection.counts.searches} searches · {selectedConnection.counts.saves} saves</span></div><footer><button type="button" onClick={() => void connect(selectedConnection)}>Connect</button><button type="button" onClick={() => void onDisconnect(selectedConnection)}>Disconnect</button><button type="button" onClick={() => void testOne(selectedConnection)}>Test connection</button>{selectedConnection.site && <button type="button" onClick={() => void openSite(selectedConnection)}>Open site</button>}</footer></section></div>, document.body)}
+    </> : <section className="connection-activity"><header><h3>Recent activity (up to 200 events)</h3><label>Filter by client<select value={filter} onChange={(event) => setFilter(event.target.value)}><option value="">All clients</option>{[...new Set(activity.map((event) => event.client))].sort().map((client) => <option key={client}>{client}</option>)}</select></label><button type="button" onClick={async () => { await window.brain.clearConnectionActivity(); await onRefresh(); }}>Clear log</button></header>{filteredActivity.map((event) => <article key={`${event.time}-${event.client}-${event.action}`}><time>{new Date(event.time).toLocaleString()}</time><strong>{event.client}</strong><span>{event.action}</span><span>{event.ok ? 'OK' : 'Fail'}</span><small>{event.reason || '—'}{event.probe ? ` · probe ${event.duration} ms` : ''}</small></article>)}{filteredActivity.length === 0 && <p className="empty-note">No connection activity yet.</p>}</section>}
+    {selectedConnection && createPortal(<div className="connection-window-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedConnection(null); }}><section className="connection-detail-window" role="dialog" aria-modal="true" aria-labelledby="connection-detail-title"><header><div><h2 id="connection-detail-title">{selectedConnection.name}</h2><small>{selectedConnection.type}</small></div><button type="button" aria-label="Close connection details" onClick={() => setSelectedConnection(null)}>×</button></header><div className="connection-detail-status"><span className={`connection-status ${selectedConnection.status.toLowerCase().replaceAll(' ', '-')}`}>{selectedConnection.status}</span><p>{selectedConnection.reason || 'No issues reported.'}</p></div><section className="connection-detail-works"><h3>Works</h3>{['Search', 'Save', 'Auto-insert'].map((feature) => <div key={feature}><strong>{selectedConnection.work[feature].supported ? '✓' : '—'} {feature}</strong>{!selectedConnection.work[feature].supported && <small>{selectedConnection.work[feature].reason || 'Not supported'}</small>}</div>)}</section><div className="connection-detail-activity"><strong>Last activity</strong><span>{selectedConnection.lastActivity ? `${selectedConnection.lastActivity.action} ${relative(selectedConnection.lastActivity.time)}` : 'No activity yet'}</span><strong>Today</strong><span>{selectedConnection.counts.searches} searches · {selectedConnection.counts.saves} saves</span></div><footer><button type="button" onClick={() => void connect(selectedConnection)}>Reconnect</button><button type="button" onClick={() => void onDisconnect(selectedConnection)}>Disconnect</button><button type="button" onClick={() => void testOne(selectedConnection)}>Test connection</button>{selectedConnection.type.includes('MCP') && <><button type="button" onClick={async () => { if (window.confirm(`Rotate ${selectedConnection.name}'s token? Its current token will stop working.`)) { await window.brain.rotateConnectorToken(selectedConnection.id); await onRefresh(); } }}>Rotate token</button><button type="button" onClick={async () => { if (window.confirm(`Revoke ${selectedConnection.name}'s token?`)) { await window.brain.revokeConnectorToken(selectedConnection.id); await onRefresh(); } }}>Revoke</button></>}{selectedConnection.site && <button type="button" onClick={() => void openSite(selectedConnection)}>Open site</button>}</footer></section></div>, document.body)}
   </section>;
 }
 

@@ -217,6 +217,7 @@
       document.body.append(manualButton);
   });
   let lastLayoutBroken = null;
+  const CONTENT_SCRIPT_VERSION = '1.2.0-loopguard';
   function checkAdapterLayout() {
     if (stopped) return false;
     const matched = adapter.selfCheck();
@@ -227,6 +228,14 @@
     }
     return layoutFallback.check(working);
   }
+  const extensionRuntime = globalThis.browser?.runtime || globalThis.chrome?.runtime;
+  globalThis.setInterval?.(() => { try { void extensionRuntime?.sendMessage?.({ type: 'poll-extension-health' }); } catch {} }, 5000);
+  extensionRuntime?.onMessage?.addListener?.((message, _sender, sendResponse) => {
+    if (message?.type !== 'run-self-check') return false;
+    const matched = adapter.selfCheck() || {};
+    sendResponse({ matched: Object.fromEntries(Object.entries(matched).map(([name, selector]) => [name, selector ? 1 : 0])), contentScriptVersion: CONTENT_SCRIPT_VERSION });
+    return false;
+  });
 
   async function openSuggestions(trigger) {
     const editor = adapter.getInputElement();

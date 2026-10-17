@@ -2,7 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn } = require('node:child_process');
 
 const INSTRUCTIONS = 'At the start of a task or when the user mentions memory, past conversations, or One Brain, call search_memories. After meaningful work, save only durable facts (decisions, setup, fixes, preferences) with add_memory and a short clear title. Never save secrets, logs, UI tweaks, personality descriptions, or guesses about the user; check for duplicates first.';
 const BEGIN = '<!-- ONE-BRAIN:BEGIN -->';
@@ -35,6 +35,23 @@ function instructionPath(homeDir, client) {
 }
 
 function resolveNode(env = process.env) { return executableOnPath('node', env) || 'node'; }
+
+function runProcess(command, args, { input = '', env = process.env, timeout = 10000 } = {}) {
+  return new Promise((resolve) => {
+    let stdout = ''; let stderr = ''; let timedOut = false;
+    const child = spawn(command, args, { windowsHide: true, env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => { timedOut = true; child.kill(); }, timeout);
+    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('error', (error) => { clearTimeout(timer); resolve({ error, status: null, stdout, stderr }); });
+    child.once('close', (status) => {
+      clearTimeout(timer);
+      resolve({ error: timedOut ? Object.assign(new Error('Process timed out.'), { code: 'ETIMEDOUT' }) : null, status, stdout, stderr });
+    });
+    child.stdin.end(input);
+  });
+}
 
 function clientPaths(homeDir, appPath, { platform = process.platform, env = process.env } = {}) {
   const appData = env.APPDATA || path.join(homeDir, 'AppData', 'Roaming');
@@ -81,7 +98,7 @@ function discoverClients(homeDir, appPath, profiles = [], tokenStates = [], env 
     const result = { ...client, status: profile ? 'connected' : found ? 'found' : 'not found', lastSeen: profile?.last_seen || null,
       tokenStatus: token ? (token.revoked ? 'revoked' : 'active') : 'none', paths: paths[client.id] || {} };
     if (token) { result.tokenCreatedAt = token.created_at || null; result.tokenModifiedAt = Number(token.file_mtime) || null; }
-    result.needsReconnect = Boolean(profile && token && Number.isFinite(result.tokenModifiedAt) && result.tokenModifiedAt > Date.parse(profile.last_seen || ''));
+    // Health is derived from generation-aware call/probe evidence by connection-health.js.
     if (client.kind === 'managed') {
       try { result.previewFiles = previewClient(client.id, homeDir, appPath, env); }
       catch { result.configError = 'Configuration is invalid or unsupported. One Brain will not modify this file.'; }
@@ -461,7 +478,7 @@ function detectConnector(clientId, homeDir, appPath, env = process.env) {
   return exists(path.dirname(paths[clientId].config)) || Boolean(executableOnPath('code', env));
 }
 
-function connectClient(clientId, homeDir, appPath, env = process.env, options = {}) {
+async function connectClient(clientId, homeDir, appPath, env = process.env, options = {}) {
   if (!detectConnector(clientId, homeDir, appPath, env)) throw new Error(`${CLIENTS.find((item) => item.id === clientId)?.name || clientId} is not installed.`);
   const paths = clientPaths(homeDir, appPath, { env });
   const cli = paths['claude-code']?.cli;
@@ -469,9 +486,9 @@ function connectClient(clientId, homeDir, appPath, env = process.env, options = 
     const config = paths['claude-code'].config;
     if (fs.existsSync(config)) makeBackup(config);
     const server = serverJson(appPath, env, clientId);
-    const run = options.runCli || ((file, args) => spawnSync(file, args, { encoding: 'utf8', windowsHide: true }));
+    const run = options.runCli || ((file, args) => runProcess(file, args, { env, timeout: 15000 }));
     const envArgs = Object.entries(server.env || {}).flatMap(([key, value]) => ['--env', `${key}=${value}`]);
-    const result = run(cli, ['mcp', 'add', '--scope', 'user', '--transport', 'stdio', 'one-brain', ...envArgs, '--', server.command, ...server.args]);
+    const result = await run(cli, ['mcp', 'add', '--scope', 'user', '--transport', 'stdio', 'one-brain', ...envArgs, '--', server.command, ...server.args]);
     if (result.error || result.status !== 0) throw new Error('Claude Code could not add the One Brain MCP server.');
     const saved = JSON.parse(readIfExists(config) || '{}');
     if (!saved.mcpServers?.['one-brain']) throw new Error('Claude Code configuration did not contain the One Brain server after adding it.');
@@ -492,27 +509,48 @@ function isConnected(clientId, profiles = []) {
   return profiles.some((item) => item.verified && item.status === 'approved' && names.some((needle) => String(item.client || '').toLowerCase().replace(/[^a-z0-9]/g, '').includes(needle)));
 }
 
-function testConnector(clientId, appPath, userDataPath, env = process.env, options = {}) {
+async function testConnector(clientId, appPath, userDataPath, env = process.env, options = {}) {
   const file = path.join(userDataPath, 'tokens', `${clientId.replaceAll(':', '~3a')}.token`);
   if (!fs.existsSync(file)) return { ok: false, reason: 'No local token is stored for this connector.' };
-  const server = serverJson(appPath, env, clientId);
+  const homeDir = options.homeDir || env.HOME || env.USERPROFILE || require('node:os').homedir();
+  const paths = clientPaths(homeDir, appPath, { env });
+  let saved;
+  try {
+    const config = readIfExists(paths[clientId]?.config);
+    if (clientId === 'codex') {
+      const match = config.match(/^\[mcp_servers\.one-brain\]\s*\r?\n((?:[^\[].*\r?\n?)*)/m);
+      const command = match?.[1]?.match(/^command\s*=\s*("(?:\\.|[^"])*")/m)?.[1];
+      const args = match?.[1]?.match(/^args\s*=\s*(\[[^\]]*\])/m)?.[1];
+      if (command && args) saved = { command: JSON.parse(command), args: JSON.parse(args) };
+    } else {
+      const parsed = JSON.parse(config || '{}');
+      saved = parsed.mcpServers?.['one-brain'] || parsed.servers?.['one-brain'];
+    }
+  } catch { return { ok: false, reason: 'Client configuration is invalid.' }; }
+  if (!saved || typeof saved.command !== 'string' || !Array.isArray(saved.args)) return { ok: false, reason: 'Client configuration does not contain the One Brain bridge.' };
+  const bridge = path.resolve(appPath, 'scripts', 'mcp-stdio.js');
+  const nodeBinary = resolveNode(env);
+  const isNode = saved.command === 'node' || path.resolve(saved.command) === path.resolve(nodeBinary);
+  if (!isNode || path.resolve(homeDir, saved.args[0] || '') !== bridge) return { ok: false, customCommand: true, reason: 'Custom command, not tested.' };
+  const server = saved;
   const messages = [
     { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'one-brain-connection-test', version: '1.0.0' } } },
     { jsonrpc: '2.0', method: 'notifications/initialized' },
-    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'search_memory', arguments: { query: 'One Brain connection check', limit: 1 } } }
+    { jsonrpc: '2.1', id: 2, method: 'tools/list', params: {} },
+    { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'search_memory', arguments: { query: 'connection health check', limit: 1 } } }
   ].map((message) => JSON.stringify(message)).join('\n') + '\n';
-  const run = options.run || ((command, args, input) => spawnSync(command, args, { input, encoding: 'utf8', timeout: 10000, windowsHide: true, env: { ...env, ...(server.env || {}) } }));
-  const result = run(server.command, server.args, messages);
+  const run = options.run || ((command, args, input) => runProcess(command, args, { input, timeout: 8000, env: { ...env, ...(server.env || {}) } }));
+  const result = await run(server.command, server.args, messages);
   if (result.error || result.status !== 0) {
     const refused = result.error?.code === 'ECONNREFUSED' || /ECONNREFUSED|fetch failed.*127\.0\.0\.1/i.test(String(result.stderr || ''));
     return { ok: false, reason: refused ? 'One Brain app is not running.' : 'MCP server did not complete the local search check.' };
   }
-  const response = String(result.stdout || '').split(/\r?\n/).map((line) => { try { return JSON.parse(line); } catch { return null; } }).find((message) => message?.id === 2);
+  const response = String(result.stdout || '').split(/\r?\n/).map((line) => { try { return JSON.parse(line); } catch { return null; } }).find((message) => message?.id === 3);
   if (!response || response.error || response.result?.isError) {
     if (/Could not reach One Brain MCP/i.test(String(result.stderr || ''))) return { ok: false, reason: 'One Brain app is not running.' };
     return { ok: false, reason: 'MCP search_memory did not return successfully. Check app approval and local API availability.' };
   }
-  return { ok: true, reason: 'search_memory succeeded.' };
+  return { ok: true, reason: 'initialize, tools/list, and search_memory succeeded.' };
 }
 
 module.exports = { INSTRUCTIONS, CLIENTS, instructionBlock, clientPaths, resolveNode, discoverClients, detectConnector, isConnected, connectClient, disconnectClient, testConnector, mergeTomlServer, removeTomlServer, mergeJsonServer, removeJsonServer, replaceInstructionBlock, previewClient, disconnectPreview, applyEdits, snippetFor, validateToml };

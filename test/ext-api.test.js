@@ -57,8 +57,8 @@ async function harness({ clock = () => Date.now() } = {}) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   const origin = 'chrome-extension://onebrainfixture';
-  async function request(url, { method = 'GET', site = 'chatgpt', token, originHeader = origin, extensionOriginHeader, host, body } = {}) {
-    return fetch(`${base}${url}`, { method, headers: { ...(originHeader ? { Origin: originHeader } : {}), ...(extensionOriginHeader ? { 'X-One-Brain-Extension-Origin': extensionOriginHeader } : {}), ...(host ? { Host: host } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body ? { 'Content-Type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) });
+  async function request(url, { method = 'GET', site = 'chatgpt', token, originHeader = origin, extensionOriginHeader, host, body, headers = {} } = {}) {
+    return fetch(`${base}${url}`, { method, headers: { ...(originHeader ? { Origin: originHeader } : {}), ...(extensionOriginHeader ? { 'X-One-Brain-Extension-Origin': extensionOriginHeader } : {}), ...(host ? { Host: host } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body ? { 'Content-Type': 'application/json' } : {}), ...headers }, ...(body ? { body: JSON.stringify(body) } : {}) });
   }
   async function pair(site = 'chatgpt') {
     const code = api.createPairCode().code;
@@ -111,6 +111,7 @@ test('pairing and extension requests enforce the paired origin and loopback host
   assert.equal(mismatch.reason, 'origin_mismatch');
   assert.equal(mismatch.expectedOrigin, h.origin);
   assert.equal(mismatch.receivedOrigin, 'chrome-extension://otherextension');
+  assert.equal(h.api.status().find((item) => item.site === 'chatgpt').health.authFailure, 'origin_mismatch');
   assert.equal(localHost('localhost'), false);
   assert.equal(localHost('127.0.0.1:3738'), true);
   response = await h.request('/ext/ping', { token });
@@ -121,6 +122,20 @@ test('pairing and extension requests enforce the paired origin and loopback host
   assert.equal(ping.paired, true);
   assert.equal(ping.approval, 'approved');
   assert.equal(response.headers.get('access-control-allow-origin'), h.origin);
+});
+
+test('extension ping records build, content-script, host-permission and origin health evidence', async (t) => {
+  const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
+  const token = await h.pair('chatgpt');
+  const response = await h.request('/ext/ping', { token, headers: { 'X-One-Brain-Build-Id': '1.2.0-loopguard', 'X-One-Brain-Content-Script-Version': '1.2.0-loopguard', 'X-One-Brain-Host-Permission': 'granted' } });
+  assert.equal(response.status, 200);
+  const health = h.api.status().find((item) => item.site === 'chatgpt').health;
+  assert.equal(health.buildId, '1.2.0-loopguard');
+  assert.equal(health.contentScriptVersion, '1.2.0-loopguard');
+  assert.equal(health.hostPermission, true);
+  assert.equal(health.expectedOrigin, h.origin);
+  assert.equal(health.receivedOrigin, h.origin);
+  assert.equal(health.apiCompatible, true);
 });
 
 test('DeepSeek and Groq pairing tokens can authenticate their extension endpoints', async (t) => {
@@ -135,6 +150,22 @@ test('DeepSeek and Groq pairing tokens can authenticate their extension endpoint
     assert.equal(layout.status, 200);
     assert.equal(h.api.status().find((item) => item.site === site).layoutStatus.broken, true);
   }
+});
+
+test('extension check request is surfaced on ping and stores selector-count-only results', async (t) => {
+  const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
+  const token = await h.pair('chatgpt');
+  h.api.requestCheck('chatgpt');
+  let response = await h.request('/ext/ping', { token });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).checkRequested, true);
+  response = await h.request('/ext/selfcheck', { method: 'POST', token, body: { matched: { input: 2, send: 1, messages: 8 }, contentScriptVersion: '1.2.0-loopguard', pageText: 'must not be stored' } });
+  assert.equal(response.status, 200);
+  const health = h.api.status().find((item) => item.site === 'chatgpt').health;
+  assert.deepEqual(health.selfCheck.matched, { input: 2, send: 1, messages: 8 });
+  assert.equal(JSON.stringify(health).includes('must not be stored'), false);
+  response = await h.request('/ext/ping', { token });
+  assert.equal((await response.json()).checkRequested, false);
 });
 
 test('revoked extension tokens return a reason-coded 401', async (t) => {

@@ -24,7 +24,7 @@ test('dashboard has every requested connection row and maps states without claim
   assert.equal(rows.find((row) => row.id === 'quick-context').work['Auto-insert'].supported, false);
 });
 
-test('dashboard maps app not installed, restart, reconnect, connected, selector failure, provider test and hotkey states', () => {
+test('dashboard maps app not installed, restart, connected, selector failure, provider test and hotkey states', () => {
   const mcp = [
     { id: 'claude-desktop', status: 'not found', tokenStatus: 'none' },
     { id: 'claude-code', status: 'found', tokenStatus: 'active' },
@@ -33,14 +33,14 @@ test('dashboard maps app not installed, restart, reconnect, connected, selector 
     { id: 'vscode', status: 'found', tokenStatus: 'none', configError: true }
   ];
   const clients = [{ client: 'gemini-cli', verified: true, status: 'approved', last_seen: '2026-10-12 11:00:00' }];
-  const extensions = [{ site: 'deepseek', paired: true, status: 'approved', layoutStatus: { broken: true } }, { site: 'groq', paired: true, status: 'approved' }];
+  const extensions = [{ site: 'deepseek', paired: true, status: 'approved', layoutStatus: { broken: true } }, { site: 'groq', paired: true, status: 'approved', health: { pingAt: new Date().toISOString(), buildId: '1.2.0-loopguard', hostPermission: true } }];
   const activity = [{ client: 'Groq API', action: 'test', ok: false, reason: 'invalid_key', time: '2026-10-12T11:00:00.000Z' }, { client: 'DeepSeek API', action: 'test', ok: true, time: '2026-10-12T11:01:00.000Z' }];
   const providers = { enabled: true, providerKeyStatus: { groq: true, deepseek: true } };
   const rows = buildConnectionRows({ mcp, clients, extensions, activity, providers, quickContext: { enabled: true, registered: true, shortcut: 'Control+Shift+Space' } });
   const status = (id) => rows.find((row) => row.id === id).status;
   assert.equal(status('claude-desktop'), 'Not installed');
   assert.equal(status('claude-code'), 'Needs restart');
-  assert.equal(status('codex'), 'Needs reconnect');
+  assert.equal(status('codex'), 'Needs restart');
   assert.equal(status('gemini'), 'Connected');
   assert.equal(status('vscode'), 'Broken');
   assert.equal(status('ext:deepseek'), 'Selectors broken');
@@ -48,7 +48,7 @@ test('dashboard maps app not installed, restart, reconnect, connected, selector 
   assert.equal(status('provider:groq'), 'Broken');
   assert.equal(status('provider:deepseek'), 'Connected');
   assert.equal(status('quick-context'), 'Connected');
-  assert.ok(['Broken', 'Needs reconnect', 'Needs restart', 'Selectors broken'].includes(rows[0].status), 'broken rows sort ahead of disconnected rows');
+  assert.ok(['Broken', 'Failing', 'Needs reconnect', 'Needs restart', 'Selectors broken'].includes(rows[0].status), 'actionable rows sort ahead of disconnected rows');
   assert.ok(summarizeConnectionHealth(rows).healthy < rows.length);
 });
 
@@ -58,13 +58,13 @@ test('connect all plan previews exact target files and does not write until conf
     { id: 'claude', name: 'Claude', status: 'not found', tokenStatus: 'none' },
     { id: 'gemini', name: 'Gemini', status: 'found', tokenStatus: 'active' }
   ]);
-  assert.deepEqual(plan.clients, ['codex']);
+  assert.deepEqual(plan.clients, ['codex', 'gemini']);
   assert.match(plan.files[0].path, /synthetic\/codex.toml/);
   let writes = 0;
   assert.deepEqual(await runConfirmedConnectAll(plan, { write: async () => { writes++; } }), { written: false, count: 0 });
   assert.equal(writes, 0);
-  assert.deepEqual(await runConfirmedConnectAll(plan, { confirmed: true, write: async () => { writes++; } }), { written: true, count: 1 });
-  assert.equal(writes, 1);
+  assert.deepEqual(await runConfirmedConnectAll(plan, { confirmed: true, write: async () => { writes++; } }), { written: true, count: 2 });
+  assert.equal(writes, 2);
 });
 
 test('health banner counts healthy connections and keeps broken entries first', () => {

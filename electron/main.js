@@ -2,15 +2,16 @@ const { app, BrowserWindow, ipcMain, Menu, safeStorage, globalShortcut, clipboar
 const path = require('path');
 const fs = require('node:fs');
 const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
-const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getMcpClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, getMemoryEmbeddingVector, getMemory, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, listRecentImports, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, addMemory, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, getLegacyCleanupStatus, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
+const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getMcpClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, getMemoryEmbeddingVector, getMemory, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, listRecentImports, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, addMemory, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
 const { startMcpServer } = require('./mcp-server');
 const { createEmbedder } = require('./embedder');
 const connectors = require('./connectors');
-const { createClientToken, revokeClientTokenFile, tokenPath } = require('./client-tokens');
+const { createClientToken, ensureClientToken, revokeClientTokenFile, tokenPath } = require('./client-tokens');
 const { createMemoryProxy } = require('./memory-proxy');
 const { createExtApi } = require('./ext-api');
 const { prepareQuickContext, buildQuickContextBlock } = require('./quick-context');
 const { createConnectionActivity } = require('./connection-activity');
+const { initialHealth, reduceHealth, getHealthStatus } = require('./connection-health');
 
 let mcpConnection;
 let memoryProxy;
@@ -163,7 +164,10 @@ ipcMain.handle('memories:search', async (_event, query, source, limit, offset, c
 });
 ipcMain.handle('memories:count-by-source', () => countBySource());
 ipcMain.handle('mcp:config', () => mcpConnection ? { endpoint: mcpConnection.config.endpoint, port: mcpConnection.config.port } : null);
-ipcMain.handle('connectors:list', () => connectors.discoverClients(app.getPath('home'), connectorAppPath(), listClients(), getConnectorTokenStates(), connectorEnvironment()));
+ipcMain.handle('connectors:list', () => connectors.discoverClients(app.getPath('home'), connectorAppPath(), listClients(), getConnectorTokenStates(), connectorEnvironment()).map((item) => {
+  const state = getConnectionHealthState(item.id) || initialHealth();
+  return { ...item, health: state, healthStatus: item.status === 'not found' ? 'not_installed' : getHealthStatus(state, { installed: true, configValid: Boolean(item.tokenStatus === 'active' && !item.configError) }) };
+}));
 ipcMain.handle('connections:activity', (_event, client) => connectionActivity?.list(String(client || '').slice(0, 120)) || []);
 ipcMain.handle('connections:counts', () => Object.fromEntries(require('./connection-activity').CLIENTS.map((client) => [client, connectionActivity?.counts(client) || { searches: 0, saves: 0 }])));
 ipcMain.handle('connections:clear-activity', () => connectionActivity?.clear() || { cleared: false });
@@ -172,6 +176,7 @@ ipcMain.handle('connections:rotate-all', () => {
   const active = listClientTokenStates().filter((item) => !item.revoked && connectors.CLIENTS.some((client) => client.id === item.client));
   for (const token of active) {
     createClientToken(app.getPath('userData'), token.client, storeClientTokenHash);
+    setConnectionHealthState(token.client, reduceHealth(getConnectionHealthState(token.client) || initialHealth(), { type: 'rotate' }));
     connectionActivity?.add({ client: connectors.CLIENTS.find((item) => item.id === token.client)?.name, action: 'rotate_token', ok: true });
   }
   return { rotated: active.length };
@@ -180,29 +185,43 @@ ipcMain.handle('connections:rotate-preview', () => listClientTokenStates()
   .filter((item) => !item.revoked && connectors.CLIENTS.some((client) => client.id === item.client))
   .map((item) => ({ path: tokenPath(app.getPath('userData'), item.client), before: 'Current token will become invalid immediately.', after: 'Generate a replacement token. The token value is never displayed.', changed: true })));
 ipcMain.handle('connectors:preview', (_event, client) => connectors.previewClient(client, app.getPath('home'), connectorAppPath(), connectorEnvironment()));
-ipcMain.handle('connectors:connect', (_event, client) => {
+ipcMain.handle('connectors:connect', async (_event, client) => {
   const appPath = connectorAppPath(); const env = connectorEnvironment();
   if (!connectors.detectConnector(client, app.getPath('home'), appPath, env)) throw new Error(`${connectors.CLIENTS.find((item) => item.id === client)?.name || 'Client'} is not installed.`);
-  createClientToken(app.getPath('userData'), client, storeClientTokenHash);
-  const files = connectors.connectClient(client, app.getPath('home'), appPath, env);
+  ensureClientToken(app.getPath('userData'), client, storeClientTokenHash);
+  const files = await connectors.connectClient(client, app.getPath('home'), appPath, env);
+  setConnectionHealthState(client, reduceHealth(getConnectionHealthState(client) || initialHealth(), { type: 'connect' }));
   connectionActivity?.add({ client: connectors.CLIENTS.find((item) => item.id === client)?.name, action: 'connect', ok: true });
   return files;
 });
 ipcMain.handle('connectors:rotate-token', (_event, client) => {
   const result = createClientToken(app.getPath('userData'), client, storeClientTokenHash);
+  setConnectionHealthState(client, reduceHealth(getConnectionHealthState(client) || initialHealth(), { type: 'rotate' }));
   connectionActivity?.add({ client: connectors.CLIENTS.find((item) => item.id === client)?.name, action: 'rotate_token', ok: true });
   return result;
 });
-ipcMain.handle('connectors:test', (_event, client) => {
-  const result = connectors.testConnector(client, connectorAppPath(), app.getPath('userData'), connectorEnvironment());
-  connectionActivity?.add({ client: connectors.CLIENTS.find((item) => item.id === client)?.name, action: 'test', ok: result.ok, reason: result.reason === 'One Brain app is not running.' ? 'app_not_running' : result.ok ? '' : 'request_failed' });
+ipcMain.handle('connectors:test', async (_event, client) => {
+  const started = Date.now();
+  const result = await connectors.testConnector(client, connectorAppPath(), app.getPath('userData'), connectorEnvironment(), { homeDir: app.getPath('home') });
+  const duration = Date.now() - started;
+  const reason = result.ok ? '' : result.customCommand ? 'custom_command' : result.reason === 'One Brain app is not running.' ? 'app_not_running' : 'request_failed';
+  if (!result.customCommand) {
+    const state = reduceHealth(getConnectionHealthState(client) || initialHealth(), { type: 'probe', ok: result.ok, reason: result.reason, duration });
+    setConnectionHealthState(client, state);
+  }
+  connectionActivity?.add({ client: connectors.CLIENTS.find((item) => item.id === client)?.name, action: 'test', ok: result.ok, reason, duration, probe: !result.customCommand });
   return result;
 });
-ipcMain.handle('connectors:revoke-token', (_event, client) => revokeClientTokenFile(app.getPath('userData'), client, revokeClientToken));
+ipcMain.handle('connectors:revoke-token', (_event, client) => {
+  const result = revokeClientTokenFile(app.getPath('userData'), client, revokeClientToken);
+  setConnectionHealthState(client, reduceHealth(getConnectionHealthState(client) || initialHealth(), { type: 'revoke' }));
+  return result;
+});
 ipcMain.handle('connectors:disconnect-preview', (_event, client) => connectors.disconnectPreview(client, app.getPath('home'), connectorAppPath(), connectorEnvironment()));
 ipcMain.handle('connectors:disconnect', (_event, client) => {
   const result = connectors.disconnectClient(client, app.getPath('home'), connectorAppPath(), connectorEnvironment());
   revokeClientTokenFile(app.getPath('userData'), client, revokeClientToken);
+  setConnectionHealthState(client, reduceHealth(getConnectionHealthState(client) || initialHealth(), { type: 'disconnect' }));
   connectionActivity?.add({ client: connectors.CLIENTS.find((item) => item.id === client)?.name, action: 'disconnect', ok: true });
   return result;
 });
@@ -235,6 +254,7 @@ ipcMain.handle('evaluation:run', () => runRetrievalEvaluation());
 ipcMain.handle('evaluation:run-results', (_event, runId) => getEvaluationRunResults(runId));
 ipcMain.handle('memory-proxy:settings', () => memoryProxy.publicSettings());
 ipcMain.handle('extension:status', () => extensionApi.status());
+ipcMain.handle('extension:check', (_event, site) => extensionApi.requestCheck(site));
 ipcMain.handle('extension:pair-code', () => ({ ...extensionApi.createPairCode(), endpoint: memoryProxy.publicSettings().endpoint }));
 ipcMain.handle('extension:revoke', (_event, site) => extensionApi.revokeSite(site));
 ipcMain.handle('extension:rotate', (_event, site) => extensionApi.rotateSite(site));
@@ -387,7 +407,11 @@ app.whenReady().then(async () => {
   startMcpServer(app.getPath('userData'), connectorAppPath(), {
     searchMemoriesForClient, getEmbeddingVector: getMemoryEmbeddingVector,
     embedText: (text) => embedder?.embed(text) || Promise.reject(new Error('Local embedder is unavailable.')),
-    listMemories, addMemory, connectionActivity
+    listMemories, addMemory, connectionActivity,
+    onClientCall: (client, ok, reason = '') => {
+      const state = reduceHealth(getConnectionHealthState(client) || initialHealth(), { type: ok ? 'success' : 'failure', reason });
+      setConnectionHealthState(client, state);
+    }
   }).then((connection) => {
     mcpConnection = connection;
     createWindow();

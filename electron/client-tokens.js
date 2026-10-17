@@ -40,6 +40,12 @@ function createClientToken(userDataPath, client, storeHash, { exposeToken = fals
   return { client: name, created: true, ...(exposeToken ? { token } : {}) };
 }
 
+function ensureClientToken(userDataPath, client, storeHash) {
+  const file = tokenPath(userDataPath, client);
+  if (fs.existsSync(file)) return { client: checkedClient(client), created: false };
+  return createClientToken(userDataPath, client, storeHash);
+}
+
 function revokeClientTokenFile(userDataPath, client, revoke) {
   const name = checkedClient(client);
   revoke(name);
@@ -48,4 +54,4 @@ function revokeClientTokenFile(userDataPath, client, revoke) {
   return { client: name, revoked: true };
 }
 
-module.exports = { checkedClient, tokenPath, hashToken, createClientToken, revokeClientTokenFile };
+module.exports = { checkedClient, tokenPath, hashToken, createClientToken, ensureClientToken, revokeClientTokenFile };

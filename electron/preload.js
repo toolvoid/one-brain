@@ -42,6 +42,7 @@ contextBridge.exposeInMainWorld('brain', {
   previewDisconnectConnector: (client) => ipcRenderer.invoke('connectors:disconnect-preview', client),
   disconnectConnector: (client) => ipcRenderer.invoke('connectors:disconnect', client),
   getConnectorSnippet: (client) => ipcRenderer.invoke('connectors:snippet', client),
+  checkExtension: (site) => ipcRenderer.invoke('extension:check', site),
   rotateConnectorToken: (client) => ipcRenderer.invoke('connectors:rotate-token', client),
   revokeConnectorToken: (client) => ipcRenderer.invoke('connectors:revoke-token', client),
   getEmbeddingStatus: () => ipcRenderer.invoke('embeddings:status'),

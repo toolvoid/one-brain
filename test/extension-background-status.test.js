@@ -20,7 +20,9 @@ function makeBackground() {
     runtime: {
       onMessage: { addListener(fn) { listener = fn; } },
       getManifest() { return { version: '1.1.0' }; }
-    }
+    },
+    permissions: { async contains() { return true; } },
+    tabs: { async query() { return [{ id: 77 }]; }, async sendMessage() { return { matched: { input: 1, send: 1 }, contentScriptVersion: '1.2.0-loopguard' }; }, onUpdated: { addListener() {} } }
   };
   const context = {
     browser,
@@ -29,7 +31,7 @@ function makeBackground() {
     setTimeout,
     clearTimeout,
     async fetch(url, options) {
-      requests.push({ path: new URL(url).pathname, headers: options.headers });
+      requests.push({ path: new URL(url).pathname, headers: options.headers, body: options.body });
       const pathName = new URL(url).pathname;
       if (pathName === '/ext/pair') {
         const body = JSON.parse(options.body);
@@ -44,9 +46,11 @@ function makeBackground() {
         return {
           ok: !revoked,
           status: revoked ? 401 : 200,
-          async json() { return revoked ? { error: 'Unauthorized' } : { site, status: 'approved', apiVersion: '1.1.0', minExtensionVersion: '1.0.0' }; }
+          async json() { return revoked ? { error: 'Unauthorized' } : { site, status: 'approved', approval: 'approved', apiVersion: '1.1.0', checkRequested: true, minExtensionVersion: '1.0.0' }; }
         };
       }
+      if (pathName === '/ext/health') return { ok: true, async json() { return { health: {}, apiCompatible: true }; } };
+      if (pathName === '/ext/selfcheck') return { ok: true, async json() { return { ok: true }; } };
       throw new Error('Unexpected local mock API request.');
     }
   };
@@ -54,11 +58,21 @@ function makeBackground() {
   return {
     storage,
     requests,
+    async runPoll() { return new Promise((resolve) => listener({ type: 'poll-extension-health' }, {}, resolve)); },
     async send(message) {
       return new Promise((resolve) => listener(message, {}, resolve));
     }
   };
 }
+
+test('background polls requested checks on open supported tabs and posts selector counts only', async () => {
+  const background = makeBackground();
+  await background.send({ type: 'pair', site: 'claude', code: '123456', endpoint: 'http://127.0.0.1:3738' });
+  await background.runPoll();
+  const report = background.requests.find((request) => request.path === '/ext/selfcheck');
+  assert.ok(report);
+  assert.deepEqual(JSON.parse(report.body), { matched: { input: 1, send: 1 }, contentScriptVersion: '1.2.0-loopguard' });
+});
 
 test('pairing stores a token per site and status pings only that site token', async () => {
   const background = makeBackground();

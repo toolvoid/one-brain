@@ -6,7 +6,7 @@ const { randomUUID } = require('node:crypto');
 
 const CLIENTS = new Set(['Claude Desktop', 'Claude Code', 'Codex', 'Gemini CLI', 'VS Code Copilot', 'Claude web', 'ChatGPT web', 'Gemini web', 'DeepSeek web', 'Groq playground', 'ChatGPT desktop', 'Groq API', 'DeepSeek API', 'One Brain']);
 const ACTIONS = new Set(['search', 'save', 'connect', 'disconnect', 'test', 'rotate_token', 'clear_log']);
-const REASONS = new Set(['', 'app_not_running', 'not_installed', 'not_paired', 'selectors_broken', 'needs_approval', 'needs_restart', 'needs_reconnect', 'key_missing', 'invalid_key', 'request_failed', 'config_invalid', 'unknown']);
+const REASONS = new Set(['', 'app_not_running', 'not_installed', 'not_paired', 'selectors_broken', 'needs_approval', 'needs_restart', 'needs_reconnect', 'key_missing', 'invalid_key', 'request_failed', 'config_invalid', 'custom_command', 'unknown']);
 const LIMIT = 200;
 
 function localDate(value) {
@@ -21,7 +21,7 @@ function safeEvent(input = {}, now = new Date().toISOString()) {
   const client = CLIENTS.has(input.client) ? input.client : 'One Brain';
   const action = ACTIONS.has(input.action) ? input.action : 'test';
   const reason = REASONS.has(input.reason) ? input.reason : '';
-  return { time, client, action, ok: input.ok === true, reason };
+  return { time, client, action, ok: input.ok === true, reason, ...(input.probe ? { probe: true, duration: Math.max(0, Number(input.duration) || 0) } : {}) };
 }
 
 function createConnectionActivity(userDataPath, options = {}) {

@@ -27,10 +27,11 @@ if (bridgeArgs.length) {
 const tokenFile = clientName
   ? path.join(dataPath, 'tokens', `${clientName}.token`)
   : path.join(dataPath, 'mcp-token');
-const token = fs.readFileSync(tokenFile, 'utf8').trim();
 const portPath = path.join(dataPath, 'mcp-port');
-let port = parseSavedPort(fs.readFileSync(portPath, 'utf8'));
-if (!/^[a-f\d]{64}$/i.test(token) || !Number.isInteger(port) || port < 1 || port > 65535) {
+function readToken() { return fs.readFileSync(tokenFile, 'utf8').trim(); }
+function readPort() { try { return parseSavedPort(fs.readFileSync(portPath, 'utf8')); } catch { return null; } }
+let port = readPort();
+if (!/^[a-f\d]{64}$/i.test(readToken()) || !Number.isInteger(port) || port < 1 || port > 65535) {
   throw new Error('One Brain MCP token or port file is invalid.');
 }
 
@@ -41,20 +42,30 @@ let requestedProtocolVersion = null;
 let internalRequestId = 0;
 
 async function postMessage(message) {
-  const headers = {
-    Authorization: `Bearer ${token}`,
-    Accept: 'application/json, text/event-stream',
-    'Content-Type': 'application/json'
+  const send = async (authToken, targetPort) => {
+    const headers = { Authorization: `Bearer ${authToken}`, Accept: 'application/json, text/event-stream', 'Content-Type': 'application/json' };
+    if (sessionId) headers['Mcp-Session-Id'] = sessionId;
+    if (protocolVersion) headers['MCP-Protocol-Version'] = protocolVersion;
+    return fetch(`http://127.0.0.1:${targetPort}/mcp`, { method: 'POST', headers, body: JSON.stringify(message) });
   };
-  if (sessionId) headers['Mcp-Session-Id'] = sessionId;
-  if (protocolVersion) headers['MCP-Protocol-Version'] = protocolVersion;
-
-  const retried = await fetchWithPortRetry((targetPort) => fetch(`http://127.0.0.1:${targetPort}/mcp`, {
-    method: 'POST', headers, body: JSON.stringify(message)
-  }), port, () => {
+  const savedPort = readPort();
+  if (savedPort) port = savedPort;
+  let authToken = readToken();
+  if (!/^[a-f\d]{64}$/i.test(authToken)) throw new Error('One Brain MCP token file is invalid.');
+  let retried = await fetchWithPortRetry((targetPort) => send(authToken, targetPort), port, () => {
     try { return fs.readFileSync(portPath, 'utf8'); } catch { return ''; }
   });
   port = retried.port;
+  if (retried.response.status === 401) {
+    const rotated = readToken();
+    if (rotated !== authToken && /^[a-f\d]{64}$/i.test(rotated)) {
+      authToken = rotated;
+      retried = await fetchWithPortRetry((targetPort) => send(authToken, targetPort), readPort() || port, () => {
+        try { return fs.readFileSync(portPath, 'utf8'); } catch { return ''; }
+      });
+      port = retried.port;
+    }
+  }
   endpoint = `http://127.0.0.1:${port}/mcp`;
   const response = retried.response;
   const text = await response.text();
@@ -136,7 +147,7 @@ async function main() {
     if (sessionId) {
       await fetch(endpoint, {
         method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}`, 'Mcp-Session-Id': sessionId, Accept: 'application/json, text/event-stream' }
+        headers: { Authorization: `Bearer ${readToken()}`, 'Mcp-Session-Id': sessionId, Accept: 'application/json, text/event-stream' }
       }).catch(() => {});
     }
   }

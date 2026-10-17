@@ -47,7 +47,7 @@ function build(browser, { root = ROOT } = {}) {
     name: 'One Brain',
     version: '1.2.0',
     description: 'Save selected chat messages to your local One Brain memory.',
-    permissions: ['storage'],
+    permissions: ['storage', 'tabs'],
     host_permissions: hosts,
     action: { default_title: 'One Brain', default_popup: 'src/popup.html' },
     content_scripts: contentScripts

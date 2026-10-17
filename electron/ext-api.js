@@ -22,6 +22,12 @@ function extensionOrigin(value) {
 
 function localHost(value) { return typeof value === 'string' && /^127\.0\.0\.1(?::\d+)?$/.test(value); }
 
+function versionAtLeast(value, minimum) {
+  const a = String(value || '').split('.').map((part) => Number(part) || 0), b = String(minimum || '').split('.').map((part) => Number(part) || 0);
+  for (let index = 0; index < Math.max(a.length, b.length); index++) if ((a[index] || 0) !== (b[index] || 0)) return (a[index] || 0) > (b[index] || 0);
+  return true;
+}
+
 function requestOrigin(req) {
   return req.headers.origin || req.headers['x-one-brain-extension-origin'] || '';
 }
@@ -31,7 +37,7 @@ function sendJson(res, status, body, corsOrigin = null) {
   if (corsOrigin) {
     headers['Access-Control-Allow-Origin'] = corsOrigin;
     headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
-    headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type, X-One-Brain-Extension-Origin';
+    headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type, X-One-Brain-Extension-Origin, X-One-Brain-Build-Id, X-One-Brain-Content-Script-Version, X-One-Brain-Host-Permission, X-One-Brain-Min-API-Version';
     headers.Vary = 'Origin';
   }
   res.writeHead(status, headers);
@@ -83,9 +89,19 @@ function createExtApi(options) {
     return Object.keys(SITES).map((site) => {
       const profile = getClientProfile(`ext:${site}`);
       const active = Boolean(origins[site] && isTokenActive(`ext:${site}`));
-      return { site, paired: active, origin: origins[site]?.origin || null, layoutStatus: origins[site]?.layoutStatus || null,
+      const health = { ...(origins[site]?.health || {}), apiVersion: API_VERSION, apiCompatible: origins[site]?.health?.apiCompatible ?? true };
+      return { site, paired: active, origin: origins[site]?.origin || null, layoutStatus: origins[site]?.layoutStatus || null, health,
         label: origins[site]?.label || null, status: profile?.status || 'unpaired', active };
     });
+  }
+
+  function requestCheck(site) {
+    if (!Object.hasOwn(SITES, site)) throw new Error('Unsupported extension site.');
+    const origins = readOrigins();
+    if (!origins[site]) throw new Error('Extension site is not paired.');
+    origins[site] = { ...origins[site], health: { ...(origins[site].health || {}), checkRequestedAt: now(), checkResultAt: null } };
+    saveOrigins(origins);
+    return { requested: true, site };
   }
 
   async function readJson(req) {
@@ -114,6 +130,11 @@ function createExtApi(options) {
   function authFailure(res, { reason, client, token, status, message, origin, expectedOrigin, receivedOrigin }) {
     const tokenHashPrefix = token ? createHash('sha256').update(token).digest('hex').slice(0, 6) : null;
     try { authFailureLog({ type: 'extension_auth_failure', reason, client, tokenHashPrefix }); } catch {}
+    if (reason === 'origin_mismatch' && /^ext:(chatgpt|claude|gemini|deepseek|groq)$/.test(String(client || ''))) {
+      const site = String(client).slice(4), origins = readOrigins();
+      origins[site] = { ...origins[site], health: { ...(origins[site]?.health || {}), authFailure: reason, authFailureAt: new Date(now()).toISOString(), expectedOrigin: expectedOrigin || origins[site]?.origin || null, receivedOrigin: receivedOrigin || origin || null } };
+      saveOrigins(origins);
+    }
     log(client || 'ext:unknown', { ok: false, error: reason });
     return sendJson(res, status, { error: message, reason,
       ...(reason === 'origin_mismatch' ? { expectedOrigin: expectedOrigin || null, receivedOrigin: receivedOrigin || null } : {}) }, origin || null);
@@ -231,18 +252,37 @@ function createExtApi(options) {
 
     const profile = getClientProfile(identity.client);
     if (req.method === 'GET' && url.pathname === '/ext/ping') {
+      const latest = readOrigins();
+      const entry = latest[site] || {};
+      const health = { ...(entry.health || {}), pingAt: new Date(now()).toISOString(), buildId: String(req.headers['x-one-brain-build-id'] || '').slice(0, 80),
+        contentScriptVersion: String(req.headers['x-one-brain-content-script-version'] || '').slice(0, 80), hostPermission: req.headers['x-one-brain-host-permission'] === 'granted', expectedOrigin: entry.origin || null, receivedOrigin: origin,
+        minApiVersion: String(req.headers['x-one-brain-min-api-version'] || '1.1.0').slice(0, 20), apiVersion: API_VERSION };
+      health.apiCompatible = versionAtLeast(API_VERSION, health.minApiVersion);
+      delete health.authFailure; delete health.authFailureAt;
+      latest[site] = { ...entry, health };
+      saveOrigins(latest);
       log(identity.client, { ok: true, latency: now() - started });
       const approval = profile?.status === 'approved' ? 'approved' : profile?.status === 'blocked' ? 'blocked' : 'pending';
-      return sendJson(res, 200, { ok: true, paired: true, approval, appVersion, apiVersion: API_VERSION, site }, origin);
+      res.setHeader('X-One-Brain-API-Version', API_VERSION);
+      res.setHeader('X-One-Brain-Build-Id', health.buildId);
+      res.setHeader('X-One-Brain-Content-Script-Version', health.contentScriptVersion);
+      return sendJson(res, 200, { ok: true, paired: true, approval, appVersion, apiVersion: API_VERSION, site, checkRequested: Boolean(health.checkRequestedAt && !health.checkResultAt) }, origin);
+    }
+    if (req.method === 'GET' && url.pathname === '/ext/health') {
+      const entry = readOrigins()[site] || {};
+      return sendJson(res, 200, { health: { ...(entry.health || {}), apiVersion: API_VERSION }, expectedOrigin: entry.origin || null, receivedOrigin: origin,
+        approval: profile?.status === 'approved' ? 'approved' : profile?.status || 'pending', apiVersion: API_VERSION, apiCompatible: entry.health?.apiCompatible ?? true }, origin);
     }
     if (profile?.status === 'blocked') return authFailure(res, { reason: 'blocked', client: identity.client, token: suppliedToken, status: 403,
       message: 'This extension client is blocked in One Brain.', origin });
-    if (req.method === 'POST' && url.pathname === '/ext/layout-status') {
+    if (req.method === 'POST' && (url.pathname === '/ext/layout-status' || url.pathname === '/ext/selfcheck')) {
       const body = await readJson(req);
-      const matched = body.matched && typeof body.matched === 'object' ? body.matched : {};
-      const safeMatched = { input: Boolean(matched.input), send: Boolean(matched.send), messages: Boolean(matched.messages) };
       const latest = readOrigins();
-      latest[site] = { ...latest[site], layoutStatus: { broken: !safeMatched.input || !safeMatched.send, matched: safeMatched, at: new Date(now()).toISOString() } };
+      const matched = body.matched && typeof body.matched === 'object' ? body.matched : {};
+      const safeMatched = Object.fromEntries(Object.entries(matched).slice(0, 50).filter(([name]) => /^[a-z][a-z0-9_-]{0,39}$/i.test(name)).map(([name, count]) => [name, Math.max(0, Math.min(1000, Math.floor(Number(count) || 0)))]));
+      const at = new Date(now()).toISOString();
+      latest[site] = { ...latest[site], layoutStatus: { broken: !Object.entries(safeMatched).some(([name, count]) => /input|editor/i.test(name) && count > 0) || !Object.entries(safeMatched).some(([name, count]) => /send|submit/i.test(name) && count > 0), matched: safeMatched, at },
+        health: { ...(latest[site]?.health || {}), selfCheck: { matched: safeMatched, at }, checkResultAt: at, tabContentScriptVersion: String(body.contentScriptVersion || '').slice(0, 80) } };
       saveOrigins(latest);
       return sendJson(res, 200, { ok: true }, origin);
     }
@@ -360,7 +400,7 @@ function createExtApi(options) {
     }
   }
 
-  return { handle, createPairCode, status, revokeSite, rotateSite };
+  return { handle, createPairCode, status, revokeSite, rotateSite, requestCheck };
 }
 
 module.exports = { SITES, API_VERSION, MIN_EXTENSION_VERSION, BODY_LIMIT, REQUEST_LIMIT, extensionOrigin, localHost, createExtApi };

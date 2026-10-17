@@ -70,22 +70,22 @@ test('Claude Desktop config path honors platform app data location', () => {
   assert.equal(paths['claude-desktop'].config, path.join('C:/Users/fake/AppData/Roaming', 'Claude', 'claude_desktop_config.json'));
 });
 
-test('connector detection requires an installed marker and connect refuses missing apps', () => {
+test('connector detection requires an installed marker and connect refuses missing apps', async () => {
   const home = tempHome();
   try {
     assert.equal(connectors.detectConnector('claude-desktop', home, '/app', { PATH: '' }), false);
-    assert.throws(() => connectors.connectClient('claude-desktop', home, '/app', { PATH: '' }), /not installed/);
+    await assert.rejects(connectors.connectClient('claude-desktop', home, '/app', { PATH: '' }), /not installed/);
     fs.mkdirSync(path.join(home, '.gemini'));
     assert.equal(connectors.detectConnector('gemini', home, '/app', { PATH: '' }), true);
   } finally { cleanup(home); }
 });
 
-test('Claude Code uses user-scoped CLI and verifies its config', () => {
+test('Claude Code uses user-scoped CLI and verifies its config', async () => {
   const home = tempHome();
   try {
     const bin = path.join(home, 'bin'); const env = envPath(bin); const cli = path.join(bin, 'claude'); fs.writeFileSync(cli, '');
     const config = path.join(home, '.claude.json');
-    const changed = connectors.connectClient('claude-code', home, '/app', env, {
+    const changed = await connectors.connectClient('claude-code', home, '/app', env, {
       runCli: (_file, args) => {
         assert.deepEqual(args.slice(0, 6), ['mcp', 'add', '--scope', 'user', '--transport', 'stdio']);
         fs.writeFileSync(config, JSON.stringify({ mcpServers: { 'one-brain': { command: 'node', args: ['/app/scripts/mcp-stdio.js', '--client', 'claude-code'] } } }));
@@ -97,19 +97,22 @@ test('Claude Code uses user-scoped CLI and verifies its config', () => {
   } finally { cleanup(home); }
 });
 
-test('connection test spawns the configured stdio bridge and checks search_memory without returning its text', () => {
+test('connection test spawns the configured stdio bridge and checks search_memory without returning its text', async () => {
   const home = tempHome();
   try {
+    fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.codex', 'config.toml'), `[mcp_servers.one-brain]\ncommand = "node"\nargs = ["/app/scripts/mcp-stdio.js", "--client", "codex"]\n`);
     const tokenDir = path.join(home, 'tokens'); fs.mkdirSync(tokenDir); fs.writeFileSync(path.join(tokenDir, 'codex.token'), 'fake-token');
-    const result = connectors.testConnector('codex', '/app', home, { PATH: '' }, {
+    const result = await connectors.testConnector('codex', '/app', home, { PATH: '' }, {
       run: (command, args, input) => {
         assert.equal(command, 'node');
         assert.deepEqual(args, ['/app/scripts/mcp-stdio.js', '--client', 'codex']);
         assert.match(input, /"name":"search_memory"/);
-        return { status: 0, stdout: `${JSON.stringify({ jsonrpc: '2.0', id: 2, result: { content: [{ type: 'text', text: 'synthetic result text' }] } })}\n` };
-      }
+        assert.match(input, /"method":"tools\/list"/);
+        return { status: 0, stdout: `${JSON.stringify({ jsonrpc: '2.0', id: 3, result: { content: [{ type: 'text', text: 'synthetic result text' }] } })}\n` };
+      }, homeDir: home
     });
-    assert.deepEqual(result, { ok: true, reason: 'search_memory succeeded.' });
+    assert.deepEqual(result, { ok: true, reason: 'initialize, tools/list, and search_memory succeeded.' });
     assert.equal(connectors.isConnected('codex', [{ client: 'Codex', verified: true, status: 'approved' }]), true);
     assert.equal(connectors.isConnected('codex', [{ client: 'Codex', verified: true, status: 'pending' }]), false);
   } finally { cleanup(home); }
@@ -130,16 +133,16 @@ test('connect-all previews temp configs, waits for explicit confirmation, then t
     await runConfirmedConnectAll(plan, { write: async () => { writes++; } });
     assert.equal(writes, 0);
     assert.equal(fs.existsSync(path.join(home, '.codex', 'config.toml')), false);
-    await runConfirmedConnectAll(plan, { confirmed: true, write: async (client) => { connectors.connectClient(client, home, '/synthetic/app', env); writes++; } });
+    await runConfirmedConnectAll(plan, { confirmed: true, write: async (client) => { await connectors.connectClient(client, home, '/synthetic/app', env); writes++; } });
     assert.equal(writes, 2);
     assert.ok(fs.existsSync(path.join(home, '.codex', 'config.toml')));
     assert.ok(fs.existsSync(path.join(home, '.gemini', 'settings.json')));
     fs.mkdirSync(path.join(home, 'tokens'), { recursive: true });
     fs.writeFileSync(path.join(home, 'tokens', 'gemini.token'), `${'a'.repeat(64)}\n`);
-    const result = connectors.testConnector('gemini', '/synthetic/app', home, env, { run: (_command, _args, input) => {
+    const result = await connectors.testConnector('gemini', '/synthetic/app', home, env, { run: (_command, _args, input) => {
       assert.match(input, /"name":"search_memory"/);
-      return { status: 0, stdout: `${JSON.stringify({ jsonrpc: '2.0', id: 2, result: { content: [{ type: 'text', text: 'synthetic-only' }] } })}\n` };
-    } });
-    assert.deepEqual(result, { ok: true, reason: 'search_memory succeeded.' });
+      return { status: 0, stdout: `${JSON.stringify({ jsonrpc: '2.0', id: 3, result: { content: [{ type: 'text', text: 'synthetic-only' }] } })}\n` };
+    }, homeDir: home });
+    assert.deepEqual(result, { ok: true, reason: 'initialize, tools/list, and search_memory succeeded.' });
   } finally { cleanup(home); }
 });

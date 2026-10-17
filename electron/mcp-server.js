@@ -53,10 +53,12 @@ function createMcpServer(identity, dependencies = {}) {
       dependencies.connectionActivity?.add({ client: activityClient,
         action: isConnectionTest ? 'test' : /^(?:search_memory|search_memories|list_recent|list_sources|get_memory)$/.test(name) ? 'search' : /^(?:save_memory|add_memory)$/.test(name) ? 'save' : 'test',
         ok: !outcome.result?.isError, reason: outcome.result?.isError ? 'request_failed' : '' });
+      if (!isConnectionTest && identity.verified && identity.profileClient) dependencies.onClientCall?.(identity.profileClient, !outcome.result?.isError, outcome.result?.isError ? 'request_failed' : '');
       return outcome.result;
     } catch (error) {
       recordEvent(mcpActivityMetadata({ tool: name, client, identity: eventIdentity, source: args.source || null,
         resultCount: 0, latencyMs: Date.now() - startedAt, ok: false, error: error?.name || 'Tool failed.' }));
+      if (identity.reportedName !== 'one-brain-connection-test' && identity.verified && identity.profileClient) dependencies.onClientCall?.(identity.profileClient, false, 'request_failed');
       throw error;
     }
   });
