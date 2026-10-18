@@ -24,8 +24,8 @@ test('connection health state machine handles current call, rotation, probes, fa
 });
 
 test('health summary counts healthy, actionable, and neutral rows', () => {
-  assert.deepEqual(summarizeHealth([{ healthStatus: 'healthy' }, { healthStatus: 'failing' }, { healthStatus: 'not_set_up' }, { healthStatus: 'manual_only' }]), { healthy: 1, needAction: 1, notSetUp: 2 });
-  assert.deepEqual(summarizeConnectionHealth([{ healthStatus: 'healthy', healthy: true }, { healthStatus: 'needs_restart' }, { healthStatus: 'not_installed' }]), { healthy: 1, needAction: 1, notSetUp: 1, total: 3, broken: [] });
+  assert.deepEqual(summarizeHealth([{ healthStatus: 'healthy' }, { healthStatus: 'degraded' }, { healthStatus: 'failing' }, { healthStatus: 'not_set_up' }, { healthStatus: 'manual_only' }]), { healthy: 1, degraded: 1, needAction: 1, notSetUp: 2 });
+  assert.deepEqual(summarizeConnectionHealth([{ healthStatus: 'healthy', healthy: true }, { healthStatus: 'needs_restart' }, { healthStatus: 'not_installed' }]), { healthy: 1, degraded: 0, needAction: 1, notSetUp: 1, total: 3, broken: [] });
 });
 
 test('extension health rows aggregate pairing, loop-guard build, permissions, and stale page state', () => {

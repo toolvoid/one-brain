@@ -7,6 +7,17 @@ const os = require('node:os');
 const path = require('node:path');
 const connectors = require('../electron/connectors');
 
+test('runNodeScript forces ELECTRON_RUN_AS_NODE for Electron-based bridge commands', async () => {
+  const result = await connectors.runNodeScript('/opt/one-brain/electron', ['bridge.js'], {
+    env: { PATH: '/synthetic/bin', ELECTRON_RUN_AS_NODE: '0' },
+    run: async (command, args, options) => ({ command, args, env: options.env })
+  });
+  assert.equal(result.command, '/opt/one-brain/electron');
+  assert.deepEqual(result.args, ['bridge.js']);
+  assert.equal(result.env.PATH, '/synthetic/bin');
+  assert.equal(result.env.ELECTRON_RUN_AS_NODE, '1');
+});
+
 function tempHome() { return fs.mkdtempSync(path.join(os.tmpdir(), 'one-brain-connectors-')); }
 function cleanup(home) { fs.rmSync(home, { recursive: true, force: true }); }
 function envPath(bin) { fs.mkdirSync(bin, { recursive: true }); return { PATH: bin, PATHEXT: '.EXE;.CMD;.BAT' }; }

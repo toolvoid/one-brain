@@ -1,8 +1,34 @@
-const { app, BrowserWindow, ipcMain, Menu, safeStorage, globalShortcut, clipboard } = require('electron');
+const { app } = require('electron');
 const path = require('path');
 const fs = require('node:fs');
+const { createLifecycleLog, instrumentAppExitCalls } = require('./lifecycle-log');
+const lifecycleLog = createLifecycleLog(app.getPath('userData'));
+lifecycleLog.append('app_start');
+instrumentAppExitCalls(app, lifecycleLog);
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  lifecycleLog.append('second_instance_blocked');
+  app.quit();
+}
+const { getGraphicsStartupConfig, recordGpuCrash, registerShortcutWithFallback } = require('./platform');
+const { createCrashLoopLimiter } = require('./window-lifecycle');
+const { rendererErrorLocation } = require('./renderer-errors');
+const { readGraphicsSettings, writeGraphicsSettings } = require('./graphics-settings');
+const graphicsUserDataPath = app.getPath('userData');
+let graphicsSettings = readGraphicsSettings(graphicsUserDataPath);
+const graphicsStartupConfig = getGraphicsStartupConfig(process.platform, { ...process.env, argv: process.argv }, graphicsSettings);
+let gpuCrashCount = 0;
+if (graphicsStartupConfig.ozonePlatform) app.commandLine.appendSwitch('ozone-platform', graphicsStartupConfig.ozonePlatform);
+if (graphicsStartupConfig.disableFeatures) app.commandLine.appendSwitch('disable-features', graphicsStartupConfig.disableFeatures);
+if (graphicsStartupConfig.useGl) app.commandLine.appendSwitch('use-gl', graphicsStartupConfig.useGl);
+if (graphicsStartupConfig.useAngle) app.commandLine.appendSwitch('use-angle', graphicsStartupConfig.useAngle);
+if (graphicsStartupConfig.disable3dApiDomainBlocking) app.disableDomainBlockingFor3DAPIs();
+if (graphicsStartupConfig.disableHardwareAcceleration) app.disableHardwareAcceleration();
+
+const { BrowserWindow, ipcMain, Menu, safeStorage, globalShortcut, clipboard, Tray, nativeImage } = require('electron');
+ipcMain.handle('lifecycle:tail', () => lifecycleLog.tail(50));
 const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
-const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getMcpClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, getMemoryEmbeddingVector, getMemory, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, listRecentImports, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, addMemory, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
+const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getMcpClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, getMemoryEmbeddingVector, getMemory, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, listRecentImports, listClients, removeLegacyClient, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, addMemory, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
 const { startMcpServer } = require('./mcp-server');
 const { createEmbedder } = require('./embedder');
 const connectors = require('./connectors');
@@ -21,9 +47,105 @@ let embedderGeneration = 0;
 let embeddingStatus = { state: 'loading' };
 const chatControllers = new Map();
 let quickContextWindow = null;
+let quickContextTray = null;
 let quickContextShortcut = null;
 let quickContextRegistrationError = '';
 let connectionActivity = null;
+let graphicsRestartNoticePending = graphicsSettings.restartNotice;
+let mainWindow = null;
+let recoveryPageShown = false;
+const mainWindowCrashLimiter = createCrashLoopLimiter({ maxRestarts: 3, windowMs: 60_000 });
+const pendingReloads = new WeakSet();
+
+function logChildProcessSpawn(command) { lifecycleLog.append('child_process_spawn', { command }); }
+
+function focusExistingMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  if (!mainWindow.isVisible()) mainWindow.show();
+  mainWindow.focus();
+  return true;
+}
+
+function reloadWindow(win) {
+  const contents = win.webContents;
+  pendingReloads.add(contents);
+  try { contents.reload(); }
+  catch (error) { pendingReloads.delete(contents); throw error; }
+}
+
+if (hasSingleInstanceLock) app.on('second-instance', () => {
+  lifecycleLog.append('second_instance_received');
+  focusExistingMainWindow();
+});
+
+function attachWindowLifecycle(win, windowName) {
+  let lastMainFrameUrl = null;
+  lifecycleLog.append('window_created', { window: windowName });
+  win.once('closed', () => lifecycleLog.append('window_closed', { window: windowName }));
+  win.on('unresponsive', () => lifecycleLog.append('window_unresponsive', { window: windowName }));
+  win.webContents.on('did-start-navigation', (navigationEvent, legacyUrl, _legacyIsInPlace, legacyIsMainFrame) => {
+    const url = navigationEvent?.url || legacyUrl;
+    const isMainFrame = typeof navigationEvent?.isMainFrame === 'boolean' ? navigationEvent.isMainFrame : legacyIsMainFrame !== false;
+    const isSameDocument = typeof navigationEvent?.isSameDocument === 'boolean' ? navigationEvent.isSameDocument : _legacyIsInPlace === true;
+    const explicitlyReportedReload = typeof navigationEvent?.isReload === 'boolean' ? navigationEvent.isReload : null;
+    const requestedReload = isMainFrame && pendingReloads.delete(win.webContents);
+    const sameUrlReload = isMainFrame && !isSameDocument && typeof url === 'string' && url === lastMainFrameUrl;
+    const isReload = explicitlyReportedReload ?? (requestedReload || sameUrlReload);
+    if (isMainFrame && typeof url === 'string') lastMainFrameUrl = url;
+    lifecycleLog.append('did_start_navigation', { window: windowName, isReload });
+  });
+  win.webContents.on('did-fail-load', (_event, errorCode, _errorDescription, _validatedURL, isMainFrame) => {
+    lifecycleLog.append('did_fail_load', { window: windowName, errorCode, isMainFrame });
+  });
+  win.webContents.on('render-process-gone', (_event, details = {}) => {
+    lifecycleLog.append('render_process_gone', { window: windowName, reason: details.reason, exitCode: details.exitCode });
+    if (windowName !== 'main' || win !== mainWindow || win.isDestroyed() || recoveryPageShown) return;
+    const recovery = mainWindowCrashLimiter.allowRestart();
+    if (recovery.allowed) {
+      lifecycleLog.append('window_recovery_attempt', { attempt: recovery.count });
+      setTimeout(() => {
+        if (win === mainWindow && !win.isDestroyed() && !win.webContents.isDestroyed() && !recoveryPageShown) reloadWindow(win);
+      }, 250);
+      return;
+    }
+    recoveryPageShown = true;
+    lifecycleLog.append('window_recovery_paused');
+    void win.loadFile(path.join(__dirname, 'lifecycle-recovery.html')).catch(() => {
+      lifecycleLog.append('recovery_page_failed');
+    });
+  });
+}
+
+app.on('child-process-gone', (_event, details) => {
+  lifecycleLog.append('child_process_gone', { type: details?.type, reason: details?.reason, exitCode: details?.exitCode });
+  const result = recordGpuCrash(process.platform, gpuCrashCount, details, graphicsSettings.safeGraphicsMode);
+  gpuCrashCount = result.count;
+  if (!result.enableSafeMode) return;
+  graphicsSettings = writeGraphicsSettings(graphicsUserDataPath, { safeGraphicsMode: true, restartNotice: true });
+  graphicsRestartNoticePending = true;
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.send('graphics:safe-mode-enabled');
+  }
+});
+
+ipcMain.handle('graphics:get-settings', () => ({
+  supported: process.platform === 'linux',
+  safeGraphicsMode: graphicsSettings.safeGraphicsMode,
+  restartRequired: graphicsSettings.safeGraphicsMode !== graphicsStartupConfig.safeGraphicsMode,
+  restartNotice: graphicsRestartNoticePending
+}));
+ipcMain.handle('graphics:set-safe-mode', (_event, enabled) => {
+  if (process.platform !== 'linux') return { supported: false, safeGraphicsMode: false, restartRequired: false };
+  graphicsSettings = writeGraphicsSettings(graphicsUserDataPath, { safeGraphicsMode: enabled === true, restartNotice: graphicsSettings.restartNotice });
+  return { supported: true, safeGraphicsMode: graphicsSettings.safeGraphicsMode, restartRequired: graphicsSettings.safeGraphicsMode !== graphicsStartupConfig.safeGraphicsMode, restartNotice: graphicsRestartNoticePending };
+});
+ipcMain.handle('graphics:acknowledge-restart-notice', () => {
+  if (!graphicsRestartNoticePending) return false;
+  graphicsRestartNoticePending = false;
+  graphicsSettings = writeGraphicsSettings(graphicsUserDataPath, { ...graphicsSettings, restartNotice: false });
+  return true;
+});
 function connectorAppPath() {
   return app.isPackaged ? path.join(process.resourcesPath, 'one-brain') : app.getAppPath();
 }
@@ -40,7 +162,8 @@ function getConnectorTokenStates() {
     catch { return item; }
   });
 }
-const QUICK_CONTEXT_DEFAULTS = { enabled: true, shortcut: 'Control+Shift+Space' };
+const QUICK_CONTEXT_DEFAULTS = { enabled: true, shortcut: 'Control+Alt+B' };
+const QUICK_CONTEXT_FALLBACKS = ['Control+Alt+B', 'Control+Alt+Space', 'Control+Shift+B'];
 const quickContextSettingsPath = () => path.join(app.getPath('userData'), 'quick-context-settings.json');
 
 function readQuickContextSettings() {
@@ -60,8 +183,18 @@ function createQuickContextWindow() {
   quickContextWindow = new BrowserWindow({ width: 470, height: 570, minWidth: 390, minHeight: 420, alwaysOnTop: true, skipTaskbar: true,
     title: 'Quick context', autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false } });
+  attachWindowLifecycle(quickContextWindow, 'quick-context');
   quickContextWindow.loadFile(path.join(__dirname, 'quick-context.html'));
   quickContextWindow.on('closed', () => { quickContextWindow = null; });
+}
+function createQuickContextTray() {
+  if (quickContextTray) return;
+  try {
+    quickContextTray = new Tray(nativeImage.createEmpty());
+    quickContextTray.setToolTip('One Brain Quick context');
+    quickContextTray.setContextMenu(Menu.buildFromTemplate([{ label: 'Open Quick context', click: createQuickContextWindow }, { label: 'Quit One Brain', click: () => app.quit() }]));
+    quickContextTray.on('click', createQuickContextWindow);
+  } catch { quickContextTray = null; }
 }
 
 function applyQuickContextSettings(next) {
@@ -70,19 +203,23 @@ function applyQuickContextSettings(next) {
   quickContextShortcut = null;
   if (next.enabled) {
     const accelerator = String(next.shortcut || '').trim();
-    if (!accelerator || !globalShortcut.register(accelerator, createQuickContextWindow)) {
+    const choice = registerShortcutWithFallback(accelerator, QUICK_CONTEXT_FALLBACKS, (shortcut) => globalShortcut.register(shortcut, createQuickContextWindow));
+    const registered = choice.shortcut;
+    if (!registered) {
       if (previous && readQuickContextSettings().enabled && globalShortcut.register(previous, createQuickContextWindow)) quickContextShortcut = previous;
-      quickContextRegistrationError = 'That shortcut is unavailable. Choose a different key combination.';
-      throw new Error('That shortcut is unavailable. Choose a different key combination.');
+      quickContextRegistrationError = `${accelerator || '(empty shortcut)'} could not register; fallback shortcuts are also unavailable.`;
+      throw new Error(quickContextRegistrationError);
     }
-    quickContextShortcut = accelerator;
+    quickContextShortcut = registered;
+    if (registered !== accelerator) { next = { ...next, shortcut: registered }; quickContextRegistrationError = `${accelerator || '(empty shortcut)'} could not register; using ${registered}.`; }
   }
-  quickContextRegistrationError = '';
+  else quickContextRegistrationError = '';
   persistQuickContextSettings(next);
   return next;
 }
 
 ipcMain.handle('quick-context:settings', () => ({ ...readQuickContextSettings(), registered: Boolean(quickContextShortcut), error: quickContextRegistrationError }));
+ipcMain.handle('quick-context:open', () => { createQuickContextWindow(); return true; });
 ipcMain.handle('quick-context:update-settings', (_event, patch = {}) => {
   const current = readQuickContextSettings();
   const next = { enabled: typeof patch.enabled === 'boolean' ? patch.enabled : current.enabled,
@@ -189,7 +326,7 @@ ipcMain.handle('connectors:connect', async (_event, client) => {
   const appPath = connectorAppPath(); const env = connectorEnvironment();
   if (!connectors.detectConnector(client, app.getPath('home'), appPath, env)) throw new Error(`${connectors.CLIENTS.find((item) => item.id === client)?.name || 'Client'} is not installed.`);
   ensureClientToken(app.getPath('userData'), client, storeClientTokenHash);
-  const files = await connectors.connectClient(client, app.getPath('home'), appPath, env);
+  const files = await connectors.connectClient(client, app.getPath('home'), appPath, env, { onSpawn: logChildProcessSpawn });
   setConnectionHealthState(client, reduceHealth(getConnectionHealthState(client) || initialHealth(), { type: 'connect' }));
   connectionActivity?.add({ client: connectors.CLIENTS.find((item) => item.id === client)?.name, action: 'connect', ok: true });
   return files;
@@ -202,7 +339,7 @@ ipcMain.handle('connectors:rotate-token', (_event, client) => {
 });
 ipcMain.handle('connectors:test', async (_event, client) => {
   const started = Date.now();
-  const result = await connectors.testConnector(client, connectorAppPath(), app.getPath('userData'), connectorEnvironment(), { homeDir: app.getPath('home') });
+  const result = await connectors.testConnector(client, connectorAppPath(), app.getPath('userData'), connectorEnvironment(), { homeDir: app.getPath('home'), onSpawn: logChildProcessSpawn });
   const duration = Date.now() - started;
   const reason = result.ok ? '' : result.customCommand ? 'custom_command' : result.reason === 'One Brain app is not running.' ? 'app_not_running' : 'request_failed';
   if (!result.customCommand) {
@@ -240,6 +377,7 @@ ipcMain.handle('clients:list', () => listClients());
 ipcMain.handle('clients:approve', (_event, client, readSources, writeSource) => approveClient(client, readSources, writeSource));
 ipcMain.handle('clients:grant', (_event, client, source, status) => updateClientGrant(client, source, status));
 ipcMain.handle('clients:update', (_event, client, changes) => updateClientProfile(client, changes));
+ipcMain.handle('clients:remove-legacy', (_event, client) => removeLegacyClient(client));
 ipcMain.handle('analytics:insights', () => getInsights());
 ipcMain.handle('analytics:run-sql', (_event, sql) => runAnalyticsSql(sql));
 ipcMain.handle('analytics:reset-retrieval-counts', () => resetRetrievalCounts());
@@ -324,6 +462,11 @@ ipcMain.handle('pending-memories:approve', (_event, id, title, content) => {
 ipcMain.handle('pending-memories:reject', (_event, id) => rejectPendingMemory(id));
 
 function createWindow() {
+  if (process.platform === 'linux' && mainWindow && !mainWindow.isDestroyed()) {
+    if (!mainWindow.isVisible()) mainWindow.show();
+    mainWindow.focus();
+    return mainWindow;
+  }
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -333,6 +476,14 @@ function createWindow() {
       nodeIntegration: false
     }
   });
+  mainWindow = win;
+  attachWindowLifecycle(win, 'main');
+  win.once('closed', () => { if (mainWindow === win) mainWindow = null; });
+  win.once('ready-to-show', () => { if (!win.isDestroyed()) { win.show(); win.focus(); } });
+  win.webContents.on('console-message', (details) => {
+    const location = rendererErrorLocation(details.level, details.lineNumber, details.sourceId);
+    if (location) console.error(`One Brain renderer error at ${location.source}${location.line ? `:${location.line}` : ''} (message omitted).`);
+  });
 
   if (!app.isPackaged) {
     win.webContents.on('before-input-event', (event, input) => {
@@ -341,7 +492,7 @@ function createWindow() {
       const command = input.control || input.meta;
       if (command && key === 'r') {
         event.preventDefault();
-        win.webContents.reload();
+        reloadWindow(win);
       } else if ((command && input.shift && (key === 'i' || key === 'j')) || key === 'f12') {
         event.preventDefault();
         win.webContents.toggleDevTools();
@@ -354,14 +505,18 @@ function createWindow() {
   } else {
     win.loadURL('http://localhost:5173');
   }
+  return win;
 }
 
 app.whenReady().then(async () => {
+  if (!hasSingleInstanceLock) return;
+  createQuickContextTray();
   const databaseStatus = await initializeDatabase(app.getPath('userData'), safeStorage);
   if (databaseStatus.message) console.error(databaseStatus.message);
 
   startEmbedder();
   try { applyQuickContextSettings(readQuickContextSettings()); } catch { /* Keep the app usable if the OS reserves the selected shortcut. */ }
+  createWindow();
 
   const userDataPath = app.getPath('userData');
   connectionActivity = createConnectionActivity(userDataPath);
@@ -401,10 +556,12 @@ app.whenReady().then(async () => {
   try {
     const connection = await memoryProxy.start();
     console.log(`One Brain memory proxy listening at ${connection.endpoint}`);
-    for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:memory-proxy-ready', connection);
+    // The proxy connection includes a Node HTTP server, which cannot cross
+    // Electron's IPC serialization boundary. No renderer consumes this event.
   } catch (error) { console.error('Could not start One Brain memory proxy:', error?.name || 'Error'); }
 
   startMcpServer(app.getPath('userData'), connectorAppPath(), {
+    onSpawn: logChildProcessSpawn,
     searchMemoriesForClient, getEmbeddingVector: getMemoryEmbeddingVector,
     embedText: (text) => embedder?.embed(text) || Promise.reject(new Error('Local embedder is unavailable.')),
     listMemories, addMemory, connectionActivity,
@@ -414,17 +571,15 @@ app.whenReady().then(async () => {
     }
   }).then((connection) => {
     mcpConnection = connection;
-    createWindow();
     console.log(`One Brain MCP listening at ${connection.config.endpoint}`);
   }).catch((error) => {
     console.error('Could not start One Brain MCP server:', error);
-    createWindow();
   });
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
-    }
+    lifecycleLog.append('app_activate');
+    if (process.platform === 'linux') createWindow();
+    else if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
 

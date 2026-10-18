@@ -25,7 +25,7 @@ function mcpActivityMetadata({ kind = 'mcp_call', tool, client, identity = {}, s
  */
 function createMcpToolHandlers(deps) {
   const { searchMemoriesForClient, listMemories, addMemory, getEmbeddingVector = () => null, embedText = null,
-    getImporter = () => import('../src/lib/importers.js'), notifyRetrieved = () => {}, notifyAdded = () => {} } = deps;
+    getImporter = () => import('../src/lib/importers.mjs'), notifyRetrieved = () => {}, notifyAdded = () => {} } = deps;
 
   async function search_memory({ query, limit = 5, source }, profile) {
     const importer = await getImporter();

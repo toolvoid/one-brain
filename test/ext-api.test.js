@@ -14,7 +14,7 @@ const { contentHash } = require('../electron/ext-chat');
 async function harness({ clock = () => Date.now() } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'one-brain-ext-test-'));
   let tick = clock;
-  const tokens = new Map(), profiles = new Map(), events = [], authFailures = [], retrieved = [], added = [], memories = [];
+  const tokens = new Map(), profiles = new Map(), events = [], authFailures = [], rateLimited = [], retrieved = [], added = [], memories = [];
   let tokenCounter = 0, nextMemoryId = 101, nextImportId = 1;
   const imports = new Map();
   const saveImported = (items, importId, markPrivate) => {
@@ -50,7 +50,7 @@ async function harness({ clock = () => Date.now() } = {}) {
     undoExtensionChatSave: (id, extensionClient) => { const batch = imports.get(id); if (!batch || batch.extensionClient !== extensionClient) return { removed: false, memoryIds: [] }; const rows = memories.filter((item) => item.importId === id); for (let index = memories.length - 1; index >= 0; index--) if (memories[index].importId === id) memories.splice(index, 1); imports.delete(id); return { removed: true, memoryIds: rows.map((item) => item.id) }; },
     recordProxyEvent: (event, ids) => events.push({ ...event, ids }),
     emitRetrieved: (ids) => retrieved.push(...ids), emitAdded: (id) => added.push(id),
-    emitRemoved: (id) => added.push(-id), authFailureLog: (entry) => authFailures.push(entry)
+    emitRemoved: (id) => added.push(-id), authFailureLog: (entry) => authFailures.push(entry), rateLimitedLog: (entry) => rateLimited.push(entry)
   });
   const proxy = createMemoryProxy({ userDataPath: directory, extensionApi: api });
   const server = http.createServer((req, res) => { void proxy.handle(req, res); });
@@ -69,7 +69,7 @@ async function harness({ clock = () => Date.now() } = {}) {
     profiles.get(`ext:${site}`).allowedSources = ['chatgpt', 'claude', 'gemini'];
     return result.token;
   }
-  return { api, server, directory, origin, request, pair, tokens, profiles, events, authFailures, retrieved, added, memories, setNow(value) { tick = () => value; } };
+  return { api, server, directory, origin, request, pair, tokens, profiles, events, authFailures, rateLimited, retrieved, added, memories, setNow(value) { tick = () => value; } };
 }
 
 test('pairing codes expire and five incorrect attempts exhaust one code', async (t) => {
@@ -148,7 +148,7 @@ test('DeepSeek and Groq pairing tokens can authenticate their extension endpoint
     assert.equal((await response.json()).site, site);
     const layout = await h.request('/ext/layout-status', { site, token, method: 'POST', body: { matched: { input: true, send: false, messages: true, text: 'must not persist' } } });
     assert.equal(layout.status, 200);
-    assert.equal(h.api.status().find((item) => item.site === site).layoutStatus.broken, true);
+    assert.equal(h.api.status().find((item) => item.site === site).layoutStatus.broken, false, 'send and message selectors do not affect REQUIRED composer status');
   }
 });
 
@@ -284,13 +284,35 @@ test('extension panel can mark an allowed memory never-suggest and search then e
   assert.deepEqual(result.memories, []);
 });
 
-test('extension token is limited to thirty requests per minute', async (t) => {
+test('extension control limit is 120 per minute and is not an auth failure', async (t) => {
   const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
   const token = await h.pair();
   let response;
-  for (let index = 0; index < 31; index++) response = await h.request('/ext/ping', { token });
+  for (let index = 0; index < 125; index++) response = await h.request('/ext/ping', { token });
   assert.equal(response.status, 429);
-  assert.equal((await response.json()).reason, 'rate_limited');
+  const body = await response.json();
+  assert.equal(body.reason, 'rate_limited');
+  assert.ok(Number(response.headers.get('retry-after')) > 0);
+  assert.equal(h.authFailures.filter((entry) => entry.reason === 'rate_limited').length, 0);
+  await new Promise((resolve) => setTimeout(resolve, 550));
+  assert.equal(h.rateLimited.length, 1);
+  assert.deepEqual(h.rateLimited.at(-1), { type: 'rate_limited', client: 'ext:chatgpt', class: 'control', count: 5 });
+});
+
+test('search traffic has its own bucket and cannot starve control pings', async (t) => {
+  const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
+  const token = await h.pair(); let response;
+  for (let index = 0; index < 31; index++) response = await h.request('/ext/search', { method: 'POST', token, body: { query: `synthetic query ${index}` } });
+  assert.equal(response.status, 429); assert.equal((await response.json()).reason, 'rate_limited');
+  response = await h.request('/ext/ping', { token }); assert.equal(response.status, 200);
+});
+
+test('save requests have a separate ten-per-minute bucket', async (t) => {
+  const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
+  const token = await h.pair(); let response;
+  for (let index = 0; index < 11; index++) response = await h.request('/ext/save', { method: 'POST', token, body: { site: 'chatgpt', kind: 'message', text: `Synthetic durable fixture ${index} with enough text to pass local filtering.` } });
+  assert.equal(response.status, 429); assert.equal((await response.json()).reason, 'rate_limited');
+  assert.equal(h.authFailures.filter((entry) => entry.reason === 'rate_limited').length, 0);
 });
 
 test('extension API rejects request bodies larger than two megabytes', async (t) => {

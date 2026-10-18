@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 const { randomBytes, randomUUID, timingSafeEqual } = require('node:crypto');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
@@ -287,15 +288,21 @@ async function startMcpServer(userDataPath, appPath, dependencies = {}) {
   try { fs.chmodSync(tokenPath, 0o600); } catch {}
 
   const portPath = path.join(userDataPath, 'mcp-port');
+  const preferredPath = path.join(userDataPath, 'mcp-preferred-port');
+  let preferredPort = Number(fs.existsSync(preferredPath) ? fs.readFileSync(preferredPath, 'utf8').trim() : 3737);
+  if (!Number.isInteger(preferredPort) || preferredPort < 1 || preferredPort > 65535) preferredPort = 3737;
+  if (!fs.existsSync(preferredPath)) fs.writeFileSync(preferredPath, `${preferredPort}\n`, { mode: 0o600 });
   let savedPort = Number(fs.existsSync(portPath) ? fs.readFileSync(portPath, 'utf8').trim() : 0);
   if (!Number.isInteger(savedPort) || savedPort < 1 || savedPort > 65535) savedPort = 0;
-  const candidates = [...new Set([savedPort || 3737, 3737, 0])];
+  const candidates = [...new Set([preferredPort, savedPort, 0])];
+  let preferredPortInUseBy = null;
   let server;
   let lastError;
   for (const port of candidates) {
     try { server = await listen(port, token, dependencies); break; }
     catch (error) {
       lastError = error;
+      if (port === preferredPort && error.code === 'EADDRINUSE') preferredPortInUseBy = findListeningProcess(preferredPort, dependencies.onSpawn);
       if (error.code !== 'EADDRINUSE' && port !== 0) throw error;
     }
   }
@@ -309,6 +316,8 @@ async function startMcpServer(userDataPath, appPath, dependencies = {}) {
     config: {
       endpoint: `http://127.0.0.1:${chosenPort}/mcp`,
       port: chosenPort,
+      preferredPort,
+      preferredPortInUseBy,
       token,
       userDataPath,
       stdioScript: path.join(appPath, 'scripts', 'mcp-stdio.js')
@@ -316,4 +325,15 @@ async function startMcpServer(userDataPath, appPath, dependencies = {}) {
   };
 }
 
-module.exports = { createMcpServer, startMcpServer };
+function findListeningProcess(port, onSpawn = () => {}) {
+  try {
+    onSpawn('lsof');
+    const pid = execFileSync('lsof', ['-nP', '-t', `-iTCP:${port}`, '-sTCP:LISTEN'], { encoding: 'utf8', timeout: 1000 }).trim().split(/\s+/)[0];
+    if (!/^\d+$/.test(pid || '')) return 'Process details unavailable';
+    onSpawn('ps');
+    const name = execFileSync('ps', ['-p', pid, '-o', 'comm='], { encoding: 'utf8', timeout: 1000 }).trim();
+    return name ? `${name} (PID ${pid})` : `PID ${pid}`;
+  } catch { return 'Process details unavailable'; }
+}
+
+module.exports = { createMcpServer, startMcpServer, findListeningProcess };

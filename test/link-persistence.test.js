@@ -85,7 +85,7 @@ test('links survive three database reopen and startup re-embedding passes', asyn
     `;
     for (let restart = 0; restart < 3; restart++) {
       db.closeDatabaseForTest();
-      const child = spawnSync(process.execPath, ['-e', crashScript, userData, 'synthetic-model-refresh', String(ids[0]), String(ids[1])], { stdio: 'ignore' });
+      const child = spawnSync(process.execPath, ['-e', crashScript, userData, 'synthetic-model-refresh', String(ids[0]), String(ids[1])], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: 'ignore' });
       assert.equal(child.signal, 'SIGKILL', `restart ${restart + 1} did not terminate during committed WAL writes`);
       await db.initializeDatabase(userData, safeStorage);
       assert.deepEqual(snapshot(), expected);

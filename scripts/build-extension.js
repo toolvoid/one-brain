@@ -6,7 +6,7 @@ const { createHash, createPrivateKey, createPublicKey, generateKeyPairSync } = r
 
 const ROOT = path.resolve(__dirname, '..');
 const hosts = ['http://127.0.0.1/*', 'https://chatgpt.com/*', 'https://claude.ai/*', 'https://gemini.google.com/*', 'https://chat.deepseek.com/*', 'https://console.groq.com/*'];
-const common = ['src/adapters/shared.js', 'src/context-blocks.js', 'src/background-message.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/smart-save.js', 'src/insertion-guard.js', 'src/manual-context.js', 'src/layout-fallback.js'];
+const common = ['src/adapters/shared.js', 'src/chat-loader.js', 'src/context-blocks.js', 'src/background-message.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/smart-save.js', 'src/insertion-guard.js', 'src/manual-context.js', 'src/layout-fallback.js'];
 const contentScripts = [
   { matches: ['https://chatgpt.com/*'], js: [...common, 'src/adapters/chatgpt.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
   { matches: ['https://claude.ai/*'], js: [...common, 'src/adapters/claude.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },

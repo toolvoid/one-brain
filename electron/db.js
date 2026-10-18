@@ -1233,8 +1233,9 @@ function normalizeClientName(client) {
 function getMcpClientProfile(clientName, identity = {}) {
   const db = getDatabase();
   const client = normalizeClientName(clientName);
+  const defaultSource = /^ext:(chatgpt|claude|gemini|deepseek|groq)$/.exec(client)?.[1] || /^chat:(chatgpt|claude|gemini|deepseek|groq)$/.exec(client)?.[1] || null;
   const created = db.prepare(`INSERT OR IGNORE INTO client_profiles (client, write_source, status, first_seen, last_seen)
-    VALUES (?, NULL, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`).run(client).changes > 0;
+    VALUES (?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`).run(client, defaultSource).changes > 0;
   db.prepare('UPDATE client_profiles SET last_seen = CURRENT_TIMESTAMP, verified = ?, reported_name = ? WHERE client = ?')
     .run(identity.verified ? 1 : 0, identity.reported_name || null, client);
   const profile = db.prepare('SELECT client, write_source, status, first_seen, last_seen, verified, reported_name FROM client_profiles WHERE client = ?').get(client);
@@ -1250,6 +1251,15 @@ function listClients() {
     ...profile,
     grants: Object.fromEntries(MEMORY_SOURCES.map((source) => [source, db.prepare('SELECT status FROM client_grants WHERE client = ? AND read_source = ?').get(profile.client, source)?.status || 'deny']))
   }));
+}
+
+function removeLegacyClient(clientName, now = Date.now()) {
+  ensureWritable();
+  const client = normalizeClientName(clientName), db = getDatabase();
+  const profile = db.prepare('SELECT client, verified, last_seen FROM client_profiles WHERE client = ?').get(client);
+  if (!profile || profile.verified || !profile.last_seen || now - Date.parse(`${String(profile.last_seen).replace(' ', 'T')}Z`) < 3 * 86400_000) return { removed: false };
+  db.transaction(() => { db.prepare('DELETE FROM client_grants WHERE client = ?').run(client); db.prepare('DELETE FROM client_profiles WHERE client = ?').run(client); })();
+  return { removed: true, client };
 }
 
 function approveClient(clientName, readSources, writeSource) {
@@ -1834,4 +1844,4 @@ function countBySource() {
     }, {});
 }
 
-module.exports = { initializeDatabase, closeDatabaseForTest, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, searchMemoriesForClient, getMemoryEmbeddingVector, getMemoryForClient, countBySourceForClient, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, JOIN_ALL_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
+module.exports = { initializeDatabase, closeDatabaseForTest, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, removeLegacyClient, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, searchMemoriesForClient, getMemoryEmbeddingVector, getMemoryForClient, countBySourceForClient, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, JOIN_ALL_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };

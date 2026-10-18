@@ -1,16 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import BrainGraph from './components/BrainGraph.jsx';
-import { MAX_IMPORT_ITEMS, isLogLikeChunk, parseImportText, parseImportFile, inferImportSource } from './lib/importers.js';
+import { MAX_IMPORT_ITEMS, isLogLikeChunk, parseImportText, parseImportFile, inferImportSource } from './lib/importers.mjs';
 import '../extension/src/smart-save.js';
 import { fallbackMemoryTitle, heuristicMemoryTitle, isChatModel, memorySourceForProvider } from './lib/chat-models.mjs';
 import { DEFAULT_LINK_VISIBILITY, graphLinkCounts, visibleGraphLinks } from './lib/graph-links.mjs';
 import { JOIN_ALL_MIN } from './lib/link-constants.json';
 import { runLinkMutation } from './lib/link-actions.mjs';
 import { multilineKeyAction } from './lib/multiline-key-action.mjs';
-import { buildConnectionRows, summarizeConnectionHealth, createConnectAllPlan, runConfirmedConnectAll } from './lib/connections-dashboard.mjs';
+import { buildConnectionRows, summarizeConnectionHealth, createConnectAllPlan, runConfirmedConnectAll, defaultWriteSourceForClient, getWriteSourceReview } from './lib/connections-dashboard.mjs';
+import { PERFORMANCE_MODE_EVENT, readManualPerformanceMode, writeManualPerformanceMode } from './lib/graph-performance.mjs';
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
+const defaultWriteSource = (client) => defaultWriteSourceForClient(client) || 'codex';
 const SOURCE_COLORS = {
   chatgpt: '#42d6c2', claude: '#f29a60', codex: '#70a9ff',
   gemini: '#b18cff', groq: '#f2d66d', deepseek: '#ff7095'
@@ -167,9 +169,15 @@ function ProviderKeysPanel({ clients }) {
   const [extensionError, setExtensionError] = useState('');
   const [quickSettings, setQuickSettings] = useState(null);
   const [quickError, setQuickError] = useState('');
+  const [graphicsSettings, setGraphicsSettings] = useState(null);
+  const [performanceMode, setPerformanceMode] = useState(() => readManualPerformanceMode());
+  const [lifecycleLines, setLifecycleLines] = useState([]);
+  const [lifecycleError, setLifecycleError] = useState('');
   const [keyTests, setKeyTests] = useState({});
   useEffect(() => { window.brain.getMemoryProxySettings().then(setSettings).catch(() => setNotice('Proxy settings are unavailable.')); }, []);
   useEffect(() => { window.brain.getQuickContextSettings().then((value) => { setQuickSettings(value); setQuickError(value.error || ''); }).catch(() => setQuickError('Quick context settings are unavailable.')); }, []);
+  useEffect(() => { window.brain.getGraphicsSettings?.().then(setGraphicsSettings).catch(() => {}); }, []);
+  useEffect(() => { void refreshLifecycleLog(); }, []);
   useEffect(() => { window.brain.getExtensionStatus().then(setExtensions).catch((error) => setExtensionError(error.message || 'Extension status is unavailable.')); }, [clients]);
   async function makePairCode() {
     try { setPairCode(await window.brain.createExtensionPairCode()); setExtensionError(''); }
@@ -205,6 +213,23 @@ function ProviderKeysPanel({ clients }) {
     try { const result = await window.brain.updateQuickContextSettings(quickSettings); setQuickSettings(result); setQuickError(result.error || ''); }
     catch (error) { setQuickError(error.message || 'Could not register this shortcut.'); }
   }
+  async function updateGraphicsMode(enabled) {
+    try { setGraphicsSettings(await window.brain.setSafeGraphicsMode(enabled)); }
+    catch { setNotice('Could not save graphics settings.'); }
+  }
+  function updatePerformanceMode(enabled) {
+    const next = writeManualPerformanceMode(enabled);
+    setPerformanceMode(next);
+    window.dispatchEvent(new CustomEvent(PERFORMANCE_MODE_EVENT, { detail: next }));
+  }
+  async function refreshLifecycleLog() {
+    try { setLifecycleLines(await window.brain.getLifecycleLog()); setLifecycleError(''); }
+    catch { setLifecycleError('Lifecycle diagnostics are unavailable.'); }
+  }
+  async function copyLifecycleLog() {
+    try { await navigator.clipboard.writeText(lifecycleLines.join('\n')); setNotice('Lifecycle diagnostics copied.'); }
+    catch { setLifecycleError('Could not copy lifecycle diagnostics.'); }
+  }
   if (!settings) return <section className="clients-settings"><h2>Provider keys</h2><p className="empty-note">Loading proxy settings…</p></section>;
   return <section className="clients-settings proxy-settings">
     <header><h2>Provider keys</h2><small>Keys are encrypted locally and never read back into the UI.</small></header>
@@ -219,7 +244,10 @@ function ProviderKeysPanel({ clients }) {
       </div>
     </article>)}
     <section className="extension-pair-card"><header><h3>Browser extension</h3><button type="button" onClick={() => void makePairCode()}>Pair</button></header><p className="connect-hint">Enter the code and local API address in the One Brain extension popup. New sites appear here for approval and source grants.</p>{pairCode && <p className="extension-pair-code" role="status">Pairing code <strong>{pairCode.code}</strong> · expires in 2 minutes<br />API address <code>{pairCode.endpoint}</code></p>}{extensions.map((item) => <article className="extension-site-row" key={item.site}><span><strong>{item.site}</strong><small>{item.active ? (item.status === 'approved' ? 'Connected' : 'Waiting for approval') : 'Not paired'}{item.origin ? ` · ${item.origin}` : ''}</small></span>{item.paired && <><button type="button" onClick={() => void rotateExtension(item.site)}>Rotate</button><button type="button" onClick={() => void revokeExtension(item.site)}>Revoke</button></>}</article>)}{extensionError && <p role="alert" className="empty-note">{extensionError}</p>}</section>
-    {quickSettings && <section className="extension-pair-card"><header><h3>Quick context</h3></header><p className="connect-hint">Open a small always-on-top context search from any app. The question is searched locally and is not logged.</p><label className="proxy-setting"><input type="checkbox" checked={quickSettings.enabled} onChange={(event) => setQuickSettings((current) => ({ ...current, enabled: event.target.checked }))} />Enable global shortcut</label><label className="proxy-setting">Shortcut<input value={quickSettings.shortcut} onChange={(event) => setQuickSettings((current) => ({ ...current, shortcut: event.target.value }))} placeholder="Control+Shift+Space" /></label><button type="button" onClick={() => void saveQuickSettings()}>Save shortcut</button>{quickError && <p role="alert" className="empty-note">{quickError}</p>}</section>}
+    {quickSettings && <section className="extension-pair-card"><header><h3>Quick context</h3></header><p className="connect-hint">Open a small always-on-top context search from any app. The question is searched locally and is not logged.</p><label className="proxy-setting"><input type="checkbox" checked={quickSettings.enabled} onChange={(event) => setQuickSettings((current) => ({ ...current, enabled: event.target.checked }))} />Enable global shortcut</label><label className="proxy-setting">Shortcut<input value={quickSettings.shortcut} onChange={(event) => setQuickSettings((current) => ({ ...current, shortcut: event.target.value }))} placeholder="Control+Alt+B" /></label><button type="button" onClick={() => void saveQuickSettings()}>Save shortcut</button><button type="button" onClick={() => void window.brain.openQuickContext()}>Open Quick context</button>{quickError && <p role="alert" className="empty-note">{quickError}</p>}</section>}
+    {graphicsSettings?.supported && <section className="extension-pair-card"><header><h3>Graphics</h3></header><label className="proxy-setting"><input type="checkbox" checked={graphicsSettings.safeGraphicsMode} onChange={(event) => void updateGraphicsMode(event.target.checked)} />Safe graphics mode</label><p className="connect-hint">Disables hardware acceleration. Restart One Brain to apply the setting.</p>{graphicsSettings.restartRequired && <small role="status">Restart One Brain to apply graphics changes.</small>}</section>}
+    <section className="extension-pair-card"><header><h3>Performance</h3></header><label className="proxy-setting"><input type="checkbox" checked={performanceMode} onChange={(event) => updatePerformanceMode(event.target.checked)} />Performance mode</label><p className="connect-hint">Reduces graph rendering work. It also turns on automatically when WebGL uses SwiftShader or llvmpipe.</p></section>
+    <section className="extension-pair-card"><header><h3>Diagnostics</h3><div><button type="button" onClick={() => void refreshLifecycleLog()}>Refresh</button><button type="button" disabled={!lifecycleLines.length} onClick={() => void copyLifecycleLog()}>Copy</button></div></header><p className="connect-hint">Last 50 application lifecycle events. The log records event metadata only.</p><pre className="lifecycle-log-view">{lifecycleLines.length ? lifecycleLines.join('\n') : 'No lifecycle events yet.'}</pre>{lifecycleError && <p role="alert" className="empty-note">{lifecycleError}</p>}</section>
     <h3>Memory injection</h3>
     <label className="proxy-setting"><input type="checkbox" checked={settings.enabled} onChange={(event) => void update({ enabled: event.target.checked })} />Enabled</label>
     <label className="proxy-setting"><input type="checkbox" checked={settings.dryRun} onChange={(event) => void update({ dryRun: event.target.checked })} />Dry run (measure retrieval, send unchanged request)</label>
@@ -332,7 +360,7 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
   }
   return <section className="connections-dashboard">
     <header className="connections-header"><div><h2>Connections</h2><p>Connection status, capabilities and recent usage.</p></div><button type="button" onClick={() => void onRefresh()}>Refresh</button></header>
-    <div className="connection-health"><strong>{health.healthy} healthy · {health.needAction} need action · {health.notSetUp} not set up</strong></div>
+    <div className="connection-health"><strong>{health.healthy} healthy · {health.degraded} degraded · {health.needAction} need action · {health.notSetUp} not set up</strong></div>
     <nav className="connection-tabs"><button type="button" aria-pressed={tab === 'connections'} onClick={() => setTab('connections')}>Connections</button><button type="button" aria-pressed={tab === 'activity'} onClick={() => setTab('activity')}>Activity log</button><button type="button" onClick={() => void onConnectAll()}>Connect all detected</button><button type="button" onClick={() => void testAll()}>Test all</button></nav>
     {notice && <p className="connection-notice" role="status">{notice}</p>}
     {pairCode && <p className="extension-pair-code" role="status">Pairing code <strong>{pairCode.code}</strong> · expires in 2 minutes<br />API address <code>{pairCode.endpoint}</code></p>}
@@ -341,6 +369,7 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
       <div className="connection-compact-list">{rows.filter((row) => !dismissedRows.has(row.id)).map((row) => <article className="connection-compact-row" key={row.id}>
         <div className="connection-compact-heading"><div><strong>{row.name}</strong><small className="connection-type">{row.type}</small></div><span className={`connection-status ${row.status.toLowerCase().replaceAll(' ', '-')}`}>{row.status}</span></div>
         {row.reason && <small className="connection-compact-reason">{row.reason}</small>}
+        {row.healthStatus === 'needs_restart' && row.mcpHealthDetails && <small className="connection-compact-meta">Why? Token generation {row.mcpHealthDetails.tokenGeneration}; last real call {row.mcpHealthDetails.lastRealCall ? `${relative(row.mcpHealthDetails.lastRealCall.time)} at generation ${row.mcpHealthDetails.lastRealCall.generation} (${row.mcpHealthDetails.lastRealCall.ok ? 'succeeded' : 'failed'})` : 'not recorded'}; last probe {row.mcpHealthDetails.lastProbe ? `${relative(row.mcpHealthDetails.lastProbe.time)} (${row.mcpHealthDetails.lastProbe.ok ? 'passed' : 'failed'})` : 'not recorded'}.</small>}
         {row.healthDetails && <small className="connection-compact-meta">Ping {relative(row.healthDetails.pingAt)} · token {row.healthDetails.tokenValid ? 'valid' : 'invalid'} · approval {row.healthDetails.approval} · origin {row.healthDetails.receivedOrigin || '—'} / expected {row.healthDetails.expectedOrigin || '—'} · API {row.healthDetails.apiVersion || '—'} · build {row.healthDetails.buildId || '—'} · host permission {row.healthDetails.hostPermission === true ? 'granted' : row.healthDetails.hostPermission === false ? 'missing' : 'unknown'} · self-check {row.healthDetails.selfCheck ? `${Object.values(row.healthDetails.selfCheck.matched || {}).filter((count) => count > 0).length} selectors matched ${relative(row.healthDetails.selfCheck.at)}` : 'not run'} · last successful {row.healthDetails.lastSuccessfulUse ? `${row.healthDetails.lastSuccessfulUse.action} ${relative(row.healthDetails.lastSuccessfulUse.time)}` : 'search/save not recorded'}</small>}
         {row.site && <button type="button" className="connection-check-extension" onClick={() => void checkExtension(row)}>Check extension</button>}
         {['needs_restart', 'failing'].includes(row.healthStatus) && <div className="connection-row-actions">{row.healthStatus === 'needs_restart' && <button type="button" onClick={() => void connect(row)}>Reconnect</button>}<button type="button" onClick={() => void testOne(row)}>Test</button>{row.healthStatus === 'needs_restart' && <button type="button" onClick={() => void copyText(`Restart ${row.name} so it reloads the One Brain MCP bridge configuration.`, `restart-${row.id}`)}>Copy restart steps</button>}</div>}
@@ -348,7 +377,7 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
         <div className="connection-compact-meta"><span>{row.lastActivity ? `${row.lastActivity.action} ${relative(row.lastActivity.time)}` : 'No activity'}</span><span>{row.counts.searches} searches · {row.counts.saves} saves today</span></div>
         <button type="button" className="connection-details-button" onClick={() => setSelectedConnection(row)}>View details</button>
       </article>)}</div>
-      <section className="connection-security"><h3>Security</h3><p>Stdio bridge: loopback listener at <code>127.0.0.1:{mcpConfig?.port || '—'}</code>. Every request requires a valid client token.</p><button type="button" onClick={onRotateAll}>Rotate token</button></section>
+      <section className="connection-security"><h3>Security</h3><p>Stdio bridge: loopback listener at <code>127.0.0.1:{mcpConfig?.port || '—'}</code>. Preferred port <code>{mcpConfig?.preferredPort || 3737}</code>{mcpConfig?.preferredPortInUseBy ? ` is held by ${mcpConfig.preferredPortInUseBy}` : ''}. Every request requires a valid client token.</p><button type="button" onClick={onRotateAll}>Rotate token</button></section>
     </> : <section className="connection-activity"><header><h3>Recent activity (up to 200 events)</h3><label>Filter by client<select value={filter} onChange={(event) => setFilter(event.target.value)}><option value="">All clients</option>{[...new Set(activity.map((event) => event.client))].sort().map((client) => <option key={client}>{client}</option>)}</select></label><button type="button" onClick={async () => { await window.brain.clearConnectionActivity(); await onRefresh(); }}>Clear log</button></header>{filteredActivity.map((event) => <article key={`${event.time}-${event.client}-${event.action}`}><time>{new Date(event.time).toLocaleString()}</time><strong>{event.client}</strong><span>{event.action}</span><span>{event.ok ? 'OK' : 'Fail'}</span><small>{event.reason || '—'}{event.probe ? ` · probe ${event.duration} ms` : ''}</small></article>)}{filteredActivity.length === 0 && <p className="empty-note">No connection activity yet.</p>}</section>}
     {selectedConnection && createPortal(<div className="connection-window-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedConnection(null); }}><section className="connection-detail-window" role="dialog" aria-modal="true" aria-labelledby="connection-detail-title"><header><div><h2 id="connection-detail-title">{selectedConnection.name}</h2><small>{selectedConnection.type}</small></div><button type="button" aria-label="Close connection details" onClick={() => setSelectedConnection(null)}>×</button></header><div className="connection-detail-status"><span className={`connection-status ${selectedConnection.status.toLowerCase().replaceAll(' ', '-')}`}>{selectedConnection.status}</span><p>{selectedConnection.reason || 'No issues reported.'}</p></div><section className="connection-detail-works"><h3>Works</h3>{['Search', 'Save', 'Auto-insert'].map((feature) => <div key={feature}><strong>{selectedConnection.work[feature].supported ? '✓' : '—'} {feature}</strong>{!selectedConnection.work[feature].supported && <small>{selectedConnection.work[feature].reason || 'Not supported'}</small>}</div>)}</section><div className="connection-detail-activity"><strong>Last activity</strong><span>{selectedConnection.lastActivity ? `${selectedConnection.lastActivity.action} ${relative(selectedConnection.lastActivity.time)}` : 'No activity yet'}</span><strong>Today</strong><span>{selectedConnection.counts.searches} searches · {selectedConnection.counts.saves} saves</span></div><footer><button type="button" onClick={() => void connect(selectedConnection)}>Reconnect</button><button type="button" onClick={() => void onDisconnect(selectedConnection)}>Disconnect</button><button type="button" onClick={() => void testOne(selectedConnection)}>Test connection</button>{selectedConnection.type.includes('MCP') && <><button type="button" onClick={async () => { if (window.confirm(`Rotate ${selectedConnection.name}'s token? Its current token will stop working.`)) { await window.brain.rotateConnectorToken(selectedConnection.id); await onRefresh(); } }}>Rotate token</button><button type="button" onClick={async () => { if (window.confirm(`Revoke ${selectedConnection.name}'s token?`)) { await window.brain.revokeConnectorToken(selectedConnection.id); await onRefresh(); } }}>Revoke</button></>}{selectedConnection.site && <button type="button" onClick={() => void openSite(selectedConnection)}>Open site</button>}</footer></section></div>, document.body)}
   </section>;
@@ -733,6 +762,7 @@ function App() {
   const [pendingOpen, setPendingOpen] = useState(false);
   const [pendingMemories, setPendingMemories] = useState([]);
   const [clients, setClients] = useState([]);
+  const [sourceHintRevision, setSourceHintRevision] = useState(0);
   const [pendingClient, setPendingClient] = useState(null);
   const [pendingReadSources, setPendingReadSources] = useState([]);
   const [pendingWriteSource, setPendingWriteSource] = useState(SOURCES[2]);
@@ -747,6 +777,7 @@ function App() {
   const [connectorCards, setConnectorCards] = useState([]);
   const [connectionActivity, setConnectionActivity] = useState([]);
   const [connectionCounts, setConnectionCounts] = useState({});
+  const [graphicsNotice, setGraphicsNotice] = useState('');
   const [extensionConnectionSites, setExtensionConnectionSites] = useState([]);
   const [providerConnectionSettings, setProviderConnectionSettings] = useState({ providerKeyStatus: {} });
   const [quickConnectionSettings, setQuickConnectionSettings] = useState({ enabled: false, registered: false });
@@ -761,6 +792,18 @@ function App() {
   searchState.current = { query: debouncedQuery, sourceFilter };
 
   const selectedMemory = memories.find((memory) => String(memory.id) === String(selectedId)) || null;
+  useEffect(() => {
+    let active = true;
+    window.brain.getGraphicsSettings?.().then((value) => {
+      if (active && value.restartNotice) setGraphicsNotice('Graphics driver problem: safe mode enabled, restart to apply');
+    }).catch(() => {});
+    const unsubscribe = window.brain.onGraphicsSafeModeEnabled?.(() => setGraphicsNotice('Graphics driver problem: safe mode enabled, restart to apply'));
+    return () => { active = false; unsubscribe?.(); };
+  }, []);
+  async function dismissGraphicsNotice() {
+    setGraphicsNotice('');
+    try { await window.brain.acknowledgeGraphicsRestartNotice?.(); } catch {}
+  }
   useEffect(() => {
     let active = true;
     if (selectedMemory && / \(part \d+\/\d+\)$/.test(selectedMemory.title || '') && window.brain.countConversationParts) {
@@ -978,7 +1021,7 @@ function App() {
       if (pending && !pendingClient) {
         setPendingClient(pending.client);
         setPendingReadSources([]);
-        setPendingWriteSource(SOURCES[2]);
+        setPendingWriteSource(pending.write_source || defaultWriteSource(pending.client));
       }
     }).catch(() => {});
   }
@@ -989,7 +1032,7 @@ function App() {
     const remaining = (await refreshClients()).find((client) => client.status === 'pending');
     setPendingClient(remaining?.client || null);
     setPendingReadSources([]);
-    setPendingWriteSource(SOURCES[2]);
+    setPendingWriteSource(remaining?.write_source || defaultWriteSource(remaining?.client));
   }
 
   async function handleBlockClient() {
@@ -998,7 +1041,7 @@ function App() {
     const remaining = (await refreshClients()).find((client) => client.status === 'pending');
     setPendingClient(remaining?.client || null);
     setPendingReadSources([]);
-    setPendingWriteSource(SOURCES[2]);
+    setPendingWriteSource(remaining?.write_source || defaultWriteSource(remaining?.client));
   }
 
   async function handleClientGrant(client, source, allowed) {
@@ -1115,8 +1158,7 @@ function App() {
       if (!client?.client) return;
       setPendingClient(client.client);
       setPendingReadSources([]);
-      setPendingWriteSource(SOURCES[2]);
-      void refreshClients();
+      void refreshClients().then((rows) => { const profile = rows.find((item) => item.client === client.client); setPendingWriteSource(profile?.write_source || defaultWriteSource(client.client)); });
     });
     void refreshPendingMemories().catch(() => {});
     const unsubscribePending = window.brain.onPendingMemoriesChanged(() => { void refreshPendingMemories().catch(() => {}); });
@@ -1127,7 +1169,7 @@ function App() {
       if (pending) {
         setPendingClient(pending.client);
         setPendingReadSources([]);
-        setPendingWriteSource(SOURCES[2]);
+        setPendingWriteSource(pending.write_source || defaultWriteSource(pending.client));
       }
     }).catch(() => {});
     return () => {
@@ -1429,6 +1471,7 @@ function App() {
 
   return (
     <main className="memory-app">
+      {graphicsNotice && <div role="alert" style={{ position: 'fixed', zIndex: 10000, top: 12, left: '50%', transform: 'translateX(-50%)', display: 'flex', alignItems: 'center', gap: 12, maxWidth: 'calc(100vw - 32px)', padding: '10px 14px', border: '1px solid #b68138', borderRadius: 8, background: '#302515', color: '#ffe2ad', boxShadow: '0 8px 30px #0008' }}><span>{graphicsNotice}</span><button type="button" aria-label="Dismiss graphics notice" onClick={() => void dismissGraphicsNotice()}>×</button></div>}
       <BrainGraph ref={graphRef} memories={memories} links={graphLinks} allLinks={links} counts={counts} linkCounts={graphLinkCountValues} linkVisibility={linkVisibility} onLinkVisibilityChange={setLinkVisibility} fitRevision={graphFitRevision} dataReady={dataReady} sidebarCollapsed={sidebarCollapsed} onMemoryClick={openDetail} />
     {insightsOpen && (insightsData ? <InsightsView data={insightsData} onBack={() => { setInsightsOpen(false); setGraphFitRevision((value) => value + 1); }} sql={sql} setSql={setSql} runSql={runAnalyticsQuery} sqlResult={sqlResult} sqlRunning={sqlRunning} onResetRetrievalCounts={resetRetrievalCounts} /> : <section className="insights-view"><header className="insights-header"><button className="back-button" type="button" onClick={() => { setInsightsOpen(false); setGraphFitRevision((value) => value + 1); }}>‹</button><div><h1>Insights</h1><p>Local activity and retrieval analytics</p></div></header><ChannelNotice channel="insights" loading={insightsLoading} error={insightsLoadError} onRetry={() => void openInsights()} /></section>)}
       {chatOpen && <ChatView onBack={() => { setChatOpen(false); setGraphFitRevision((value) => value + 1); }} onManageProviders={() => { setChatOpen(false); openConnectSettings(); }} memoryTitles={Object.fromEntries(memories.map((item) => [item.id, item.title || 'Untitled memory']))} onOpenMemory={(id) => { setChatOpen(false); setInsightsOpen(false); setSelectedId(id); setSidebarCollapsed(false); focusMemory(id); }} />}
@@ -1450,7 +1493,9 @@ function App() {
                 {client.reported_name && client.reported_name !== client.client && <small>Reported name: {client.reported_name}</small>}
                 <small>Last seen {dateLabel(client.last_seen) || '—'}</small>
                 <label>Write as<select value={client.write_source || ''} onChange={(event) => handleClientWriteSource(client.client, event.target.value || null)}><option value="">Choose source</option>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label>
+                {getWriteSourceReview(client.client, client.write_source) && !window.localStorage.getItem(`write-source-hint:${client.client}`) && <p className="connection-notice" key={`${client.client}-${sourceHintRevision}`}>{getWriteSourceReview(client.client, client.write_source).message} <button type="button" onClick={async () => { await handleClientWriteSource(client.client, defaultWriteSource(client.client)); window.localStorage.setItem(`write-source-hint:${client.client}`, 'applied'); setSourceHintRevision((value) => value + 1); }}>Apply</button> <button type="button" onClick={() => { window.localStorage.setItem(`write-source-hint:${client.client}`, 'kept'); setSourceHintRevision((value) => value + 1); }}>Keep</button></p>}
                 <fieldset><legend>May read</legend>{SOURCES.map((source) => <label className="client-grant" key={source}><input type="checkbox" checked={client.grants?.[source] === 'allow'} onChange={(event) => handleClientGrant(client.client, source, event.target.checked)} />{source}</label>)}</fieldset>
+                {!client.verified && client.last_seen && Date.now() - Date.parse(`${String(client.last_seen).replace(' ', 'T')}Z`) >= 3 * 86400_000 && <button type="button" className="client-block" onClick={async () => { if (!window.confirm(`Remove the stale client profile and its grants for ${client.client}? Memories will remain.`)) return; await window.brain.removeLegacyClient(client.client); await refreshClients(); }}>Remove stale client</button>}
                 {client.status === 'blocked' ? <button type="button" className="client-unblock" disabled={!client.write_source} onClick={() => handleClientStatus(client.client, 'approved')}>Unblock</button> : <button type="button" className="client-block" onClick={() => handleClientStatus(client.client, 'blocked')}>Block</button>}
               </article>)}
               {clients.length === 0 && <p className="empty-note">No MCP clients have connected yet.</p>}
@@ -1852,7 +1897,7 @@ function App() {
         .connection-tabs { justify-content:flex-start;flex-wrap:wrap; }.connection-tabs button[aria-pressed=true] { color:#fff;background:#314d71; }
         .connection-notice,.connection-test-results { margin:0;padding:7px;border:1px solid rgba(143,196,255,.18);border-radius:6px;color:#cad8eb;background:#121e30;font-size:10px; }.connection-test-results { display:grid;gap:4px; }
         .connection-compact-list { display:grid;gap:7px;min-width:0; }.connection-compact-row { display:grid;gap:6px;min-width:0;padding:9px;border:1px solid rgba(175,195,224,.14);border-radius:7px;background:rgba(15,24,37,.7); }.connection-compact-heading { display:flex;align-items:flex-start;justify-content:space-between;gap:7px; }.connection-compact-heading > div { display:grid;gap:3px;min-width:0; }.connection-compact-heading strong { color:#e2eaf5;font-size:11px;overflow-wrap:anywhere; }.connection-compact-reason { color:#f0b5ae;font-size:9px;line-height:1.4; }.connection-compact-meta { display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap;color:#91a0b4;font-size:9px; }.connection-details-button { justify-self:start; }
-        .connection-type { color:#91a4bb!important; }.connection-status { display:inline-block;padding:3px 5px;border-radius:5px;color:#d7e4f4;background:#26364d;font-size:9px;white-space:nowrap; }.connection-status.connected,.connection-status.paired { color:#b7f0ca;background:#173b2c; }.connection-status.broken,.connection-status.selectors-broken,.connection-status.needs-reconnect,.connection-status.needs-restart { color:#ffcbc3;background:#48272a; }.connection-status.not-installed,.connection-status.not-paired,.connection-status.not-connected { color:#d1d6df;background:#343b49; }
+        .connection-type { color:#91a4bb!important; }.connection-status { display:inline-block;padding:3px 5px;border-radius:5px;color:#d7e4f4;background:#26364d;font-size:9px;white-space:nowrap; }.connection-status.connected,.connection-status.paired { color:#b7f0ca;background:#173b2c; }.connection-status.broken,.connection-status.selectors-broken,.connection-status.needs-reconnect,.connection-status.needs-restart,.connection-status.failing { color:#ffcbc3;background:#48272a; }.connection-status.not-installed,.connection-status.not-paired,.connection-status.not-connected,.connection-status.needs-approval { color:#d1d6df;background:#343b49; }.connection-status.degraded,.connection-status.not-checked,.connection-status[class*="busy-"] { color:#f3d18a;background:#493b1d; }
         .connection-works { display:grid;gap:4px;min-width:180px; }.connection-works span { color:#b9c9dc; }.connection-works span:first-letter { color:#9ce0b9; }.connection-works small { display:block;padding-left:14px;color:#8393a7;font-size:8px; }
         .connection-security,.connection-activity { display:grid;gap:7px;padding:9px;border:1px solid rgba(175,195,224,.14);border-radius:7px;background:rgba(15,24,37,.7); }.connection-security p { margin:0;color:#aab9cb;font-size:10px;line-height:1.5; }.connection-security code { color:#cde3ff; }
         .connection-window-backdrop { position:fixed;z-index:1200;inset:0;display:grid;place-items:center;padding:16px;background:rgba(3,7,13,.68); }.connection-detail-window { display:grid;gap:13px;width:min(620px,100%);max-height:min(84vh,780px);overflow:auto;padding:18px;border:1px solid rgba(143,196,255,.3);border-radius:12px;background:#111a28;box-shadow:0 20px 70px rgba(0,0,0,.5);color:#dce6f2; }.connection-detail-window > header { display:flex;justify-content:space-between;align-items:flex-start;gap:12px; }.connection-detail-window h2 { margin:0;color:#eef5ff;font-size:17px; }.connection-detail-window header small { display:block;margin-top:4px;color:#91a4bb;font-size:10px; }.connection-detail-window header button { font-size:16px; }.connection-detail-status p { margin:7px 0 0;color:#aab9cb;font-size:11px;line-height:1.5; }.connection-detail-works { display:grid;gap:7px; }.connection-detail-works h3 { margin:0;color:#e2eaf5;font-size:12px; }.connection-detail-works > div { display:grid;gap:3px;padding:8px;border:1px solid rgba(175,195,224,.12);border-radius:6px;background:rgba(255,255,255,.025);font-size:11px; }.connection-detail-works small { color:#91a0b4;font-size:9px; }.connection-detail-activity { display:grid;grid-template-columns:auto 1fr;gap:7px 12px;color:#aab9cb;font-size:10px; }.connection-detail-activity strong { color:#e2eaf5; }.connection-detail-window footer { display:flex;gap:6px;flex-wrap:wrap; }
@@ -1875,6 +1920,7 @@ function App() {
         .proxy-key-row button,.pending-memory-inbox button { border:1px solid rgba(143,196,255,.22);border-radius:5px;padding:5px 7px;color:#c7e1ff;background:#182a40;font:9px system-ui,sans-serif;cursor:pointer; }
         .proxy-settings h3 { margin:8px 0 0;color:#d5e1f0;font-size:11px; }
         .extension-pair-card { display:grid;gap:7px;margin-top:10px;padding:10px;border:1px solid rgba(143,196,255,.15);border-radius:8px;background:rgba(12,20,33,.52); }.extension-pair-card > header,.extension-site-row { display:flex;align-items:center;gap:7px; }.extension-pair-card > header { justify-content:space-between; }.extension-pair-card h3 { margin:0; }.extension-site-row { padding:5px 0;border-top:1px solid rgba(175,195,224,.1); }.extension-site-row span { display:grid;gap:3px;flex:1;text-transform:capitalize; }.extension-site-row small { color:#8494aa;font-size:9px;overflow-wrap:anywhere;text-transform:none; }.extension-site-row button,.extension-pair-card > header button { border:1px solid rgba(143,196,255,.22);border-radius:5px;padding:5px 7px;color:#c7e1ff;background:#182a40;font:9px system-ui,sans-serif;cursor:pointer; }.extension-pair-code { margin:0;padding:8px;border-radius:6px;background:#111c2b;font-size:11px; }.extension-pair-code strong { letter-spacing:.2em;font:700 20px ui-monospace,monospace; }
+        .lifecycle-log-view { max-height:260px;overflow:auto;margin:0;padding:9px;border:1px solid rgba(175,195,224,.13);border-radius:6px;color:#aebfd4;background:#080e18;font:9px/1.45 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text; }
         .proxy-setting { display:flex;align-items:center;gap:6px;color:#bac9dc;font-size:10px; }
         .proxy-setting input[type=number] { width:58px;margin-left:auto; }
         .proxy-setting input[type=text] { width:145px;margin-left:auto; }

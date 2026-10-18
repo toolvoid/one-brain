@@ -1,6 +1,6 @@
 'use strict';
 
-const NEUTRAL = new Set(['not_set_up', 'not_installed', 'manual_only']);
+const NEUTRAL = new Set(['not_set_up', 'not_installed', 'manual_only', 'not_checked']);
 
 function initialHealth() { return { token_generation: 0, last_success: null, last_failure: null, probe: null, configValid: false }; }
 
@@ -22,6 +22,7 @@ function reduceHealth(previous = initialHealth(), event = {}) {
 
 function getHealthStatus(state = initialHealth(), { neutral, installed = true, configValid = state.configValid, now = Date.now(), recentMs = 5 * 60_000 } = {}) {
   if (neutral && NEUTRAL.has(neutral)) return neutral;
+  if (state.rate_limited) return 'busy';
   if (!installed) return 'not_installed';
   if (!configValid) return 'not_set_up';
   const success = state.last_success;
@@ -35,9 +36,10 @@ function getHealthStatus(state = initialHealth(), { neutral, installed = true, c
 }
 
 function summarizeHealth(rows = []) {
-  const neutral = new Set(['not_set_up', 'not_installed', 'manual_only']);
+  const neutral = new Set(['not_set_up', 'not_installed', 'manual_only', 'not_checked']);
   return { healthy: rows.filter((row) => row.healthStatus === 'healthy').length,
-    needAction: rows.filter((row) => ['needs_restart', 'failing'].includes(row.healthStatus)).length,
+    degraded: rows.filter((row) => row.healthStatus === 'degraded').length,
+    needAction: rows.filter((row) => ['needs_restart', 'failing', 'busy', 'needs_approval'].includes(row.healthStatus)).length,
     notSetUp: rows.filter((row) => neutral.has(row.healthStatus)).length };
 }
 

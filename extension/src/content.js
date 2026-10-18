@@ -12,7 +12,8 @@
   const insertionGuardModule = globalThis.OneBrainInsertionGuard;
   const manualContext = globalThis.OneBrainManualContext;
   const layoutFallbackModule = globalThis.OneBrainLayoutFallback;
-  if (!SITE || !API || !adapter || !editorTools || !searchIntent || !backgroundMessage || !smartSave || !insertionGuardModule || !manualContext || !layoutFallbackModule) return;
+  const chatLoader = globalThis.OneBrainChatLoader;
+  if (!SITE || !API || !adapter || !editorTools || !searchIntent || !backgroundMessage || !smartSave || !insertionGuardModule || !manualContext || !layoutFallbackModule || !chatLoader) return;
   const timers = new Set();
   const eventController = new AbortController();
   let stopped = false, staleToastShown = false, adapterCleanup = () => {};
@@ -229,11 +230,10 @@
     return layoutFallback.check(working);
   }
   const extensionRuntime = globalThis.browser?.runtime || globalThis.chrome?.runtime;
-  globalThis.setInterval?.(() => { try { void extensionRuntime?.sendMessage?.({ type: 'poll-extension-health' }); } catch {} }, 5000);
   extensionRuntime?.onMessage?.addListener?.((message, _sender, sendResponse) => {
     if (message?.type !== 'run-self-check') return false;
     const matched = adapter.selfCheck() || {};
-    sendResponse({ matched: Object.fromEntries(Object.entries(matched).map(([name, selector]) => [name, selector ? 1 : 0])), contentScriptVersion: CONTENT_SCRIPT_VERSION });
+    sendResponse({ matched, diagnostics: { containersMatched: matched.containersMatched, messagesByRole: matched.messagesByRole, scrollableFound: matched.scrollableFound, scrollableType: matched.scrollableType, messageSelectors: matched.messageSelectors, selectorNames: matched.selectorNames || {} }, contentScriptVersion: CONTENT_SCRIPT_VERSION });
     return false;
   });
 
@@ -410,17 +410,14 @@
   }
 
   function readChatMessages() {
-    return adapter.getMessages().map(({ element, role }, index) => {
-      const rawTimestamp = element.getAttribute('data-timestamp') || element.querySelector('time')?.dateTime || '';
-      const numericTimestamp = Number(rawTimestamp);
-      return {
-        id: element.getAttribute('data-message-id') || element.getAttribute('data-testid') || `${role}-${index}`,
-        role: ['human', 'user'].includes(role) ? 'user' : ['assistant', 'model'].includes(role) ? 'assistant' : role,
-        text: cleanOutgoingText(readText(element)),
-        ts: numericTimestamp || (rawTimestamp ? Date.parse(rawTimestamp) : null) || null,
-        element
-      };
-    }).filter((message) => message.text && ['user', 'assistant'].includes(message.role));
+    const found = adapter.getMessages().map(({ id, element, role, text, ts, order }) => ({ id, role, text: cleanOutgoingText(text ?? readText(element)), ts: ts || null, order, element }))
+      .filter((message) => message.text && ['user', 'assistant'].includes(message.role));
+    return loadedChatMessages ? mergeMessages(loadedChatMessages, found) : found;
+  }
+
+  let loadedChatMessages = null;
+  function mergeMessages(existing, incoming) {
+    return chatLoader.merge(existing, incoming);
   }
 
   function looksLikeSecret(text) {
@@ -429,19 +426,12 @@
 
   async function loadFullChat(panel, status, cancelState) {
     const progress = panel.querySelector('[data-load-progress]');
-    let stableRounds = 0;
-    for (let step = 0; step < 80 && !cancelState.cancelled && stableRounds < 2; step++) {
-      const before = adapter.getMessages().length;
-      const button = adapter.getLoadOlderButton?.();
-      if (!button || button.disabled) break;
-      button.scrollIntoView?.({ block: 'start' });
-      button.click();
-      await new Promise((resolve) => scheduleTimeout(resolve, 650));
-      const after = adapter.getMessages().length;
-      stableRounds = after > before ? 0 : stableRounds + 1;
-      progress.textContent = `Loaded ${after} messages · step ${step + 1}`;
-    }
-    progress.textContent = cancelState.cancelled ? 'Loading cancelled.' : `Loaded ${adapter.getMessages().length} messages.`;
+    const initial = adapter.getMessages();
+    const scroller = adapter.findScrollContainer?.(initial) || null;
+    if (!scroller) { progress.textContent = `Loaded ${initial.length} messages. No scrollable message container found.`; status.textContent = ''; return; }
+    const result = await chatLoader.loadFullChat({ scroller, collect: readChatMessages, cancelled: () => cancelState.cancelled, wait: (ms) => new Promise((resolve) => scheduleTimeout(resolve, ms || 1)), progress: (count) => { progress.textContent = `${count} messages loaded`; } });
+    loadedChatMessages = result.messages.map(({ element, ...message }) => message);
+    progress.textContent = result.cancelled ? `${result.messages.length} messages loaded · cancelled` : `${result.messages.length} messages loaded`;
     status.textContent = '';
   }
 
@@ -478,7 +468,9 @@
     function renderMessageSelectors() {
       const list = readChatMessages();
       const messageStatus = panel.querySelector('[data-message-status]');
-      messageStatus.textContent = list.length ? `${list.length} messages detected.` : 'No readable chat messages detected. Try “Load full chat”.';
+      const yours = list.filter((message) => message.role === 'user').length, assistant = list.filter((message) => message.role === 'assistant').length;
+      const longChat = (adapter.findScrollContainer?.(adapter.getMessages())?.scrollHeight || 0) > 2500;
+      messageStatus.textContent = list.length ? `${list.length} messages detected: ${yours} yours, ${assistant} assistant${list.length === 1 || (longChat && list.length < 4) ? '. Press Load full chat or scroll to the top first.' : '.'}` : 'No readable chat messages detected. Press Load full chat or scroll to the top first.';
       startsAt.replaceChildren(); picks.replaceChildren();
       list.forEach((message, index) => {
         const hiddenText = looksLikeSecret(message.text) ? '[secret-looking text hidden]' : message.text.split(/\r?\n/, 1)[0].slice(0, 100);

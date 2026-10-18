@@ -14,7 +14,7 @@ const API_VERSION = '1.2.0';
 const MIN_EXTENSION_VERSION = '1.1.0';
 const BODY_LIMIT = 2 * 1024 * 1024;
 const WINDOW_MS = 60_000;
-const REQUEST_LIMIT = 30;
+const RATE_LIMITS = Object.freeze({ control: 120, search: 30, save: 10 });
 
 function extensionOrigin(value) {
   return typeof value === 'string' && /^(?:chrome|moz)-extension:\/\/[a-z0-9-]+$/i.test(value);
@@ -52,7 +52,8 @@ function createExtApi(options) {
     setMemoryNoSuggest = () => false, getMemoryForClient = () => ({ memory: null }), createImport, importMemories, finishImport, getExtensionChatSave, undoExtensionChatSave,
     embedText, appVersion = require('../package.json').version,
     authFailureLog = (entry) => console.info(JSON.stringify(entry)),
-    importText = async (...args) => (await import('../src/lib/importers.js')).parseImportText(...args)
+    rateLimitedLog = (entry) => console.info(JSON.stringify(entry)),
+    importText = async (...args) => (await import('../src/lib/importers.mjs')).parseImportText(...args)
   } = options;
   const originsPath = path.join(userDataPath, 'extension-origins.json');
   const readOrigins = () => { try { return JSON.parse(fs.readFileSync(originsPath, 'utf8')); } catch { return {}; } };
@@ -63,6 +64,7 @@ function createExtApi(options) {
   };
   let pairing = null;
   const rateLimits = new Map();
+  const rateLimitLogs = new Map();
 
   function createPairCode() {
     const code = String(randomInt(100000, 1_000_000));
@@ -154,7 +156,7 @@ function createExtApi(options) {
     const safeTitle = looksSecret(rawTitle) ? `Saved ${site} chat` : rawTitle;
     let parsed;
     if (Array.isArray(body.selectedItems)) {
-      const importer = await import('../src/lib/importers.js');
+      const importer = await import('../src/lib/importers.mjs');
       const items = body.selectedItems.slice(0, 100).map((item) => ({ title: String(item.title || safeTitle).slice(0, 160), content: contextBlocks.stripContextBlocks(item.content) })).filter((item) => item.content.trim().length >= 25 && !looksSecret(item.title) && !looksSecret(item.content) && !importer.isLogLikeChunk(item.content));
       parsed = { items, skippedLogs: 0, skippedSecrets: body.selectedItems.length - items.length };
     } else {
@@ -240,15 +242,26 @@ function createExtApi(options) {
         message: 'The extension origin does not match the saved pairing.', origin: extensionRequestOrigin ? origin : null,
         expectedOrigin: savedOrigin, receivedOrigin: origin });
     }
+    const endpointClass = url.pathname === '/ext/search' ? 'search' : /^\/ext\/(?:save|save-chat|preview-chat|undo-chat)$/.test(url.pathname) ? 'save' : 'control';
     const tokenId = createHash('sha256').update(suppliedToken).digest('hex');
     const time = now();
-    if (rateLimits.size > 2000) for (const [key, entry] of rateLimits) if (time >= entry.startedAt + WINDOW_MS) rateLimits.delete(key);
-    const window = rateLimits.get(tokenId);
-    if (!window || time >= window.startedAt + WINDOW_MS) rateLimits.set(tokenId, { startedAt: time, count: 1 });
-    else if (window.count >= REQUEST_LIMIT) {
-      return authFailure(res, { reason: 'rate_limited', client: identity.client, token: suppliedToken, status: 429,
-        message: 'Extension request limit reached. Try again in a minute.', origin });
+    if (rateLimits.size > 4000) for (const [key, entry] of rateLimits) if (time >= entry.startedAt + WINDOW_MS) rateLimits.delete(key);
+    const bucketKey = `${tokenId}:${endpointClass}`, window = rateLimits.get(bucketKey), limit = RATE_LIMITS[endpointClass];
+    if (!window || time >= window.startedAt + WINDOW_MS) rateLimits.set(bucketKey, { startedAt: time, count: 1 });
+    else if (window.count >= limit) {
+      const retryAfter = Math.max(1, Math.ceil((window.startedAt + WINDOW_MS - time) / 1000));
+      const minute = Math.floor(time / WINDOW_MS), logKey = `${identity.client}:${endpointClass}`;
+      let aggregate = rateLimitLogs.get(logKey);
+      if (!aggregate || aggregate.minute !== minute) { aggregate = { minute, count: 0 }; rateLimitLogs.set(logKey, aggregate); }
+      aggregate.count++;
+      if (!aggregate.logged) { aggregate.logged = true; aggregate.timer = setTimeout(() => { try { rateLimitedLog({ type: 'rate_limited', client: identity.client, class: endpointClass, count: aggregate.count }); } catch {} }, 500); aggregate.timer.unref?.(); }
+      const latest = readOrigins(); latest[site] = { ...latest[site], health: { ...(latest[site]?.health || {}), rateLimited: true, retryAfter, retryAt: time + retryAfter * 1000, rateLimitedClass: endpointClass } }; saveOrigins(latest);
+      res.setHeader('Retry-After', String(retryAfter));
+      return sendJson(res, 429, { reason: 'rate_limited', retryAfter, error: 'Extension is busy. Retry shortly.' }, origin);
     } else window.count += 1;
+
+    const latestHealth = readOrigins();
+    if (latestHealth[site]?.health?.rateLimited) { latestHealth[site] = { ...latestHealth[site], health: { ...latestHealth[site].health, rateLimited: false, retryAfter: 0 } }; saveOrigins(latestHealth); }
 
     const profile = getClientProfile(identity.client);
     if (req.method === 'GET' && url.pathname === '/ext/ping') {
@@ -278,11 +291,14 @@ function createExtApi(options) {
     if (req.method === 'POST' && (url.pathname === '/ext/layout-status' || url.pathname === '/ext/selfcheck')) {
       const body = await readJson(req);
       const latest = readOrigins();
-      const matched = body.matched && typeof body.matched === 'object' ? body.matched : {};
+      const rawMatched = body.matched && typeof body.matched === 'object' ? body.matched : {};
+      const matched = rawMatched.required ? { composer: rawMatched.required.composer ? 1 : 0, send: rawMatched.required.send ? 1 : 0, messages: Number(rawMatched.containersMatched) || 0 } : rawMatched;
       const safeMatched = Object.fromEntries(Object.entries(matched).slice(0, 50).filter(([name]) => /^[a-z][a-z0-9_-]{0,39}$/i.test(name)).map(([name, count]) => [name, Math.max(0, Math.min(1000, Math.floor(Number(count) || 0)))]));
+      const diag = body.diagnostics && typeof body.diagnostics === 'object' ? body.diagnostics : rawMatched;
+      const safeDiagnostics = { containersMatched: Math.max(0, Math.min(1000, Number(diag.containersMatched ?? safeMatched.messages) || 0)), messagesByRole: { user: Math.max(0, Math.min(1000, Number(diag.messagesByRole?.user) || 0)), assistant: Math.max(0, Math.min(1000, Number(diag.messagesByRole?.assistant) || 0)) }, scrollableFound: Boolean(diag.scrollableFound), scrollableType: ['window', 'div', 'main', 'section', 'element'].includes(diag.scrollableType) ? diag.scrollableType : null, messageSelectors: Object.fromEntries(Object.entries(diag.messageSelectors || {}).slice(0, 20).map(([name, value]) => [String(name).slice(0, 40), typeof value === 'string' ? value.slice(0, 200) : null])), selectorNames: Object.fromEntries(Object.entries(diag.selectorNames || {}).slice(0, 100).filter(([id]) => /^[\w:-]{1,100}$/.test(id)).map(([id, name]) => [id, String(name).slice(0, 40)])) };
       const at = new Date(now()).toISOString();
-      latest[site] = { ...latest[site], layoutStatus: { broken: !Object.entries(safeMatched).some(([name, count]) => /input|editor/i.test(name) && count > 0) || !Object.entries(safeMatched).some(([name, count]) => /send|submit/i.test(name) && count > 0), matched: safeMatched, at },
-        health: { ...(latest[site]?.health || {}), selfCheck: { matched: safeMatched, at }, checkResultAt: at, tabContentScriptVersion: String(body.contentScriptVersion || '').slice(0, 80) } };
+      latest[site] = { ...latest[site], layoutStatus: { broken: Number(safeMatched.composer ?? safeMatched.input ?? 0) < 1, matched: safeMatched, at },
+        health: { ...(latest[site]?.health || {}), selfCheck: { matched: safeMatched, ...safeDiagnostics, at }, checkResultAt: at, tabContentScriptVersion: String(body.contentScriptVersion || '').slice(0, 80), rateLimited: false } };
       saveOrigins(latest);
       return sendJson(res, 200, { ok: true }, origin);
     }
@@ -300,7 +316,7 @@ function createExtApi(options) {
       const excludeIds = Array.isArray(body.excludeIds) ? body.excludeIds.slice(0, 500) : [];
       const minScore = body.minScore == null ? 0.015 : Math.max(0, Math.min(1, Number(body.minScore) || 0));
       const result = query ? await searchMemoriesForClient(query, 'all', Math.min(50, limit * 10), profile) : { memories: [] };
-      const importer = await import('../src/lib/importers.js');
+      const importer = await import('../src/lib/importers.mjs');
       const safeMemories = (result.memories || []).filter((memory) => profile.allowedSources?.includes(memory.source) && String(memory.content || '').trim().length >= 25 && String(memory.title || '').trim().toLowerCase() !== String(memory.content || '').trim().toLowerCase() && !importer.isLogLikeChunk(String(memory.content || '')));
       const queryVector = typeof embedText === 'function' ? await embedText(query).catch(() => null) : null;
       const memories = await prepareSearchMemories({ query, memories: safeMemories, limit, excludeIds, getVector: getEmbeddingVector, queryVector, embedText, floor: 0.12 });
@@ -403,4 +419,4 @@ function createExtApi(options) {
   return { handle, createPairCode, status, revokeSite, rotateSite, requestCheck };
 }
 
-module.exports = { SITES, API_VERSION, MIN_EXTENSION_VERSION, BODY_LIMIT, REQUEST_LIMIT, extensionOrigin, localHost, createExtApi };
+module.exports = { SITES, API_VERSION, MIN_EXTENSION_VERSION, BODY_LIMIT, RATE_LIMITS, extensionOrigin, localHost, createExtApi };

@@ -1,34 +1,10 @@
 'use strict';
-
 const OneBrainClaudeSelectors = Object.freeze({
-  messages: ['[data-testid="chat-message"]', '[data-testid*="user-message" i]', '[data-testid*="human-message" i]', '[data-message-author-role]', '[role="article"]', '.font-user-message'],
-  assistant: ['[data-message-author-role="assistant"]', '[data-testid*="assistant-message" i]', '[data-testid*="assistant"]', '[aria-label*="assistant message" i]'],
-  user: ['[data-message-author-role="user"]', '[data-testid*="user-message" i]', '[data-testid*="human-message" i]', '[aria-label*="user message" i]', '.font-user-message'],
+  messageGroups: { primary: ['[data-testid="chat-message"]', '[data-message-author-role]'], roleFallback: ['[data-testid*="user-message" i]', '[data-testid*="assistant-message" i]', '[data-testid*="human-message" i]', '[aria-label*="user message" i]', '[aria-label*="assistant message" i]', '.font-user-message'] },
   composer: ['[contenteditable="true"][role="textbox"]', 'textarea[placeholder]', '[aria-label*="reply" i]', '[aria-label*="message" i]'],
   sendButton: ['button[aria-label*="send" i]', '[data-testid*="send" i]', 'button[aria-label*="submit" i]'],
   loadOlder: ['button[aria-label*="load older" i]', 'button[aria-label*="load more" i]', '[data-testid*="load-older" i]']
 });
-
-const OneBrainClaudeAdapter = {
-  site: 'claude', selectors: OneBrainClaudeSelectors,
-  getMessages(root = document) {
-    const elements = new Set(OneBrainClaudeSelectors.messages.flatMap((selector) => [...root.querySelectorAll(selector)]));
-    const order = new Map([...root.querySelectorAll('*')].map((element, index) => [element, index]));
-    return [...elements].sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0)).map((element) => {
-      const explicit = String(element.getAttribute('data-message-author-role') || element.getAttribute('data-role') || '').toLowerCase();
-      const role = ['user', 'human'].includes(explicit) ? 'user' : ['assistant', 'model'].includes(explicit) ? 'assistant' :
-        OneBrainClaudeSelectors.user.some((selector) => element.matches(selector)) ? 'user' :
-          OneBrainClaudeSelectors.assistant.some((selector) => element.matches(selector)) ? 'assistant' : 'unknown';
-      return { element, role };
-    });
-  },
-  getInputElement(root = document) { for (const selector of OneBrainClaudeSelectors.composer) { const element = root.querySelector(selector); if (element) return element; } return null; },
-  getSendButton(root = document) { for (const selector of OneBrainClaudeSelectors.sendButton) { const element = root.querySelector(selector); if (element) return element; } return null; },
-  getLoadOlderButton(root = document) { for (const selector of OneBrainClaudeSelectors.loadOlder) { const element = root.querySelector(selector); if (element) return element; } return null; },
-  getLastAssistantMessage(root = document) { return this.getMessages(root).filter((message) => message.role === 'assistant').at(-1) || null; },
-  observe(callback, root = document.body) { const observer = new MutationObserver(callback); if (root) observer.observe(root, { childList: true, subtree: true }); return () => observer.disconnect(); },
-  selfCheck(root = document) { return Object.fromEntries(Object.entries(OneBrainClaudeSelectors).map(([name, selectors]) => [name, selectors.find((selector) => root.querySelectorAll(selector).length > 0) || null])); }
-};
-
+const OneBrainClaudeAdapter = globalThis.OneBrainAdapterFactory.createAdapter('claude', OneBrainClaudeSelectors);
 if (typeof module !== 'undefined') module.exports = OneBrainClaudeAdapter;
-if (typeof globalThis !== 'undefined') (globalThis.OneBrainAdapters ||= {}).claude = OneBrainClaudeAdapter;
+globalThis.OneBrainAdapters ||= {}; globalThis.OneBrainAdapters.claude = OneBrainClaudeAdapter;

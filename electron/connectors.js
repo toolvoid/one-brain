@@ -36,9 +36,10 @@ function instructionPath(homeDir, client) {
 
 function resolveNode(env = process.env) { return executableOnPath('node', env) || 'node'; }
 
-function runProcess(command, args, { input = '', env = process.env, timeout = 10000 } = {}) {
+function runProcess(command, args, { input = '', env = process.env, timeout = 10000, onSpawn = null } = {}) {
   return new Promise((resolve) => {
     let stdout = ''; let stderr = ''; let timedOut = false;
+    try { onSpawn?.(command); } catch {}
     const child = spawn(command, args, { windowsHide: true, env, stdio: ['pipe', 'pipe', 'pipe'] });
     const timer = setTimeout(() => { timedOut = true; child.kill(); }, timeout);
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
@@ -51,6 +52,11 @@ function runProcess(command, args, { input = '', env = process.env, timeout = 10
     });
     child.stdin.end(input);
   });
+}
+
+function runNodeScript(command, args, options = {}) {
+  const { run = runProcess, env = process.env, ...runOptions } = options;
+  return run(command, args, { ...runOptions, env: { ...env, ELECTRON_RUN_AS_NODE: '1' } });
 }
 
 function clientPaths(homeDir, appPath, { platform = process.platform, env = process.env } = {}) {
@@ -486,7 +492,7 @@ async function connectClient(clientId, homeDir, appPath, env = process.env, opti
     const config = paths['claude-code'].config;
     if (fs.existsSync(config)) makeBackup(config);
     const server = serverJson(appPath, env, clientId);
-    const run = options.runCli || ((file, args) => runProcess(file, args, { env, timeout: 15000 }));
+    const run = options.runCli || ((file, args) => runProcess(file, args, { env, timeout: 15000, onSpawn: options.onSpawn }));
     const envArgs = Object.entries(server.env || {}).flatMap(([key, value]) => ['--env', `${key}=${value}`]);
     const result = await run(cli, ['mcp', 'add', '--scope', 'user', '--transport', 'stdio', 'one-brain', ...envArgs, '--', server.command, ...server.args]);
     if (result.error || result.status !== 0) throw new Error('Claude Code could not add the One Brain MCP server.');
@@ -539,7 +545,7 @@ async function testConnector(clientId, appPath, userDataPath, env = process.env,
     { jsonrpc: '2.1', id: 2, method: 'tools/list', params: {} },
     { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'search_memory', arguments: { query: 'connection health check', limit: 1 } } }
   ].map((message) => JSON.stringify(message)).join('\n') + '\n';
-  const run = options.run || ((command, args, input) => runProcess(command, args, { input, timeout: 8000, env: { ...env, ...(server.env || {}) } }));
+  const run = options.run || ((command, args, input) => runNodeScript(command, args, { input, timeout: 8000, env: { ...env, ...(server.env || {}) }, onSpawn: options.onSpawn }));
   const result = await run(server.command, server.args, messages);
   if (result.error || result.status !== 0) {
     const refused = result.error?.code === 'ECONNREFUSED' || /ECONNREFUSED|fetch failed.*127\.0\.0\.1/i.test(String(result.stderr || ''));
@@ -553,4 +559,4 @@ async function testConnector(clientId, appPath, userDataPath, env = process.env,
   return { ok: true, reason: 'initialize, tools/list, and search_memory succeeded.' };
 }
 
-module.exports = { INSTRUCTIONS, CLIENTS, instructionBlock, clientPaths, resolveNode, discoverClients, detectConnector, isConnected, connectClient, disconnectClient, testConnector, mergeTomlServer, removeTomlServer, mergeJsonServer, removeJsonServer, replaceInstructionBlock, previewClient, disconnectPreview, applyEdits, snippetFor, validateToml };
+module.exports = { INSTRUCTIONS, CLIENTS, instructionBlock, clientPaths, resolveNode, runNodeScript, discoverClients, detectConnector, isConnected, connectClient, disconnectClient, testConnector, mergeTomlServer, removeTomlServer, mergeJsonServer, removeJsonServer, replaceInstructionBlock, previewClient, disconnectPreview, applyEdits, snippetFor, validateToml };

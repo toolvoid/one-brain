@@ -1,6 +1,15 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('brain', {
+  getLifecycleLog: () => ipcRenderer.invoke('lifecycle:tail'),
+  getGraphicsSettings: () => ipcRenderer.invoke('graphics:get-settings'),
+  setSafeGraphicsMode: (enabled) => ipcRenderer.invoke('graphics:set-safe-mode', enabled),
+  acknowledgeGraphicsRestartNotice: () => ipcRenderer.invoke('graphics:acknowledge-restart-notice'),
+  onGraphicsSafeModeEnabled: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on('graphics:safe-mode-enabled', listener);
+    return () => ipcRenderer.removeListener('graphics:safe-mode-enabled', listener);
+  },
   addMemory: (memory) => ipcRenderer.invoke('memories:add', memory),
   createImport: (source) => ipcRenderer.invoke('imports:create', source),
   importMemories: (items, importId, markPrivate) => ipcRenderer.invoke('memories:import', items, importId, markPrivate),
@@ -52,6 +61,7 @@ contextBridge.exposeInMainWorld('brain', {
   approveClient: (client, readSources, writeSource) => ipcRenderer.invoke('clients:approve', client, readSources, writeSource),
   updateClientGrant: (client, source, status) => ipcRenderer.invoke('clients:grant', client, source, status),
   updateClientProfile: (client, changes) => ipcRenderer.invoke('clients:update', client, changes),
+  removeLegacyClient: (client) => ipcRenderer.invoke('clients:remove-legacy', client),
   getInsights: () => ipcRenderer.invoke('analytics:insights'),
   runAnalyticsSql: (sql) => ipcRenderer.invoke('analytics:run-sql', sql),
   resetRetrievalCounts: () => ipcRenderer.invoke('analytics:reset-retrieval-counts'),
@@ -74,6 +84,7 @@ contextBridge.exposeInMainWorld('brain', {
   deleteProviderKey: (provider) => ipcRenderer.invoke('memory-proxy:delete-key', provider),
   testProviderKey: (provider, key) => ipcRenderer.invoke('memory-proxy:test-key', provider, key),
   getQuickContextSettings: () => ipcRenderer.invoke('quick-context:settings'),
+  openQuickContext: () => ipcRenderer.invoke('quick-context:open'),
   updateQuickContextSettings: (settings) => ipcRenderer.invoke('quick-context:update-settings', settings),
   quickContextSearch: (query) => ipcRenderer.invoke('quick-context:search', query),
   copyQuickContext: (memories) => ipcRenderer.invoke('quick-context:copy', memories),

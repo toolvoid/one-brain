@@ -35,7 +35,7 @@ const deepseek = JSON.stringify([{ title: 'Synthetic DeepSeek export', messages:
 ] }]);
 
 test('universal importer parses ChatGPT, Claude, Gemini Takeout, DeepSeek, and copied chat samples', () => {
-  return import('../src/lib/importers.js').then(({ parseImportText }) => {
+  return import('../src/lib/importers.mjs').then(({ parseImportText }) => {
   for (const [name, text, source] of [['conversations.json', gpt, 'chatgpt'], ['claude.json', claude, 'claude'], ['takeout-gemini.json', gemini, 'gemini'], ['deepseek-export.json', deepseek, 'deepseek']]) {
     const parsed = parseImportText(text, name, true, false);
     assert.equal(parsed.error, undefined);
@@ -50,7 +50,7 @@ test('universal importer parses ChatGPT, Claude, Gemini Takeout, DeepSeek, and c
 });
 
 test('ZIP ChatGPT export parses atomically and unsupported or malformed input imports nothing', async () => {
-  const { parseImportText, parseImportFile } = await import('../src/lib/importers.js');
+  const { parseImportText, parseImportFile } = await import('../src/lib/importers.mjs');
   const archive = storedZip({ 'account/conversations.json': gpt, 'account/readme.txt': 'Synthetic archive note.' });
   const parsed = await parseImportFile({ name: 'chatgpt-export.zip', arrayBuffer: async () => archive.buffer.slice(archive.byteOffset, archive.byteOffset + archive.byteLength) }, true, false);
   assert.ok(parsed.items.length > 0);

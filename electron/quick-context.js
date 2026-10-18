@@ -7,7 +7,7 @@ const contextBlocks = require('../extension/src/context-blocks');
 async function prepareQuickContext({ query, searchMemories, getMemory = () => null, embedText, getVector = () => null } = {}) {
   const cleanQuery = contextBlocks.stripContextBlocks(String(query || '')).trim().slice(0, 4000);
   if (!cleanQuery) return { query: '', memories: [] };
-  const { isLogLikeChunk } = await import('../src/lib/importers.js');
+  const { isLogLikeChunk } = await import('../src/lib/importers.mjs');
   const found = await searchMemories(cleanQuery, 'all', 50, 0);
   const hydrated = (found || []).map((memory) => ({ ...memory, ...(getMemory(memory.id) || {}) }));
   const candidates = hydrated.filter((memory) => !memory.private && !memory.no_suggest &&

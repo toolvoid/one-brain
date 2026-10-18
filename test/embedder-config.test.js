@@ -8,13 +8,12 @@ const test = require('node:test');
 
 test('embedder uses an absolute user-data model path and can reuse a read-only model folder', async () => {
   const { localModelEnvironment } = await import('../src/lib/embedder-config.mjs');
-  const source = path.join(os.homedir(), '.config', 'one-brain', 'models');
-  const model = path.join(source, 'Xenova', 'paraphrase-multilingual-MiniLM-L12-v2');
   const required = ['config.json', 'tokenizer.json', 'tokenizer_config.json', 'onnx/model_quantized.onnx'];
-  assert.ok(required.every((file) => fs.existsSync(path.join(model, file))), 'the already-downloaded model files should be available for the local-copy check');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'one-brain-model-path-'));
+  const source = path.join(root, 'source-models'), model = path.join(source, 'Xenova', 'paraphrase-multilingual-MiniLM-L12-v2');
   const localModels = path.join(root, 'models');
   try {
+    for (const file of required) { const target = path.join(model, file); fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, 'synthetic model fixture'); }
     fs.cpSync(source, localModels, { recursive: true });
     for (const entry of [localModels, path.join(localModels, 'Xenova'), model.replace(source, localModels)]) fs.chmodSync(entry, 0o555);
     for (const file of required) fs.chmodSync(path.join(localModels, 'Xenova', 'paraphrase-multilingual-MiniLM-L12-v2', file), 0o444);

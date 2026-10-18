@@ -33,7 +33,7 @@ test('stdio bridge reloads a rotated token during an existing client session', a
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   fs.writeFileSync(path.join(directory, 'mcp-port'), `${server.address().port}\n`);
   t.after(async () => { server.close(); fs.rmSync(directory, { recursive: true, force: true }); });
-  const child = spawn(process.execPath, [path.resolve(__dirname, '../scripts/mcp-stdio.js'), '--client', 'codex'], { env: { ...process.env, ONE_BRAIN_USER_DATA: directory }, stdio: ['pipe', 'pipe', 'ignore'] });
+  const child = spawn(process.execPath, [path.resolve(__dirname, '../scripts/mcp-stdio.js'), '--client', 'codex'], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', ONE_BRAIN_USER_DATA: directory }, stdio: ['pipe', 'pipe', 'ignore'] });
   let output = '', pending = [];
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', (chunk) => { output += chunk; const lines = output.split(/\r?\n/); output = lines.pop() || ''; for (const line of lines) { try { pending.shift()?.(JSON.parse(line)); } catch {} } });

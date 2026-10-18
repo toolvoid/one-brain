@@ -42,11 +42,11 @@
       const head = document.createElement('div'); head.className = 'connection-head';
       const name = document.createElement('strong'); name.textContent = status.site;
       const label = document.createElement('span'); label.className = 'status';
-      const labels = { paired: 'Paired', pending: 'Paired, waiting for approval in One Brain', blocked: 'Blocked in One Brain', 'no-token': 'No token stored', unauthorized: 'Unauthorized', 'rate-limited': 'Rate limited', unreachable: 'App not reachable', 'version-mismatch': 'Version mismatch' };
+      const labels = { paired: 'Paired', pending: 'Paired, waiting for approval in One Brain', blocked: 'Blocked in One Brain', 'no-token': 'No token stored', unauthorized: 'Unauthorized', 'rate-limited': `Busy: rate limited, retrying in ${Math.max(1, status.retryAfter || 1)}s`, unreachable: 'App not reachable', 'version-mismatch': 'Version mismatch' };
       const reasonDisplay = status.reason ? globalThis.OneBrainAuthReasons?.authReasonDisplay(status.reason, status.site) : null;
-      label.textContent = reasonDisplay?.label || labels[status.status] || 'App not reachable';
+      label.textContent = status.status === 'rate-limited' ? labels['rate-limited'] : reasonDisplay?.label || labels[status.status] || 'App not reachable';
       const hint = document.createElement('small'); hint.className = 'status-hint';
-      hint.textContent = reasonDisplay?.hint || (status.status === 'paired' ? 'Fix: none needed.' : status.status === 'no-token' ? 'Fix: pair this site.' : status.status === 'unauthorized' ? 'Fix: pair again.' : status.status === 'version-mismatch' ? 'Fix: update One Brain.' : 'Fix: start One Brain and check the local API address.');
+      hint.textContent = status.status === 'rate-limited' ? labels['rate-limited'] : reasonDisplay?.hint || (status.status === 'paired' ? 'Fix: none needed.' : status.status === 'no-token' ? 'Fix: pair this site.' : status.status === 'unauthorized' ? 'Fix: pair again.' : status.status === 'version-mismatch' ? 'Fix: update One Brain.' : 'Fix: start One Brain and check the local API address.');
       head.append(name, label); card.append(head, hint);
       if (status.reason === 'origin_mismatch' && (status.expectedOrigin || status.receivedOrigin)) {
         const origins = document.createElement('small'); origins.className = 'status-hint';
@@ -102,7 +102,10 @@
         if (!report) { selfCheckRoot.textContent = `Open ${status.site} in a tab to run its self-check.`; return; }
         const heading = document.createElement('strong'); heading.textContent = `${status.site} selector matches`;
         const rows = document.createElement('div'); rows.className = 'selector-check';
-        for (const [name, selector] of Object.entries(report.matched || {})) { const row = document.createElement('span'); row.textContent = `${name}: ${selector ? 'matched' : 'not found'}`; if (selector) { const code = document.createElement('code'); code.textContent = selector; row.append(' · ', code); } rows.append(row); }
+        for (const [name, selector] of Object.entries(report.matched || {})) { const row = document.createElement('span'); row.textContent = `${name}: ${selector ? 'matched' : 'not found'}`; rows.append(row); }
+        if (report.diagnostics) { const summary = document.createElement('span'); summary.textContent = `Message containers: ${report.diagnostics.containersMatched || 0} · user ${report.diagnostics.messagesByRole?.user || 0} · assistant ${report.diagnostics.messagesByRole?.assistant || 0} · scrollable: ${report.diagnostics.scrollableFound ? report.diagnostics.scrollableType : 'not found'}`; rows.append(summary);
+          for (const [id, name] of Object.entries(report.diagnostics.selectorNames || {})) { const used = document.createElement('span'); used.textContent = `${id}: ${name}`; rows.append(used); }
+        }
         selfCheckRoot.append(heading, rows);
       });
       card.append(check); connections.append(card);
@@ -111,4 +114,6 @@
 
   void message({ type: 'get-endpoint' }).then((endpoint) => { endpointInput.value = endpoint || endpointInput.value; }).catch(() => {});
   void refresh().catch(() => { connections.textContent = 'One Brain is not running.'; });
+  const refreshTimer = setInterval(() => { if (document.visibilityState === 'visible') void refresh().catch(() => {}); }, 30_000);
+  window.addEventListener('pagehide', () => clearInterval(refreshTimer), { once: true });
 })();

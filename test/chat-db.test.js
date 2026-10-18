@@ -41,6 +41,8 @@ test('chat grants, stored memory ids, memory source, and chat deletion use the l
     assert.equal(profile.write_source, 'chatgpt');
     const geminiGrant = db.saveChatGrant('gemini', ['gemini']);
     assert.equal(geminiGrant.write_source, 'gemini');
+    const pairedGemini = db.getMcpClientProfile('ext:gemini', { verified: true, reported_name: 'One Brain Gemini extension' });
+    assert.equal(pairedGemini.write_source, 'gemini');
     const claudeGrant = db.saveChatGrant('claude', ['claude']);
     assert.equal(claudeGrant.write_source, 'claude');
     const openRouterGrant = db.saveChatGrant('openrouter', [], 'claude');
@@ -50,6 +52,13 @@ test('chat grants, stored memory ids, memory source, and chat deletion use the l
     const savedPendingId = db.approvePendingMemory(candidate.id, 'Gemini fact', 'Synthetic Gemini durable fact.');
     assert.equal(db.listMemories().find((item) => item.id === savedPendingId).source, 'gemini');
     const memory = db.addMemory({ source: 'chatgpt', title: 'Saved from Chat', content: 'Synthetic saved answer.' }, { event: false });
+    db.getMcpClientProfile('Visual Studio Code', { verified: false });
+    db.updateClientGrant('Visual Studio Code', 'codex', 'allow');
+    const legacyMemory = db.addMemory({ source: 'codex', title: 'Retained memory', content: 'Synthetic durable memory remains after profile cleanup.' }, { event: false });
+    const removed = db.removeLegacyClient('Visual Studio Code', Date.now() + 4 * 86400_000);
+    assert.equal(removed.removed, true);
+    assert.equal(db.listClients().some((client) => client.client === 'Visual Studio Code'), false);
+    assert.equal(db.getMemory(legacyMemory.id).title, 'Retained memory');
     assert.equal(db.createLink(memory.id, savedPendingId), true);
     assert.equal(db.listLinks().some((link) => link.a_id === Math.min(memory.id, savedPendingId) && link.b_id === Math.max(memory.id, savedPendingId)), true);
     const chatId = db.createChat('openai', 'mock-chat-model');

@@ -10,6 +10,15 @@ export const CONNECTION_DEFINITIONS = [
   { id: 'provider:deepseek', name: 'DeepSeek API', provider: 'deepseek', type: 'API provider', supports: ['Search', 'Auto-insert'] }
 ];
 
+export function defaultWriteSourceForClient(client) {
+  return /^(?:ext|chat):(chatgpt|claude|gemini|deepseek|groq)$/.exec(String(client || ''))?.[1] || null;
+}
+
+export function getWriteSourceReview(client, writeSource) {
+  const expected = defaultWriteSourceForClient(client);
+  return expected && writeSource !== expected ? { expected, current: writeSource || null, message: `${client} saves as ${writeSource || 'unset'}. Change to ${expected}?` } : null;
+}
+
 const healthyStatuses = new Set(['Connected', 'Paired', 'Healthy']);
 const byId = (list, key, id) => list.find((item) => item[key] === id);
 
@@ -33,19 +42,33 @@ export function buildConnectionRows({ mcp = [], clients = [], extensions = [], p
     } else if (definition.type === 'Web via extension') {
       const item = byId(extensions, 'site', definition.site);
       const selector = selectors[definition.site] || item?.layoutStatus;
-      if (selector?.broken) { status = 'Selectors broken'; reason = 'The page layout changed; use Manual context until selectors are repaired.'; }
-      else if (!item?.paired) { status = 'Not paired'; reason = 'Pair this site from the browser extension.'; }
-      else if (item.status !== 'approved') { status = 'Broken'; reason = 'Approve this extension client in One Brain.'; }
+      const h = item?.health || {};
+      const selfCheck = h.selfCheck || {};
+      const matched = selfCheck.matched || {};
+      const composerMatched = Number(matched.composer ?? matched.input ?? 0) > 0;
+      const messageCount = Number(selfCheck.containersMatched ?? matched.messages ?? 0);
+      const hasEvidence = Boolean(h.pingAt || selfCheck.at || h.authFailure || h.checkResultAt);
+      const latestUse = activity.filter((event) => event.client === definition.name && ['search', 'save'].includes(event.action)).sort((a, b) => Date.parse(b.time) - Date.parse(a.time));
+      const newestSuccess = latestUse.find((event) => event.ok);
+      const newestFailure = latestUse.find((event) => !event.ok);
+      const successfulUseIsCurrent = newestSuccess && (!newestFailure || Date.parse(newestSuccess.time) >= Date.parse(newestFailure.time));
+      if (!item?.paired) { status = 'Not paired'; reason = 'Pair this site from the browser extension.'; }
+      else if (item.status !== 'approved') { status = 'Needs approval'; reason = 'Approve this extension client in One Brain.'; }
       else {
-        const h = item.health || {};
         const expectedBuild = String(item.buildId || h.buildId || '');
-        if (h.tabContentScriptVersion && h.contentScriptVersion && h.tabContentScriptVersion !== h.contentScriptVersion) { status = 'Failing'; reason = 'Reload this page.'; }
-        else if (h.authFailure === 'origin_mismatch') { status = 'Failing'; reason = `Origin mismatch: expected ${h.expectedOrigin || 'unknown'}, received ${h.receivedOrigin || 'unknown'}.`; }
-        else if (item.health?.apiCompatible === false || item.updateOneBrain) { status = 'Failing'; reason = 'Extension and One Brain API versions are incompatible.'; }
-        else if (h.hostPermission === false) { status = 'Failing'; reason = 'Host permission is not granted.'; }
-        else if (!expectedBuild || !expectedBuild.toLowerCase().includes('loopguard')) { status = 'Failing'; reason = 'Extension build is missing the loop guard.'; }
-        else if (!h.pingAt) { status = 'Failing'; reason = 'Extension has not pinged yet; open a supported site.'; }
-        else if (Date.now() - Date.parse(h.pingAt) > 45000) { status = 'Failing'; reason = 'Extension ping is stale; open a supported page.'; }
+        const requiredBroken = selector?.required?.composer === null || selector?.composer === null || (hasEvidence && !composerMatched && (matched.composer !== undefined || matched.input !== undefined));
+        const reportedBuildBroken = Boolean(expectedBuild && !expectedBuild.toLowerCase().includes('loopguard'));
+        const busy = h.rateLimited === true || h.reason === 'rate_limited' || item.status === 'rate-limited';
+        const staleScript = Boolean(h.tabContentScriptVersion && h.contentScriptVersion && h.tabContentScriptVersion !== h.contentScriptVersion);
+        const realFailure = h.authFailure && h.authFailure !== 'rate_limited' || item.status === 'unauthorized' || h.hostPermission === false || item.updateOneBrain || h.apiCompatible === false || reportedBuildBroken || staleScript;
+        const effectiveRealFailure = !successfulUseIsCurrent && realFailure;
+        const degraded = !requiredBroken && (composerMatched && (messageCount > 0 && messageCount < 2 || selfCheck.messageSelectors && Object.values(selfCheck.messageSelectors).every((value) => !value)) || selector?.messageBroken);
+        if (busy) { status = 'Busy (rate limited)'; const retryAfter = h.retryAt ? Math.ceil((Number(h.retryAt) - Date.now()) / 1000) : Number(h.retryAfter) || 1; reason = `Busy: rate limited, retrying in ${Math.max(1, retryAfter)}s`; }
+        else if (requiredBroken) { status = 'Broken'; reason = 'Required composer selector matched 0.'; }
+        else if (effectiveRealFailure) { status = 'Failing'; reason = h.authFailure === 'origin_mismatch' ? `Origin mismatch: expected ${h.expectedOrigin || 'unknown'}, received ${h.receivedOrigin || 'unknown'}.` : h.hostPermission === false ? 'Host permission is not granted.' : item.updateOneBrain || h.apiCompatible === false ? 'Extension and One Brain API versions are incompatible.' : reportedBuildBroken ? 'Extension reported a build without the loop guard.' : staleScript ? 'Reload this page.' : 'The last extension check failed.'; }
+        else if (degraded) { status = 'Degraded'; reason = messageCount === 1 ? 'Message detection found 1 message: Save this chat may be incomplete, press Load full chat' : 'Message selectors need attention.'; }
+        else if (successfulUseIsCurrent) { status = 'Paired'; reason = `Last ${newestSuccess.action} succeeded ${newestSuccess.time}.`; }
+        else if (!hasEvidence) { status = 'Not checked'; reason = `Open a ${definition.site === 'gemini' ? 'Gemini' : definition.site} tab and press Check extension.`; }
         else { status = 'Paired'; reason = 'Extension is paired and approved.'; }
       }
     } else if (definition.manual) {
@@ -74,14 +97,21 @@ export function buildConnectionRows({ mcp = [], clients = [], extensions = [], p
       ? { supported: true, reason: '' }
       : { supported: false, reason: definition.manual ? 'Quick context copies text for manual paste.' : definition.type.includes('MCP') ? 'MCP tools return results but do not insert into the client prompt.' : definition.type === 'API provider' && !(providers.providerKeyStatus || providers)[definition.provider] ? 'Provider key is missing.' : definition.type === 'API provider' && providers.enabled === false ? 'Memory injection is disabled in the local API proxy.' : definition.type === 'API provider' && providers.dryRun && feature === 'Auto-insert' ? 'Dry run leaves provider requests unchanged.' : definition.type === 'API provider' ? 'The provider API connection has no save_memory tool.' : 'This connection does not provide this action.' }]));
     const sourceHealth = itemHealthStatus(mcp, definition.id);
-    const healthStatus = definition.type.includes('MCP') ? (status === 'Broken' || status === 'Failing' ? 'failing' : sourceHealth === 'not_set_up' && status === 'Connected' ? 'healthy' : sourceHealth === 'not_set_up' && status === 'Needs restart' ? 'needs_restart' : sourceHealth) : definition.manual ? 'manual_only' : definition.type === 'Web via extension' ? (byId(extensions, 'site', definition.site)?.paired ? (['Paired'].includes(status) ? 'healthy' : 'failing') : 'not_set_up') : (['Broken', 'Failing'].includes(status) ? 'failing' : status === 'Connected' ? 'healthy' : 'not_set_up');
     const ext = definition.site ? byId(extensions, 'site', definition.site) : null;
+    const mcpHealth = definition.type.includes('MCP') ? byId(mcp, 'id', definition.id)?.health || {} : null;
+    const lastRealCall = mcpHealth && [mcpHealth.last_success, mcpHealth.last_failure].filter(Boolean).sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts))[0] || null;
+    const mcpHealthDetails = mcpHealth ? { tokenGeneration: Number(mcpHealth.token_generation) || 0, lastRealCall: lastRealCall ? { time: lastRealCall.ts, generation: lastRealCall.generation, ok: lastRealCall === mcpHealth.last_success } : null,
+      lastProbe: mcpHealth.probe ? { time: mcpHealth.probe.ts, ok: mcpHealth.probe.ok, reason: mcpHealth.probe.reason || '' } : null, rotatedAt: mcpHealth.rotated_at || null } : null;
+    const recentUseEvents = events.filter((event) => ['search', 'save'].includes(event.action)).sort((a, b) => Date.parse(b.time) - Date.parse(a.time));
+    const lastSuccessEvent = recentUseEvents.find((event) => event.ok), lastFailureEvent = recentUseEvents.find((event) => !event.ok);
+    const hasCurrentSuccess = lastSuccessEvent && (!lastFailureEvent || Date.parse(lastSuccessEvent.time) >= Date.parse(lastFailureEvent.time));
+    const healthStatus = definition.type.includes('MCP') ? (status === 'Broken' || status === 'Failing' ? 'failing' : sourceHealth === 'not_set_up' && status === 'Connected' ? 'healthy' : sourceHealth === 'not_set_up' && status === 'Needs restart' ? 'needs_restart' : sourceHealth) : definition.manual ? 'manual_only' : definition.type === 'Web via extension' ? (status === 'Not checked' || status === 'Not paired' ? 'not_set_up' : status === 'Degraded' ? (hasCurrentSuccess ? 'healthy' : 'degraded') : status === 'Busy (rate limited)' ? 'busy' : status === 'Needs approval' ? 'needs_approval' : ['Broken', 'Failing'].includes(status) ? 'failing' : 'healthy') : (['Broken', 'Failing'].includes(status) ? 'failing' : status === 'Connected' ? 'healthy' : 'not_set_up');
     const lastSuccessfulUse = events.find((event) => ['search', 'save'].includes(event.action) && event.ok);
     const healthDetails = ext ? { pingAt: ext.health?.pingAt || null, tokenValid: Boolean(ext.paired), approval: ext.status || 'pending', expectedOrigin: ext.health?.expectedOrigin || ext.origin || null,
       receivedOrigin: ext.health?.receivedOrigin || null, apiVersion: ext.health?.apiVersion || ext.apiVersion || null, apiCompatible: ext.health?.apiCompatible ?? ext.apiCompatible ?? null,
       buildId: ext.health?.buildId || null, hostPermission: ext.health?.hostPermission ?? null,
       selfCheck: ext.health?.selfCheck || null, lastSuccessfulUse: lastSuccessfulUse ? { action: lastSuccessfulUse.action, time: lastSuccessfulUse.time } : null } : null;
-    return { ...definition, status, healthStatus, healthDetails, reason, healthy: healthyStatuses.has(status), lastActivity: latest ? { action: latest.action, time: latest.time } : last ? { action: 'last seen', time: last } : null, counts, work };
+    return { ...definition, status, healthStatus, healthDetails, mcpHealthDetails, reason, healthy: healthStatus === 'healthy' || healthyStatuses.has(status), lastActivity: latest ? { action: latest.action, time: latest.time } : last ? { action: 'last seen', time: last } : null, counts, work };
   });
   const urgency = (row) => row.healthy ? 2 : ['Broken', 'Failing', 'Needs reconnect', 'Needs restart', 'Selectors broken'].includes(row.status) ? 0 : 1;
   return rows.sort((a, b) => urgency(a) - urgency(b) || a.name.localeCompare(b.name));
@@ -90,8 +120,9 @@ export function buildConnectionRows({ mcp = [], clients = [], extensions = [], p
 export function summarizeConnectionHealth(rows) {
   const healthy = rows.filter((row) => row.healthy).length;
   const neutral = new Set(['not_set_up', 'not_installed', 'manual_only']);
-  const needAction = rows.filter((row) => ['needs_restart', 'failing'].includes(row.healthStatus)).length;
-  return { healthy, needAction, notSetUp: rows.filter((row) => neutral.has(row.healthStatus)).length, total: rows.length,
+  const degraded = rows.filter((row) => row.healthStatus === 'degraded').length;
+  const needAction = rows.filter((row) => ['needs_restart', 'failing', 'needs_approval', 'busy'].includes(row.healthStatus)).length;
+  return { healthy, degraded, needAction, notSetUp: rows.filter((row) => neutral.has(row.healthStatus)).length, total: rows.length,
     broken: rows.filter((row) => ['Broken', 'Failing', 'Needs reconnect', 'Needs restart', 'Selectors broken'].includes(row.status)) };
 }
 

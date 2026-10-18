@@ -44,7 +44,7 @@ function includedMessages(messages, include) {
     .map((message) => include === 'both-truncated' && ['assistant', 'model'].includes(message.role) ? { ...message, text: message.text.slice(0, 600) } : message);
 }
 async function splitChatMessages({ messages, include = 'my-messages', split = 'exchange', title = 'Saved chat', skipLogs = true, skipSecrets = true, topicThreshold = 0.55, embedText } = {}) {
-  const importer = await import('../src/lib/importers.js');
+  const importer = await import('../src/lib/importers.mjs');
   const filtered = includedMessages(messages || [], include);
   let skippedLogs = 0, skippedSecrets = 0;
   const safe = filtered.filter((message) => {
