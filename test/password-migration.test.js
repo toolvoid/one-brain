@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const Database = require('better-sqlite3-multiple-ciphers');
+const lockController = require('../electron/lock-controller');
 const { unwrapDatabaseKey } = require('../electron/security-vault');
 
 test('password migration runs on a temporary DB copy, backs up db and key, and exports encrypted recovery', async () => {
@@ -56,7 +57,20 @@ test('password migration runs on a temporary DB copy, backs up db and key, and e
     };
     try { assert.equal(countRows(recoveredDbPath), countRows(path.join(userData, 'onebrain.db'))); }
     finally { recoveryKey.fill(0); }
+    lockController.resetForTest();
+    lockController.configure({
+      verifyPassword: (password) => db.verifyMasterPassword(userData, password),
+      onLock: db.lockDatabase,
+      onUnlock: (password) => db.unlockDatabaseWithPassword(userData, password),
+    });
+    lockController.lock();
+    assert.equal(await lockController.unlock('wrong recovery password'), false);
+    assert.equal(lockController.isLocked(), true);
+    assert.equal(await lockController.unlock('correct migration password'), true);
+    assert.equal(lockController.isLocked(), false);
+    assert.equal(db.getMemory(memory.id).content, 'Synthetic migration data never written to the real profile.');
   } finally {
+    lockController.resetForTest();
     try { db.closeDatabaseForTest(); } catch {}
     os.homedir = originalHome;
     fs.rmSync(root, { recursive: true, force: true });

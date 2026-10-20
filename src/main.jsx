@@ -1,6 +1,6 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import App from './App.jsx';
+import UnlockGate from './UnlockGate.jsx';
 
 class RendererErrorBoundary extends React.Component {
   state = { failed: false };
@@ -26,6 +26,6 @@ class RendererErrorBoundary extends React.Component {
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <RendererErrorBoundary><App /></RendererErrorBoundary>
+    <RendererErrorBoundary><UnlockGate /></RendererErrorBoundary>
   </React.StrictMode>
 );

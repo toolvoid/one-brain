@@ -71,4 +71,29 @@ function registerSecurityIpc(ipcMain, {
   });
 }
 
-module.exports = { registerSecurityIpc, safeError };
+function registerUnlockIpc(ipcMain, {
+  lockController,
+  logEvent = () => {},
+  notifyUnlocked = () => {},
+  delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  failureDelayMs = 1000,
+}) {
+  let failures = 0;
+  ipcMain.handle('security:startup-state', async () => ({ ok: true, error: null, locked: lockController.isLocked() }));
+  ipcMain.handle('security:unlock', async (_event, password) => {
+    let ok = false;
+    try { ok = await lockController.unlock(password); } catch { ok = false; }
+    if (!ok) {
+      failures += 1;
+      try { logEvent('vault_unlock_failed'); } catch {}
+      if (failures % 5 === 0) await delay(failureDelayMs);
+      return { ok: false, error: 'Wrong password' };
+    }
+    failures = 0;
+    try { logEvent('vault_unlocked'); } catch {}
+    try { notifyUnlocked(); } catch {}
+    return { ok: true, error: null };
+  });
+}
+
+module.exports = { registerSecurityIpc, registerUnlockIpc, safeError };

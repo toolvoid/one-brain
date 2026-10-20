@@ -33,7 +33,9 @@ const { startMcpServer } = require('./mcp-server');
 const { createEmbedder } = require('./embedder');
 const connectors = require('./connectors');
 const { createClientToken, ensureClientToken, revokeClientTokenFile, tokenPath } = require('./client-tokens');
-const { registerSecurityIpc } = require('./security-ipc');
+const { registerSecurityIpc, registerUnlockIpc } = require('./security-ipc');
+const { registerMemoryReadIpc } = require('./memory-ipc');
+const { handleAllWindowsClosed } = require('./window-quit-policy');
 const { createMemoryProxy } = require('./memory-proxy');
 const { createExtApi } = require('./ext-api');
 const { prepareQuickContext, buildQuickContextBlock } = require('./quick-context');
@@ -301,12 +303,7 @@ ipcMain.handle('suggestions:reject', (_event, id) => rejectSuggestion(id));
 ipcMain.handle('suggestions:list-rejected', () => listRejected());
 ipcMain.handle('suggestions:restore', (_event, id) => restoreRejected(id));
 ipcMain.handle('suggestions:dismiss-all', () => dismissSuggestions());
-ipcMain.handle('memories:list', () => listMemories());
-ipcMain.handle('memories:search', async (_event, query, source, limit, offset, countRetrieval = false) => {
-  const results = await searchMemories(query, source, limit, offset, countRetrieval && String(query || '').trim() ? { kind: 'search', tool: 'ui_search' } : null);
-  recordMemoryViews(results.map((row) => row.id));
-  return results;
-});
+registerMemoryReadIpc(ipcMain, { lockController, listMemories, searchMemories, recordMemoryViews });
 ipcMain.handle('memories:count-by-source', () => countBySource());
 ipcMain.handle('mcp:config', () => mcpConnection ? { endpoint: mcpConnection.config.endpoint, port: mcpConnection.config.port } : null);
 ipcMain.handle('connectors:list', () => connectors.discoverClients(app.getPath('home'), connectorAppPath(), listClients(), getConnectorTokenStates(), connectorEnvironment()).map((item) => {
@@ -391,6 +388,12 @@ registerSecurityIpc(ipcMain, {
   exportEncryptedRecoveryFile,
   logFailure: (details) => lifecycleLog.append('vault_operation_failed', details),
 });
+registerUnlockIpc(ipcMain, {
+  lockController,
+  logEvent: (event) => lifecycleLog.append(event),
+  notifyUnlocked: () => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:unlocked'); },
+});
+ipcMain.handle('app:quit', () => { app.quit(); return true; });
 ipcMain.handle('clients:list', () => listClients());
 ipcMain.handle('clients:approve', (_event, client, readSources, writeSource) => approveClient(client, readSources, writeSource));
 ipcMain.handle('clients:grant', (_event, client, source, status) => updateClientGrant(client, source, status));
@@ -535,8 +538,14 @@ app.whenReady().then(async () => {
   const userDataPath = app.getPath('userData');
   lockController.configure({
     verifyPassword: async (password) => { try { return verifyMasterPassword(userDataPath, password); } catch { return false; } },
-    onLock: lockDatabase,
-    onUnlock: (password) => unlockDatabaseWithPassword(userDataPath, password)
+    onLock: () => {
+      lockDatabase();
+      for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:locked');
+    },
+    onUnlock: async (password) => {
+      await unlockDatabaseWithPassword(userDataPath, password);
+      startEmbedder();
+    }
   });
   const databaseStatus = await initializeDatabase(app.getPath('userData'), safeStorage);
   if (databaseStatus.state === 'password-required') lockController.lock();
@@ -617,7 +626,5 @@ app.on('before-quit', () => {
 });
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
+  handleAllWindowsClosed({ platform: process.platform, isLocked: lockController.isLocked, quit: () => app.quit() });
 });
