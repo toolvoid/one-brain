@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('node:path');
+const fs = require('node:fs');
 
 function safeError(error) {
   const name = String(error?.name || 'Error').replace(/[^\w.-]/g, '').slice(0, 40) || 'Error';
@@ -19,9 +20,19 @@ function registerSecurityIpc(ipcMain, {
   getMainWindow,
   dialog,
   migrateDatabaseToPassword,
+  verifyMasterPassword,
   exportEncryptedRecoveryFile,
   logFailure = () => {},
 }) {
+  ipcMain.handle('security:has-master-password', async () => {
+    try { return { ok: true, error: null, set: fs.existsSync(path.join(getUserDataPath(), 'db.vault.json')) }; }
+    catch (error) {
+      const safe = safeError(error);
+      try { logFailure({ operation: 'export_recovery', ...safe }); } catch {}
+      return { ok: false, error: safe.message, set: false };
+    }
+  });
+
   ipcMain.handle('security:set-master-password', async (_event, password) => {
     try {
       const result = await migrateDatabaseToPassword(getUserDataPath(), password);
@@ -35,13 +46,22 @@ function registerSecurityIpc(ipcMain, {
 
   ipcMain.handle('security:export-recovery', async (_event, password) => {
     try {
+      const userDataPath = getUserDataPath();
+      if (!fs.existsSync(path.join(userDataPath, 'db.vault.json'))) return { ok: false, error: 'Set a master password first.' };
+      let validPassword = false;
+      try { validPassword = await verifyMasterPassword(userDataPath, password); } catch {}
+      if (!validPassword) {
+        const safe = { name: 'WrongPasswordError', message: 'Wrong password' };
+        try { logFailure({ operation: 'export_recovery', ...safe }); } catch {}
+        return { ok: false, error: 'Wrong password' };
+      }
       const result = await dialog.showSaveDialog(getMainWindow(), {
         title: 'Export encrypted recovery file',
         defaultPath: path.join(getHomePath(), 'one-brain-recovery.obr'),
         filters: [{ name: 'One Brain recovery', extensions: ['obr'] }],
       });
       if (result.canceled || !result.filePath) return { ok: false, error: 'Recovery export canceled.', canceled: true };
-      const exported = await exportEncryptedRecoveryFile(getUserDataPath(), result.filePath, password);
+      const exported = await exportEncryptedRecoveryFile(userDataPath, result.filePath, password);
       return { ok: true, error: null, ...exported };
     } catch (error) {
       const safe = safeError(error);

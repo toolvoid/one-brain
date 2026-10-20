@@ -727,6 +727,14 @@ async function migrateDatabaseToPassword(userDataPath, password, options = {}) {
 
     writeVault(vaultPath, newKey, password);
     vaultWritten = true;
+    const unlockedKey = readVault(vaultPath, password);
+    try {
+      if (!timingSafeEqual(unlockedKey, newKey)) throw new Error('Password unlock verification failed.');
+      const passwordVerified = openEncrypted(pendingPath, unlockedKey, { readonly: true, fileMustExist: true });
+      try {
+        if (JSON.stringify(databaseCounts(passwordVerified)) !== JSON.stringify(oldCounts)) throw new Error('Password unlock verification failed: row counts differ.');
+      } finally { passwordVerified.close(); }
+    } finally { unlockedKey.fill(0); }
     if (typeof options.afterVerified === 'function') await options.afterVerified();
     getDatabase().pragma('wal_checkpoint(TRUNCATE)');
     if (database?.open) database.close();
@@ -812,6 +820,7 @@ function unlockDatabaseWithPassword(userDataPath, password) {
 async function exportEncryptedRecoveryFile(userDataPath, destinationPath, password) {
   ensureWritable();
   const vaultPath = path.join(userDataPath, 'db.vault.json');
+  if (!fs.existsSync(vaultPath)) throw new Error('Set a master password first.');
   const vault = JSON.parse(fs.readFileSync(vaultPath, 'utf8'));
   const recoveredKey = unwrapDatabaseKey(vault, password);
   if (databaseKey && !timingSafeEqual(recoveredKey, databaseKey)) { recoveredKey.fill(0); throw new Error('Master password does not match this vault.'); }

@@ -387,6 +387,7 @@ registerSecurityIpc(ipcMain, {
   getMainWindow: () => mainWindow,
   dialog,
   migrateDatabaseToPassword,
+  verifyMasterPassword,
   exportEncryptedRecoveryFile,
   logFailure: (details) => lifecycleLog.append('vault_operation_failed', details),
 });

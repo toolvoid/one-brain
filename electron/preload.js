@@ -58,6 +58,7 @@ contextBridge.exposeInMainWorld('brain', {
   retryEmbedding: () => ipcRenderer.invoke('embeddings:retry'),
   getDatabaseStatus: () => ipcRenderer.invoke('database:status'),
   setMasterPassword: (password) => ipcRenderer.invoke('security:set-master-password', password),
+  hasMasterPassword: () => ipcRenderer.invoke('security:has-master-password'),
   exportRecoveryFile: (password) => ipcRenderer.invoke('security:export-recovery', password),
   listClients: () => ipcRenderer.invoke('clients:list'),
   approveClient: (client, readSources, writeSource) => ipcRenderer.invoke('clients:approve', client, readSources, writeSource),
