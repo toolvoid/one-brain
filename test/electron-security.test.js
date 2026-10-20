@@ -7,7 +7,7 @@ const path = require('node:path');
 const test = require('node:test');
 const {
   createSecurityEventLogger, createTrustedAppUrl, installIpcSenderValidation,
-  attachWebContentsSecurity, denySessionPermissions, rendererCsp
+  attachWebContentsSecurity, denySessionPermissions, cspProfileForUrl, rendererCsp, applyCspToSession
 } = require('../electron/electron-security');
 
 test('trusted renderer URLs allow only the app root and exact Vite dev origin', (t) => {
@@ -67,13 +67,39 @@ test('windows deny navigation, popups and webviews; permissions are denied', () 
   assert.deepEqual(denied, ['navigation_denied', 'navigation_denied', 'navigation_denied', 'permission_denied', 'permission_denied']);
 });
 
-test('renderer CSP excludes eval and permits only the Vite dev websocket in dev mode', () => {
-  const dev = rendererCsp({ dev: true }), prod = rendererCsp();
-  assert.doesNotMatch(dev, /unsafe-eval/);
-  assert.match(dev, /ws:\/\/localhost:5173/);
-  assert.doesNotMatch(prod, /ws:\/\/localhost:5173/);
-  assert.match(prod, /script-src 'self'/);
-  assert.match(prod, /object-src 'none'/);
+test('production CSP is strict and dev CSP applies only to localhost Vite, never packaged mode', () => {
+  const production = rendererCsp({ profile: 'production' });
+  const development = rendererCsp({ profile: 'development' });
+  assert.match(production, /script-src 'self'(?:;|$)/);
+  assert.doesNotMatch(production.match(/script-src[^;]*/)[0], /unsafe-inline|unsafe-eval/);
+  assert.doesNotMatch(production, /unsafe-eval/);
+  assert.match(production, /frame-ancestors 'none'/);
+  assert.match(development, /script-src 'self' 'unsafe-inline'/);
+  assert.doesNotMatch(development, /unsafe-eval/);
+  assert.match(development, /connect-src 'self' ws:\/\/localhost:5173 http:\/\/localhost:5173/);
+  assert.equal(cspProfileForUrl('http://localhost:5173/', { isPackaged: false }), 'development');
+  assert.equal(cspProfileForUrl('http://127.0.0.1:5173/', { isPackaged: false }), 'production');
+  assert.equal(cspProfileForUrl('https://localhost:5173/', { isPackaged: false }), 'production');
+  assert.equal(cspProfileForUrl('http://localhost:5173/', { isPackaged: true }), 'production');
+});
+
+test('CSP response header is origin-scoped and contains frame-ancestors', () => {
+  let hook;
+  applyCspToSession({ webRequest: { onHeadersReceived: (fn) => { hook = fn; } } }, {
+    isPackaged: false, isTrustedUrl: (url) => url === 'http://localhost:5173/'
+  });
+  let response;
+  hook({ url: 'http://localhost:5173/', responseHeaders: { 'Content-Type': ['text/html'] } }, (value) => { response = value; });
+  assert.match(response.responseHeaders['Content-Security-Policy'][0], /script-src 'self' 'unsafe-inline'/);
+  assert.match(response.responseHeaders['Content-Security-Policy'][0], /frame-ancestors 'none'/);
+  hook({ url: 'https://example.com/', responseHeaders: { 'Content-Type': ['text/html'] } }, (value) => { response = value; });
+  assert.equal(response.responseHeaders['Content-Security-Policy'], undefined);
+});
+
+test('index CSP meta contains only meta-safe directives and no frame-ancestors', () => {
+  const index = fs.readFileSync(path.join(__dirname, '../index.html'), 'utf8');
+  assert.doesNotMatch(index, /frame-ancestors/);
+  assert.match(index, /base-uri 'self'; object-src 'none'; form-action 'self'/);
 });
 
 test('every current BrowserWindow opts into all required renderer protections', () => {

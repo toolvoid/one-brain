@@ -28,11 +28,15 @@ const { getGraphicsStartupConfig, recordGpuCrash, registerShortcutWithFallback }
 const { createCrashLoopLimiter } = require('./window-lifecycle');
 const { rendererErrorLocation, rendererErrorMessage } = require('./renderer-errors');
 const { readGraphicsSettings, writeGraphicsSettings } = require('./graphics-settings');
-const { getAutomaticSoftwareFallback } = require('./graphics-fallback');
+const { getAutomaticSoftwareFallback, prepareGraphicsStartup, recordStableHardwareStart, resetGraphicsFailuresForRetry } = require('./graphics-fallback');
 const graphicsUserDataPath = userDataRoot;
 let graphicsSettings = readGraphicsSettings(graphicsUserDataPath);
-const graphicsStartupConfig = getGraphicsStartupConfig(process.platform, { ...process.env, argv: process.argv }, graphicsSettings);
+const graphicsStartup = prepareGraphicsStartup(process.platform, graphicsSettings);
+if (JSON.stringify(graphicsStartup.settings) !== JSON.stringify(graphicsSettings)) graphicsSettings = writeGraphicsSettings(graphicsUserDataPath, graphicsStartup.settings);
+const graphicsStartupConfig = getGraphicsStartupConfig(process.platform, { ...process.env, argv: process.argv }, { ...graphicsSettings, mode: graphicsStartup.startupMode });
 let gpuCrashCount = 0;
+let graphicsStabilityTimer = null;
+let graphicsFallbackRestartScheduled = false;
 if (graphicsStartupConfig.ozonePlatform) app.commandLine.appendSwitch('ozone-platform', graphicsStartupConfig.ozonePlatform);
 if (graphicsStartupConfig.useGl) app.commandLine.appendSwitch('use-gl', graphicsStartupConfig.useGl);
 if (graphicsStartupConfig.useAngle) app.commandLine.appendSwitch('use-angle', graphicsStartupConfig.useAngle);
@@ -46,10 +50,13 @@ const securityEventFlushTimer = setInterval(() => securityEventLogger.flush(true
 securityEventFlushTimer.unref?.();
 const recordSecurityEvent = (event, details) => securityEventLogger.record(event, details);
 installIpcSenderValidation(ipcMain, { isTrustedUrl: trustedRendererUrl, recordDenied: recordSecurityEvent });
-app.on('web-contents-created', (_event, contents) => attachWebContentsSecurity(contents, { isTrustedUrl: trustedRendererUrl, recordDenied: recordSecurityEvent }));
 app.on('before-quit', () => { clearInterval(securityEventFlushTimer); securityEventLogger.flush(true); });
-denySessionPermissions(session.defaultSession, recordSecurityEvent);
-applyCspToSession(session.defaultSession, { dev: !app.isPackaged });
+function initializeReadyElectronApis() {
+  app.on('web-contents-created', (_event, contents) => attachWebContentsSecurity(contents, { isTrustedUrl: trustedRendererUrl, recordDenied: recordSecurityEvent }));
+  denySessionPermissions(session.defaultSession, recordSecurityEvent);
+  applyCspToSession(session.defaultSession, { isPackaged: app.isPackaged, devOrigin: 'http://localhost:5173', isTrustedUrl: trustedRendererUrl });
+  Menu.setApplicationMenu(null);
+}
 ipcMain.handle('lifecycle:tail', () => lifecycleLog.tail(50));
 const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
 const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getMcpClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, getMemoryEmbeddingVector, getMemory, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, listRecentImports, listClients, removeLegacyClient, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, addMemory, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
@@ -181,35 +188,68 @@ app.on('child-process-gone', (_event, details) => {
 });
 
 function activateAutomaticSoftwareFallback(reason) {
+  if (graphicsStartupConfig.mode !== 'auto' || graphicsSettings.mode !== 'auto' || graphicsFallbackRestartScheduled) return false;
   const next = getAutomaticSoftwareFallback(process.platform, graphicsSettings, reason);
   if (!next) return false;
+  graphicsFallbackRestartScheduled = true;
+  if (graphicsStabilityTimer) clearTimeout(graphicsStabilityTimer);
+  graphicsStabilityTimer = null;
   graphicsSettings = writeGraphicsSettings(graphicsUserDataPath, { ...next, restartNotice: false });
   graphicsRestartNoticePending = false;
-  lifecycleLog.append('graphics_software_fallback', { reason });
+  lifecycleLog.append('graphics_software_fallback', { reason, failureCount: graphicsSettings.failureCount });
   app.relaunch();
   app.quit();
   return true;
 }
 
+function publicGraphicsSettings({ restartRequired = null } = {}) {
+  const ordinaryRestartNeeded = graphicsSettings.mode !== graphicsStartupConfig.mode && graphicsSettings.mode !== 'auto';
+  return {
+    supported: process.platform === 'linux',
+    mode: graphicsSettings.mode,
+    activeMode: graphicsStartupConfig.mode,
+    hardwareStrategy: graphicsSettings.hardwareStrategy,
+    renderer: graphicsSettings.renderer,
+    rendererSoftware: /swiftshader|llvmpipe|software rasterizer/i.test(graphicsSettings.renderer),
+    failureCount: graphicsSettings.failureCount,
+    lastFailureReason: graphicsSettings.lastFailureReason,
+    restartRequired: restartRequired ?? (ordinaryRestartNeeded || graphicsSettings.retryHardwareNextStart),
+    retryHardwareNextStart: graphicsSettings.retryHardwareNextStart,
+    restartNotice: graphicsRestartNoticePending
+  };
+}
+
 ipcMain.handle('graphics:get-settings', () => ({
-  supported: process.platform === 'linux',
-  mode: graphicsSettings.mode,
-  hardwareStrategy: graphicsSettings.hardwareStrategy,
-  renderer: graphicsSettings.renderer,
-  rendererSoftware: /swiftshader|llvmpipe|software rasterizer/i.test(graphicsSettings.renderer),
-  restartRequired: graphicsSettings.mode !== graphicsStartupConfig.mode || graphicsSettings.hardwareStrategy !== graphicsStartupConfig.hardwareStrategy,
-  restartNotice: graphicsRestartNoticePending
+  ...publicGraphicsSettings({ restartRequired: graphicsSettings.hardwareStrategy !== graphicsStartupConfig.hardwareStrategy || (graphicsSettings.mode !== 'auto' && graphicsSettings.mode !== graphicsStartupConfig.mode) || graphicsSettings.retryHardwareNextStart })
 }));
 ipcMain.handle('graphics:set-mode', (_event, mode, hardwareStrategy) => {
   if (process.platform !== 'linux') return { supported: false, mode: graphicsSettings.mode, restartRequired: false };
   if (!['auto', 'hardware', 'safe-software'].includes(mode)) throw new Error('Invalid graphics mode.');
   const strategy = hardwareStrategy === 'egl' ? 'egl' : hardwareStrategy === 'angle-gl' ? 'angle-gl' : graphicsSettings.hardwareStrategy;
-  graphicsSettings = writeGraphicsSettings(graphicsUserDataPath, { ...graphicsSettings, mode, hardwareStrategy: strategy });
-  return { supported: true, mode: graphicsSettings.mode, hardwareStrategy: graphicsSettings.hardwareStrategy, restartRequired: graphicsSettings.mode !== graphicsStartupConfig.mode || graphicsSettings.hardwareStrategy !== graphicsStartupConfig.hardwareStrategy, restartNotice: graphicsRestartNoticePending };
+  const changes = mode === 'hardware' ? { failureCount: 0, lastFailureReason: '', fallbackNextStart: false, retryHardwareNextStart: false } : mode === 'safe-software' ? { fallbackNextStart: false, retryHardwareNextStart: false } : {};
+  graphicsSettings = writeGraphicsSettings(graphicsUserDataPath, { ...graphicsSettings, ...changes, mode, hardwareStrategy: strategy });
+  return publicGraphicsSettings({ restartRequired: graphicsSettings.mode !== graphicsStartupConfig.mode || graphicsSettings.hardwareStrategy !== graphicsStartupConfig.hardwareStrategy });
+});
+ipcMain.handle('graphics:try-hardware-again', () => {
+  if (process.platform !== 'linux') return { supported: false, mode: graphicsSettings.mode, restartRequired: false };
+  if (graphicsSettings.mode !== 'auto' || graphicsSettings.failureCount < 2) return { ...publicGraphicsSettings(), error: 'Hardware retry is available after two Auto-mode failures.' };
+  graphicsSettings = writeGraphicsSettings(graphicsUserDataPath, resetGraphicsFailuresForRetry(graphicsSettings));
+  lifecycleLog.append('graphics_hardware_retry_requested');
+  return publicGraphicsSettings({ restartRequired: true });
 });
 ipcMain.handle('graphics:report-renderer', (_event, renderer) => {
   graphicsSettings = writeGraphicsSettings(graphicsUserDataPath, { ...graphicsSettings, renderer: typeof renderer === 'string' ? renderer.slice(0, 200) : '' });
   if (/swiftshader|llvmpipe|software rasterizer/i.test(graphicsSettings.renderer)) lifecycleLog.append('graphics_software_renderer_detected');
+  if (graphicsStabilityTimer) clearTimeout(graphicsStabilityTimer);
+  graphicsStabilityTimer = null;
+  if (process.platform === 'linux' && ['auto', 'hardware'].includes(graphicsStartupConfig.mode) && !/swiftshader|llvmpipe|software rasterizer/i.test(graphicsSettings.renderer)) {
+    graphicsStabilityTimer = setTimeout(() => {
+      graphicsStabilityTimer = null;
+      graphicsSettings = writeGraphicsSettings(graphicsUserDataPath, recordStableHardwareStart(graphicsSettings));
+      lifecycleLog.append('graphics_hardware_stable', { durationMs: 60_000 });
+    }, 60_000);
+    graphicsStabilityTimer.unref?.();
+  }
   return { ok: true };
 });
 ipcMain.handle('graphics:context-failed', () => {
@@ -314,8 +354,6 @@ ipcMain.handle('quick-context:copy', (_event, memories) => {
   return { ok: true };
 });
 ipcMain.handle('quick-context:close', (event) => { BrowserWindow.fromWebContents(event.sender)?.close(); return true; });
-
-Menu.setApplicationMenu(null);
 
 function publishEmbeddingStatus(status) {
   embeddingStatus = status;
@@ -643,6 +681,7 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return;
+  initializeReadyElectronApis();
   createQuickContextTray();
   const userDataPath = app.getPath('userData');
   lockController.configure({

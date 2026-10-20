@@ -1,7 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 const INVOKE_CHANNELS = new Set([
-  'lifecycle:tail', 'graphics:get-settings', 'graphics:set-mode', 'graphics:report-renderer', 'graphics:context-failed', 'graphics:acknowledge-restart-notice',
+  'lifecycle:tail', 'graphics:get-settings', 'graphics:set-mode', 'graphics:try-hardware-again', 'graphics:report-renderer', 'graphics:context-failed', 'graphics:acknowledge-restart-notice',
   'memories:add', 'imports:create', 'memories:import', 'imports:finish', 'imports:list', 'imports:undo',
   'legacy-cleanup:status', 'legacy-cleanup:run', 'links:list', 'links:create', 'links:delete',
   'suggestions:list', 'suggestions:accept', 'suggestions:join-all', 'suggestions:reject', 'suggestions:list-rejected', 'suggestions:restore', 'suggestions:dismiss-all',
@@ -56,6 +56,7 @@ contextBridge.exposeInMainWorld('brain', {
   getLifecycleLog: () => invoke('lifecycle:tail'),
   getGraphicsSettings: () => invoke('graphics:get-settings'),
   setGraphicsMode: (mode, hardwareStrategy) => invoke('graphics:set-mode', mode, hardwareStrategy),
+  tryGraphicsHardwareAgain: () => invoke('graphics:try-hardware-again'),
   reportGraphicsRenderer: (renderer) => invoke('graphics:report-renderer', String(renderer || '').slice(0, 200)),
   reportGraphicsContextFailure: () => invoke('graphics:context-failed'),
   acknowledgeGraphicsRestartNotice: () => invoke('graphics:acknowledge-restart-notice'),

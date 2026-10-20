@@ -4,7 +4,7 @@ const path = require('node:path');
 
 const MODES = Object.freeze(['auto', 'hardware', 'safe-software']);
 const HARDWARE_STRATEGIES = Object.freeze(['angle-gl', 'egl']);
-const DEFAULTS = Object.freeze({ mode: 'auto', hardwareStrategy: 'angle-gl', restartNotice: false, renderer: '' });
+const DEFAULTS = Object.freeze({ mode: 'auto', hardwareStrategy: 'angle-gl', restartNotice: false, renderer: '', failureCount: 0, lastFailureReason: '', fallbackNextStart: false, retryHardwareNextStart: false });
 
 function graphicsSettingsPath(userDataPath) {
   return path.join(userDataPath, 'graphics-settings.json');
@@ -16,7 +16,11 @@ function normalizeGraphicsSettings(value = {}) {
     mode: MODES.includes(value.mode) ? value.mode : (legacyMode || DEFAULTS.mode),
     hardwareStrategy: HARDWARE_STRATEGIES.includes(value.hardwareStrategy) ? value.hardwareStrategy : DEFAULTS.hardwareStrategy,
     restartNotice: value.restartNotice === true,
-    renderer: typeof value.renderer === 'string' ? value.renderer.slice(0, 200) : ''
+    renderer: typeof value.renderer === 'string' ? value.renderer.slice(0, 200) : '',
+    failureCount: Number.isSafeInteger(value.failureCount) ? Math.max(0, Math.min(2, value.failureCount)) : 0,
+    lastFailureReason: typeof value.lastFailureReason === 'string' ? value.lastFailureReason.slice(0, 100) : '',
+    fallbackNextStart: value.fallbackNextStart === true,
+    retryHardwareNextStart: value.retryHardwareNextStart === true
   };
 }
 

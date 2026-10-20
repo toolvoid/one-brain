@@ -101,17 +101,36 @@ function denySessionPermissions(electronSession, recordDenied = () => {}) {
   });
 }
 
-function rendererCsp({ dev = false } = {}) {
+function cspProfileForUrl(value, { isPackaged = false, devOrigin = 'http://localhost:5173' } = {}) {
+  if (isPackaged) return 'production';
+  try {
+    const loaded = new URL(String(value));
+    const dev = new URL(devOrigin);
+    return loaded.protocol === 'http:' && loaded.origin === dev.origin ? 'development' : 'production';
+  } catch {
+    return 'production';
+  }
+}
+
+function rendererCsp({ profile = 'production' } = {}) {
+  const dev = profile === 'development';
+  const scripts = dev ? "'self' 'unsafe-inline'" : "'self'";
   const connect = dev ? "'self' ws://localhost:5173 http://localhost:5173" : "'self'";
-  return `default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src ${connect}; worker-src 'self' blob:`;
+  return `default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src ${scripts}; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src ${connect}; worker-src 'self' blob:`;
 }
 
-function applyCspToSession(electronSession, { dev = false } = {}) {
-  const csp = rendererCsp({ dev });
+function applyCspToSession(electronSession, { isPackaged = false, devOrigin = 'http://localhost:5173', isTrustedUrl = () => true } = {}) {
   electronSession.webRequest?.onHeadersReceived?.((details, callback) => {
-    callback({ responseHeaders: { ...details.responseHeaders, 'Content-Security-Policy': [csp] } });
+    if (!isTrustedUrl(details.url)) {
+      callback({ responseHeaders: details.responseHeaders });
+      return;
+    }
+    const profile = cspProfileForUrl(details.url, { isPackaged, devOrigin });
+    const csp = rendererCsp({ profile });
+    const responseHeaders = Object.fromEntries(Object.entries(details.responseHeaders || {}).filter(([name]) => name.toLowerCase() !== 'content-security-policy'));
+    responseHeaders['Content-Security-Policy'] = [csp];
+    callback({ responseHeaders });
   });
-  return csp;
 }
 
-module.exports = { createSecurityEventLogger, createTrustedAppUrl, installIpcSenderValidation, attachWebContentsSecurity, denySessionPermissions, rendererCsp, applyCspToSession };
+module.exports = { createSecurityEventLogger, createTrustedAppUrl, installIpcSenderValidation, attachWebContentsSecurity, denySessionPermissions, cspProfileForUrl, rendererCsp, applyCspToSession };
