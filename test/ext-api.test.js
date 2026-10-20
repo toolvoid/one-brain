@@ -254,7 +254,7 @@ test('save forces the source from the paired site and search excludes private re
   const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
   const token = await h.pair();
   h.profiles.get('ext:chatgpt').allowedSources = ['chatgpt'];
-  h.memories.push({ id: 1, source: 'chatgpt', title: 'Synthetic public', content: 'Synthetic fixture body with enough words to pass the minimum content length filter.', private: false, score: 0.9 }, { id: 2, source: 'chatgpt', title: 'Synthetic private', content: 'OB_PRIVATE_MARKER_EXTENSION must never reach the extension search or insert path.', private: true, score: 0.88 }, { id: 3, source: 'claude', title: 'Synthetic ungranted', content: 'Synthetic ungranted fixture body with enough content for filtering.', private: false, score: 0.85 });
+  h.memories.push({ id: 1, source: 'chatgpt', title: 'Synthetic public', content: 'Synthetic fixture body with enough words to pass the minimum content length filter.', private: false, score: 0.9, vectorSimilarity: 0.9 }, { id: 2, source: 'chatgpt', title: 'Synthetic private', content: 'OB_PRIVATE_MARKER_EXTENSION must never reach the extension search or insert path.', private: true, score: 0.88, vectorSimilarity: 0.88 }, { id: 3, source: 'claude', title: 'Synthetic ungranted', content: 'Synthetic ungranted fixture body with enough content for filtering.', private: false, score: 0.85, vectorSimilarity: 0.85 });
   let response = await h.request('/ext/search', { method: 'POST', token, body: { query: 'synthetic' } });
   let result = await response.json();
   assert.equal(response.status, 200);
@@ -274,7 +274,7 @@ test('save forces the source from the paired site and search excludes private re
 test('extension panel can mark an allowed memory never-suggest and search then excludes it', async (t) => {
   const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
   const token = await h.pair();
-  h.memories.push({ id: 11, source: 'chatgpt', title: 'Synthetic memory', content: 'Synthetic fixture body with enough words to pass the minimum content length filter.', private: false, no_suggest: false, score: 0.9 });
+  h.memories.push({ id: 11, source: 'chatgpt', title: 'Synthetic memory', content: 'Synthetic fixture body with enough words to pass the minimum content length filter.', private: false, no_suggest: false, score: 0.9, vectorSimilarity: 0.9 });
   let response = await h.request('/ext/search', { method: 'POST', token, body: { query: 'Synthetic fixture', limit: 5 } });
   let result = await response.json();
   assert.deepEqual(result.memories.map((item) => item.id), [11]);

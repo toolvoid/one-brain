@@ -7,6 +7,7 @@ const { rankExtensionResults } = require('./ext-search');
 const { prepareSearchMemories } = require('./ext-context');
 const contextBlocks = require('../extension/src/context-blocks');
 const lockController = require('./lock-controller');
+const { passesRelevanceGate } = require('./relevance-gate');
 const smartSave = require('../extension/src/smart-save');
 const { splitChatMessages, contentHash, looksSecret } = require('./ext-chat');
 
@@ -51,7 +52,7 @@ function createExtApi(options) {
     createToken, revokeToken, searchMemoriesForClient, addMemory, recordProxyEvent, isTokenActive = () => true,
     emitRetrieved = () => {}, emitAdded = () => {}, emitRemoved = () => {}, now = Date.now, getEmbeddingVector = () => null,
     setMemoryNoSuggest = () => false, getMemoryForClient = () => ({ memory: null }), createImport, importMemories, finishImport, getExtensionChatSave, undoExtensionChatSave,
-    embedText, appVersion = require('../package.json').version,
+    embedText, getMinimumCosine = () => 0.3, appVersion = require('../package.json').version,
     authFailureLog = (entry) => console.info(JSON.stringify(entry)),
     rateLimitedLog = (entry) => console.info(JSON.stringify(entry)),
     importText = async (...args) => (await import('../src/lib/importers.mjs')).parseImportText(...args)
@@ -315,10 +316,12 @@ function createExtApi(options) {
       const query = String(body.query || '').trim().slice(0, 4000);
       const limit = Math.max(1, Math.min(10, Math.floor(Number(body.limit) || 5)));
       const excludeIds = Array.isArray(body.excludeIds) ? body.excludeIds.slice(0, 500) : [];
-      const minScore = body.minScore == null ? 0.015 : Math.max(0, Math.min(1, Number(body.minScore) || 0));
-      const result = query ? await searchMemoriesForClient(query, 'all', Math.min(50, limit * 10), profile) : { memories: [] };
+      const configuredValue = Number(getMinimumCosine());
+      const configuredCutoff = Number.isFinite(configuredValue) ? Math.max(0, Math.min(1, configuredValue)) : 0.3;
+      const minScore = body.minScore == null ? configuredCutoff : Math.max(configuredCutoff, Math.max(0, Math.min(1, Number(body.minScore) || 0)));
+      const result = query ? await searchMemoriesForClient(query, 'all', Math.min(50, limit * 10), profile, { minScore }) : { memories: [] };
       const importer = await import('../src/lib/importers.mjs');
-      const safeMemories = (result.memories || []).filter((memory) => profile.allowedSources?.includes(memory.source) && String(memory.content || '').trim().length >= 25 && String(memory.title || '').trim().toLowerCase() !== String(memory.content || '').trim().toLowerCase() && !importer.isLogLikeChunk(String(memory.content || '')));
+      const safeMemories = (result.memories || []).filter((memory) => passesRelevanceGate(memory, minScore) && profile.allowedSources?.includes(memory.source) && String(memory.content || '').trim().length >= 25 && String(memory.title || '').trim().toLowerCase() !== String(memory.content || '').trim().toLowerCase() && !importer.isLogLikeChunk(String(memory.content || '')));
       const queryVector = typeof embedText === 'function' ? await embedText(query).catch(() => null) : null;
       const memories = await prepareSearchMemories({ query, memories: safeMemories, limit, excludeIds, getVector: getEmbeddingVector, queryVector, embedText, floor: 0.12 });
       emitRetrieved(memories.map((memory) => memory.id));

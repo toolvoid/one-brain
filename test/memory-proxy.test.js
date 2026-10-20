@@ -51,7 +51,7 @@ async function exerciseProxy({ dryRun, autoMemoryInjection = false, privateMemor
     },
     authenticateClientToken: () => ({ client: 'test-client' }),
     getClientProfile: () => ({ client: 'test-client', status: 'approved', allowedSources: ['codex'], auto_memory_injection: autoMemoryInjection }),
-    searchMemoriesForClient: async () => ({ memories: [{ id: 42, score: 1 }] }),
+    searchMemoriesForClient: async () => ({ memories: [{ id: 42, score: 1, vectorSimilarity: 0.9 }] }),
     getMemoryForClient: () => ({ memory: { id: 42, source: 'codex', title: 'Preference', content: privateMemory ? 'OB_PRIVATE_MARKER_PROXY must never leave One Brain.' : 'Prefers concise answers.', private: privateMemory } }),
     recordProxyEvent: (value) => { event = value; },
     addPendingMemory: async () => {},

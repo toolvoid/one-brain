@@ -77,7 +77,7 @@ async function withMock(run, { failModels = false, echoKey = false, titleFailure
     listenPort: 0, titleTimeoutMs,
     fetchImpl: globalThis.fetch,
     getClientProfile: () => ({ client: 'chat:openai', status: 'approved', allowedSources: ['codex'], write_source: 'claude' }),
-    searchMemoriesForClient: async () => ({ memories: [{ id: 1, score: 1 }, { id: 2, score: 0.9 }, { id: 3, score: 0.8 }] }),
+    searchMemoriesForClient: async () => ({ memories: [{ id: 1, score: 1, vectorSimilarity: 0.9 }, { id: 2, score: 0.9, vectorSimilarity: 0.8 }, { id: 3, score: 0.8, vectorSimilarity: 0.7 }] }),
     getMemoryForClient: (id, profile) => {
       const rows = {
         1: { id: 1, source: 'codex', title: 'Public allowed', content: 'synthetic allowed memory', private: false },

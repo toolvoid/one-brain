@@ -12,6 +12,7 @@ import { runLinkMutation } from './lib/link-actions.mjs';
 import { multilineKeyAction } from './lib/multiline-key-action.mjs';
 import { buildConnectionRows, summarizeConnectionHealth, createConnectAllPlan, runConfirmedConnectAll, defaultWriteSourceForClient, getWriteSourceReview } from './lib/connections-dashboard.mjs';
 import { PERFORMANCE_MODE_EVENT, readManualPerformanceMode, writeManualPerformanceMode } from './lib/graph-performance.mjs';
+import { calibrationCutoffs, recommendCutoff, rrfSweepConfigs } from './lib/evaluation-tuning.mjs';
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 const defaultWriteSource = (client) => defaultWriteSourceForClient(client) || 'codex';
@@ -89,7 +90,14 @@ function EvaluationPanel() {
   const [latestImportedRun, setLatestImportedRun] = useState(null);
   const [selectedDataset, setSelectedDataset] = useState('');
   const [includePrivate, setIncludePrivate] = useState(false);
-  const [runConfig, setRunConfig] = useState({ ftsWeight: 1, vectorWeight: 1, rrfK: 60, minScore: 0.015, topN: 10, chunkSize: 1200, chunkOverlap: 0 });
+  const [runConfig, setRunConfig] = useState({ ftsWeight: 1, vectorWeight: 1, rrfK: 60, minScore: 0.3, topN: 10, chunkSize: 1200, chunkOverlap: 0 });
+  const [calibrationRows, setCalibrationRows] = useState([]);
+  const [weightSweepRows, setWeightSweepRows] = useState([]);
+  const [verificationRun, setVerificationRun] = useState(null);
+  const [recommendedCutoff, setRecommendedCutoff] = useState(null);
+  const [qualityCandidates, setQualityCandidates] = useState([]);
+  const [reembedStatus, setReembedStatus] = useState({ state: 'idle', done: 0, total: 0, needsReembed: 0 });
+  const [reembedding, setReembedding] = useState(false);
 
   async function refresh() {
     const [nextCases, nextRecent, nextHistory, nextDatasets, nextRuns] = await Promise.all([
@@ -101,6 +109,40 @@ function EvaluationPanel() {
     setNotes(Object.fromEntries(nextHistory.map((run) => [run.id, run.note || ''])));
   }
   useEffect(() => { void refresh().catch((reason) => setError(reason.message || 'Could not load evaluation data.')); }, []);
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const [candidates, status] = await Promise.all([window.brain.listLowQualityCandidates(), window.brain.getReembedStatus()]);
+        if (active) { setQualityCandidates(candidates); setReembedStatus(status); }
+      } catch {}
+    };
+    void load();
+    const unsubscribe = window.brain.onEmbeddingStatus((status) => {
+      if (active && ['reembedding', 'paused', 'ready'].includes(status?.state)) setReembedStatus((current) => ({ ...current, ...status }));
+    });
+    return () => { active = false; unsubscribe?.(); };
+  }, []);
+
+  async function reloadQualityCandidates() {
+    setQualityCandidates(await window.brain.listLowQualityCandidates());
+  }
+  async function reviewQualityCandidate(id, action) {
+    try {
+      if (action === 'delete') await window.brain.deleteMemory(id);
+      else await window.brain.setMemoryLowQuality(id, action === 'demote');
+      await reloadQualityCandidates();
+    } catch (reason) { setError(reason.message || 'Could not update memory quality.'); }
+  }
+  async function reembedAll() {
+    setReembedding(true); setError('');
+    try {
+      const result = await window.brain.reembedAllMemories();
+      if (!result?.ok) throw new Error(result?.error || 'Re-embedding paused safely.');
+      setReembedStatus({ state: 'ready', ...result.result });
+    } catch (reason) { setError(reason.message || 'Could not re-embed memories.'); }
+    finally { setReembedding(false); }
+  }
 
   async function searchForExpected(nextQuery = lookupQuery) {
     const value = String(nextQuery || '').trim();
@@ -165,6 +207,51 @@ function EvaluationPanel() {
     catch (reason) { setError(reason.message || 'Evaluation run failed.'); }
     finally { setRunning(false); }
   }
+  async function calibrateCutoff() {
+    if (!selectedDataset) return;
+    setRunning(true); setError(''); setCalibrationRows([]);
+    try {
+      const rows = [];
+      for (const cutoff of calibrationCutoffs()) {
+        const run = await window.brain.runEvaluationDataset(Number(selectedDataset), { config: { ...runConfig, minScore: cutoff }, includePrivate });
+        rows.push({ cutoff, hit3: run.metrics.hit3, negativeFalsePositiveRate: run.metrics.negativeFalsePositiveRate, mrr: run.metrics.mrr });
+      }
+      const best = recommendCutoff(rows);
+      setCalibrationRows(rows); setRecommendedCutoff(best?.cutoff ?? null);
+      await refresh();
+    } catch (reason) { setError(reason.message || 'Could not calibrate the relevance cutoff.'); }
+    finally { setRunning(false); }
+  }
+  async function applyRecommendedCutoff() {
+    if (recommendedCutoff == null) return;
+    setRunning(true); setError('');
+    try {
+      const result = await window.brain.updateMemoryProxySettings({ minScore: recommendedCutoff });
+      if (result?.error) throw new Error(result.error);
+      setRunConfig((current) => ({ ...current, minScore: recommendedCutoff }));
+    } catch (reason) { setError(reason.message || 'Could not save the calibrated cutoff.'); }
+    finally { setRunning(false); }
+  }
+  async function sweepRrfWeights() {
+    if (!selectedDataset) return;
+    setRunning(true); setError(''); setWeightSweepRows([]); setVerificationRun(null);
+    try {
+      const rows = [];
+      for (const tuning of rrfSweepConfigs()) {
+        const run = await window.brain.runEvaluationDataset(Number(selectedDataset), { config: { ...runConfig, ...tuning }, includePrivate, questionTypes: ['direct', 'paraphrase'] });
+        rows.push({ ...tuning, hit3: run.metrics.hit3, mrr: run.metrics.mrr, count: run.metrics.positiveQuestions });
+      }
+      rows.sort((a, b) => b.hit3 - a.hit3 || b.mrr - a.mrr);
+      setWeightSweepRows(rows);
+      if (rows[0]) {
+        const bestConfig = { ...runConfig, ftsWeight: rows[0].ftsWeight, vectorWeight: rows[0].vectorWeight, rrfK: rows[0].rrfK };
+        setRunConfig(bestConfig);
+        setVerificationRun(await window.brain.runEvaluationDataset(Number(selectedDataset), { config: bestConfig, includePrivate, questionTypes: ['multi', 'negative'] }));
+      }
+      await refresh();
+    } catch (reason) { setError(reason.message || 'Could not sweep RRF settings.'); }
+    finally { setRunning(false); }
+  }
   function exportMetrics() {
     const columns = ['id','ts','datasetId','appVersion','hit1','hit3','hit5','mrr','negativeFalsePositiveRate','medianLatencyMs'];
     const csv = [columns.join(','), ...savedRuns.map((run) => {
@@ -182,6 +269,8 @@ function EvaluationPanel() {
     <header><h2>Retrieval evaluation</h2><button className="run-sql-button" type="button" onClick={() => void run()} disabled={running || cases.every((item) => item.stale)}>{running ? 'Running…' : 'Run evaluation'}</button></header>
     <p className="evaluation-help">Cases save only query text and expected memory IDs. Deleted expected memories are stale and skipped.</p>
     {error && <p className="sql-error" role="alert">{error}</p>}
+    <section className="evaluation-import"><header><h3>Embedding quality refresh</h3><button type="button" onClick={() => void reembedAll()} disabled={reembedding || reembedStatus.state === 'reembedding' || reembedStatus.needsReembed === 0}>{reembedding || reembedStatus.state === 'reembedding' ? 'Re-embedding…' : 'Re-embed title + content'}</button></header><p>New embeddings include the memory title. Work is staged in the encrypted DB, resumes from saved progress, and swaps atomically so the old index stays active until the new run completes.</p><p>{reembedStatus.state}: {reembedStatus.done || 0}/{reembedStatus.total || 0} · {reembedStatus.needsReembed || 0} need the new title + content format</p>{reembedStatus.total > 0 && <progress max={reembedStatus.total} value={reembedStatus.done || 0} />}</section>
+    <section className="evaluation-import"><header><h3>Low-quality memory review</h3><button type="button" onClick={() => void reloadQualityCandidates()}>Refresh</button></header><p>Titles only are shown here. Mark a candidate to demote it in retrieval, keep it to dismiss it, or delete it.</p>{qualityCandidates.length ? qualityCandidates.map((item) => <article className="evaluation-note" key={item.id}><strong>{item.title}</strong><small>{item.source}{item.lowQuality ? ' · demoted' : ''}</small><button type="button" onClick={() => void reviewQualityCandidate(item.id, 'keep')}>Keep</button><button type="button" onClick={() => void reviewQualityCandidate(item.id, 'demote')}>Demote</button><button type="button" className="evaluation-delete" onClick={() => void reviewQualityCandidate(item.id, 'delete')}>Delete</button></article>) : <p className="empty-note">No candidate memories need review.</p>}</section>
     <section className="evaluation-import"><h3>Import questions</h3><p className="evaluation-help">CSV columns: id, question, type, expected. Paste CSV or choose a file; validate and preview before saving. Negative rows leave expected empty.</p>
       <label>Dataset name<input value={importName} onChange={(event) => setImportName(event.target.value)} /></label>
       <label>Paste CSV<textarea rows="5" value={importText} onChange={(event) => setImportText(event.target.value)} /></label>
@@ -191,11 +280,15 @@ function EvaluationPanel() {
     <section className="evaluation-import"><header><h3>Run imported dataset</h3><button type="button" onClick={exportMetrics} disabled={!savedRuns.length}>Export metrics only</button></header>
       <label>Dataset<select value={selectedDataset} onChange={(event) => setSelectedDataset(event.target.value)}><option value="">Choose dataset</option>{datasets.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.questions} questions</option>)}</select></label>
       <label><input type="checkbox" checked={includePrivate} onChange={(event) => setIncludePrivate(event.target.checked)} /> Include private memories</label>
-      <details><summary>Temporary retrieval configuration</summary><p>These values apply only to this run. Chunk size and overlap are recorded for reproducibility; existing memories keep the chunk boundaries used when imported.</p><p>Embedding model: {latestImportedRun?.config?.model || 'Current configured model'}</p>{[['ftsWeight','FTS weight'],['vectorWeight','Vector weight'],['rrfK','RRF k'],['minScore','Minimum score'],['topN','Top N'],['chunkSize','Chunk size'],['chunkOverlap','Chunk overlap']].map(([key,label]) => <label key={key}>{label}<input type="number" min="0" step={key === 'minScore' || key.includes('Weight') ? '0.01' : '1'} value={runConfig[key]} onChange={(event) => setRunConfig((current) => ({ ...current, [key]: Number(event.target.value) }))} /></label>)}</details>
+      <details><summary>Temporary retrieval configuration</summary><p>These values apply only to this run. Chunk size and overlap are recorded for reproducibility; existing memories keep the chunk boundaries used when imported.</p><p>Embedding model: {latestImportedRun?.config?.model || 'Current configured model'}</p>{[['ftsWeight','FTS weight'],['vectorWeight','Vector weight'],['rrfK','RRF k'],['minScore','Minimum cosine relevance'],['topN','Top N'],['chunkSize','Chunk size'],['chunkOverlap','Chunk overlap']].map(([key,label]) => <label key={key}>{label}<input type="number" min="0" max={key === 'minScore' ? '1' : undefined} step={key === 'minScore' || key.includes('Weight') ? '0.01' : '1'} value={runConfig[key]} onChange={(event) => setRunConfig((current) => ({ ...current, [key]: Number(event.target.value) }))} /></label>)}</details>
       <button type="button" className="run-sql-button" onClick={() => void runImportedDataset()} disabled={running || !selectedDataset}>{running ? 'Running…' : 'Run dataset'}</button>
+      <div className="evaluation-add"><button type="button" onClick={() => void calibrateCutoff()} disabled={running || !selectedDataset}>{running ? 'Calibrating…' : 'Calibrate from evaluation'}</button><button type="button" onClick={() => void sweepRrfWeights()} disabled={running || !selectedDataset}>{running ? 'Sweeping…' : 'Sweep RRF weights and k'}</button></div>
+      {calibrationRows.length > 0 && <section className="evaluation-results"><h4>Relevance cutoff calibration</h4><p>Recommended by hit@3 minus negative false-positive rate: {recommendedCutoff?.toFixed(2)} cosine. Apply saves this cutoff for proxy injection.</p><div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>Cosine cutoff</th><th>Hit@3</th><th>Negative false-positive</th><th>MRR</th></tr></thead><tbody>{calibrationRows.map((row) => <tr key={row.cutoff}><td>{row.cutoff.toFixed(2)}{row.cutoff === recommendedCutoff ? ' · recommended' : ''}</td><td>{percent(row.hit3)}</td><td>{percent(row.negativeFalsePositiveRate)}</td><td>{row.mrr.toFixed(3)}</td></tr>)}</tbody></table></div><button type="button" onClick={() => void applyRecommendedCutoff()} disabled={running}>Apply recommended cutoff</button></section>}
+      {weightSweepRows.length > 0 && <section className="evaluation-results"><h4>RRF sweep · tuned on direct + paraphrase</h4><p>Small datasets can overfit. The best configuration is verified separately on multi + negative questions below.</p><div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>FTS weight</th><th>Vector weight</th><th>RRF k</th><th>Hit@3</th><th>MRR</th><th>Questions</th></tr></thead><tbody>{weightSweepRows.map((row, index) => <tr key={`${row.ftsWeight}-${row.vectorWeight}-${row.rrfK}`}><td>{row.ftsWeight}</td><td>{row.vectorWeight}</td><td>{row.rrfK}</td><td>{percent(row.hit3)}{index === 0 ? ' · best' : ''}</td><td>{row.mrr.toFixed(3)}</td><td>{row.count}</td></tr>)}</tbody></table></div></section>}
+      {verificationRun && <section className="evaluation-results"><h4>Held-out verification · multi + negative</h4><p>Hit@3 {percent(verificationRun.metrics.hit3)} · MRR {verificationRun.metrics.mrr.toFixed(3)} · negative false-positive {percent(verificationRun.metrics.negativeFalsePositiveRate)}</p></section>}
     </section>
     {savedRuns.length > 0 && <section className="evaluation-results"><h3>Imported dataset runs · newest first</h3><div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>Compare</th><th>Run</th><th>Dataset</th><th>Hit@1</th><th>Hit@3</th><th>Hit@5</th><th>MRR</th><th>Neg. false positives</th><th>Median ms</th><th>Δ MRR vs previous</th></tr></thead><tbody>{savedRuns.map((run) => <tr key={run.id}><td><input aria-label={`Select run ${run.id} for comparison`} type="checkbox" checked={selectedCompareIds.includes(run.id)} onChange={(event) => setSelectedCompareIds((current) => event.target.checked ? [...current, run.id].slice(-2) : current.filter((id) => id !== run.id))} /></td><td>{dateLabel(run.ts)}</td><td>{run.datasetName}</td><td>{percent(run.metrics.hit1)}</td><td>{percent(run.metrics.hit3)}</td><td>{percent(run.metrics.hit5)}</td><td>{Number(run.metrics.mrr).toFixed(3)}</td><td>{percent(run.metrics.negativeFalsePositiveRate)}</td><td>{Number(run.metrics.medianLatencyMs).toFixed(1)}</td><td>{run.delta ? delta(run.delta.mrr) : '—'}</td></tr>)}</tbody></table></div>{selectedCompareIds.length === 2 && (() => { const [older, newer] = [...selectedCompareIds].map((id) => savedRuns.find((run) => run.id === id)).filter(Boolean).sort((a,b) => a.id - b.id); if (!older || !newer) return null; return <section><h4>Compare runs: {older.datasetName} vs {newer.datasetName}</h4>{['hit1','hit3','hit5','mrr','negativeFalsePositiveRate','medianLatencyMs'].map((metric) => <p key={metric}>{metric}: {Number(older.metrics[metric] || 0).toFixed(3)} → {Number(newer.metrics[metric] || 0).toFixed(3)} · Δ {delta(Number(newer.metrics[metric] || 0) - Number(older.metrics[metric] || 0))}</p>)}</section>; })()}</section>}
-    {latestImportedRun && <section className="evaluation-results"><h3>Latest run · {latestImportedRun.datasetName}</h3><p>Hit@1 {percent(latestImportedRun.metrics.hit1)} · Hit@3 {percent(latestImportedRun.metrics.hit3)} · Hit@5 {percent(latestImportedRun.metrics.hit5)} · MRR {latestImportedRun.metrics.mrr.toFixed(3)} · Negative false-positive rate {percent(latestImportedRun.metrics.negativeFalsePositiveRate)} · median {latestImportedRun.metrics.medianLatencyMs.toFixed(1)} ms</p><h4>Per-type</h4><p>{Object.entries(latestImportedRun.byType).map(([type, metric]) => `${type}: ${type === 'negative' ? percent(metric.falsePositiveRate) : `hit@1 ${percent(metric.hit1)}, MRR ${metric.mrr.toFixed(3)}`}`).join(' · ')}</p><h4>Negative questions</h4>{latestImportedRun.records.filter((item) => item.type === 'negative').map((item) => <article key={item.id}><strong>{item.id} · top score {item.topScore.toFixed(4)} · crossed threshold {item.falsePositive ? 'yes' : 'no'}</strong><p>{item.question}</p></article>)}<h4>Failed questions · in-app only</h4>{latestImportedRun.failed.length ? latestImportedRun.failed.map((item) => <article key={item.id}><strong>{item.id} · {item.type} · rank {item.rank ?? '—'}</strong><p>{item.question}</p><small>Expected: {item.expectedTitle || 'None'} · returned: {item.returned.map((memory) => memory.title).join(' · ') || 'No results'}</small></article>) : <p className="empty-note">No failed questions.</p>}</section>}
+    {latestImportedRun && <section className="evaluation-results"><h3>Latest run · {latestImportedRun.datasetName}</h3><p>Hit@1 {percent(latestImportedRun.metrics.hit1)} · Hit@3 {percent(latestImportedRun.metrics.hit3)} · Hit@5 {percent(latestImportedRun.metrics.hit5)} · MRR {latestImportedRun.metrics.mrr.toFixed(3)} · Negative false-positive rate {percent(latestImportedRun.metrics.negativeFalsePositiveRate)} · median {latestImportedRun.metrics.medianLatencyMs.toFixed(1)} ms</p><h4>Per-type</h4><p>{Object.entries(latestImportedRun.byType).map(([type, metric]) => `${type}: ${type === 'negative' ? percent(metric.falsePositiveRate) : `hit@1 ${percent(metric.hit1)}, MRR ${metric.mrr.toFixed(3)}`}`).join(' · ')}</p><h4>Negative questions</h4>{latestImportedRun.records.filter((item) => item.type === 'negative').map((item) => <article key={item.id}><strong>{item.id} · top score {item.topScore.toFixed(4)} · crossed threshold {item.falsePositive ? 'yes' : 'no'}</strong><p>{item.question}</p></article>)}<h4>Failed questions · in-app only</h4>{latestImportedRun.failed.length ? latestImportedRun.failed.map((item) => <article key={item.id}><strong>{item.id} · {item.type} · rank {item.rank ?? '—'}</strong><p>{item.question}</p><small>Expected: {item.expectedTitle || 'None'} · returned: {item.returned.map((memory) => memory.title).join(' · ') || 'No results'}</small>{item.diagnostics && <small>Ranks: FTS {item.diagnostics.ftsRank ?? '—'} · vector {item.diagnostics.vectorRank ?? '—'} · hybrid {item.diagnostics.hybridRank ?? '—'} · expected cosine {item.diagnostics.cosineSimilarity == null ? '—' : item.diagnostics.cosineSimilarity.toFixed(3)}</small>}</article>) : <p className="empty-note">No failed questions.</p>}</section>}
     <div className="evaluation-add">
       <label>Query<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search query to evaluate" /></label>
       <button type="button" onClick={() => void searchForExpected(query, editingCase)} disabled={searching || !query.trim()}>{searching ? 'Searching…' : 'Search'}</button>
@@ -351,7 +444,7 @@ function ProviderKeysPanel({ clients }) {
     <label className="proxy-setting"><input type="checkbox" checked={settings.enabled} onChange={(event) => void update({ enabled: event.target.checked })} />Enabled</label>
     <label className="proxy-setting"><input type="checkbox" checked={settings.dryRun} onChange={(event) => void update({ dryRun: event.target.checked })} />Dry run (measure retrieval, send unchanged request)</label>
     <label className="proxy-setting">Maximum memories<input type="number" min="1" max="10" value={settings.count} onChange={(event) => void update({ count: event.target.value })} /></label>
-    <label className="proxy-setting">Minimum score<input type="number" min="0" max="1" step="0.05" value={settings.minScore} onChange={(event) => void update({ minScore: event.target.value })} /></label>
+    <label className="proxy-setting">Minimum cosine relevance<input type="number" min="0" max="1" step="0.05" value={settings.minScore} onChange={(event) => void update({ minScore: event.target.value })} /></label>
     <h3>Save-back review (off by default)</h3>
     <label className="proxy-setting">Cheap model<input value={settings.saveBackModel || ''} onChange={(event) => setSettings((value) => ({ ...value, saveBackModel: event.target.value }))} onBlur={() => void update({ saveBackModel: settings.saveBackModel })} /></label>
     {clients.filter((client) => client.verified).map((client) => <label className="proxy-setting" key={client.client}><input type="checkbox" checked={Boolean(settings.saveBackClients?.[client.client])} onChange={(event) => void update({ saveBackClients: { [client.client]: event.target.checked } })} />Allow save-back candidates for {client.client}</label>)}
@@ -902,12 +995,12 @@ function normalizeImportedContent(content) {
   return String(content || '').normalize('NFKC').replace(/\r\n?/g, '\n').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
-function importItemsWithFilters(allItems, { skipLogs = true, smart = false } = {}) {
+function importItemsWithFilters(allItems, { skipLogs = true, smart = false, byHeadings = false } = {}) {
   const sourceItems = Array.isArray(allItems) ? allItems : [];
   const logSkipped = sourceItems.filter((item) => isLogLikeChunk(item.content)).length;
   let items = skipLogs ? sourceItems.filter((item) => !isLogLikeChunk(item.content)) : sourceItems;
   let smartDropped = 0;
-  if (smart && globalThis.OneBrainSmartSave?.prepareSmartSave) {
+  if (smart && !byHeadings && globalThis.OneBrainSmartSave?.prepareSmartSave) {
     const result = globalThis.OneBrainSmartSave.prepareSmartSave(items.map((item, index) => ({ id: String(index), role: 'user', text: item.content })), { importance: 'Normal' });
     const kept = new Set(result.kept.map((item) => Number(item.id)));
     smartDropped = result.droppedCount;
@@ -962,6 +1055,7 @@ function App() {
   const [importText, setImportText] = useState('');
   const [importSmart, setImportSmart] = useState(false);
   const [importChunkSize, setImportChunkSize] = useState(1200);
+  const [importSplitMode, setImportSplitMode] = useState('auto');
   const [includeAssistant, setIncludeAssistant] = useState(false);
   const [skipLogText, setSkipLogText] = useState(true);
   const [conversationPartCount, setConversationPartCount] = useState(0);
@@ -1568,13 +1662,14 @@ function App() {
       const pasted = importText.trim();
       if (!pasted && !importFile) throw new Error('Choose a file or paste conversation text first.');
       const fileName = pasted ? 'Pasted text.txt' : importFile.name;
-      const parsed = pasted ? parseImportText(importText, fileName, includeAssistant, skipLogText, importChunkSize) : await parseImportFile(importFile, includeAssistant, skipLogText, importChunkSize);
+      const parsed = pasted ? parseImportText(importText, fileName, includeAssistant, skipLogText, importChunkSize, importSplitMode) : await parseImportFile(importFile, includeAssistant, skipLogText, importChunkSize, importSplitMode);
       if (parsed.error) throw new Error(parsed.error);
+      if (parsed.splitMode) setImportSplitMode(parsed.splitMode);
       const detectedSource = parsed.detectedSource || inferImportSource(fileName);
       const effectiveSource = SOURCES.includes(detectedSource) ? detectedSource : importSource;
       if (effectiveSource !== importSource) setImportSource(effectiveSource);
       const allItems = parsed.allItems || parsed.items;
-      const filtered = importItemsWithFilters(allItems, { skipLogs: skipLogText, smart: importSmart });
+      const filtered = importItemsWithFilters(allItems, { skipLogs: skipLogText, smart: importSmart, byHeadings: parsed.splitMode === 'headings' });
       const items = filtered.items.map((item) => ({ ...item, source: effectiveSource }));
       setImportParsed({ ...parsed, detectedSource, items, allItems: allItems.map((item) => ({ ...item, source: effectiveSource })), logSkipped: filtered.logSkipped, smartDropped: filtered.smartDropped, total: items.length });
       setConfirmLargeImport(false);
@@ -1589,7 +1684,7 @@ function App() {
     setSkipLogText(checked);
     setImportParsed((current) => {
       if (!current?.allItems) return current;
-      const filtered = importItemsWithFilters(current.allItems, { skipLogs: checked, smart: importSmart });
+      const filtered = importItemsWithFilters(current.allItems, { skipLogs: checked, smart: importSmart, byHeadings: current.splitMode === 'headings' });
       return { ...current, items: filtered.items, total: filtered.items.length, logSkipped: filtered.logSkipped, smartDropped: filtered.smartDropped };
     });
   }
@@ -1882,18 +1977,20 @@ function App() {
             <label>Conversation file<input type="file" accept=".json,.txt,.md,.zip,application/json,text/plain,text/markdown,application/zip" onChange={(event) => { setImportFile(event.target.files?.[0] || null); setImportText(''); setImportParsed(null); setImportSummary(''); setImportError(''); setConfirmLargeImport(false); }} /></label>
             <label className="import-check"><input type="checkbox" checked={includeAssistant} onChange={(event) => { setIncludeAssistant(event.target.checked); setImportParsed(null); setConfirmLargeImport(false); }} />Include assistant replies</label>
             <label className="import-check"><input type="checkbox" checked={skipLogText} onChange={(event) => { toggleSkipLogText(event.target.checked); setConfirmLargeImport(false); }} />Skip terminal/log text</label>
-            <label className="import-check"><input type="checkbox" checked={importSmart} onChange={(event) => { const checked = event.target.checked; setImportSmart(checked); setImportParsed((current) => { if (!current?.allItems) return current; const filtered = importItemsWithFilters(current.allItems, { skipLogs: skipLogText, smart: checked }); return { ...current, items: filtered.items.map((item) => ({ ...item, source: importSource })), total: filtered.items.length, logSkipped: filtered.logSkipped, smartDropped: filtered.smartDropped }; }); }} />Apply Smart mode filters</label>
+            <label className="import-check"><input type="checkbox" checked={importSmart} onChange={(event) => { const checked = event.target.checked; setImportSmart(checked); setImportParsed((current) => { if (!current?.allItems) return current; const filtered = importItemsWithFilters(current.allItems, { skipLogs: skipLogText, smart: checked, byHeadings: current.splitMode === 'headings' }); return { ...current, items: filtered.items.map((item) => ({ ...item, source: importSource })), total: filtered.items.length, logSkipped: filtered.logSkipped, smartDropped: filtered.smartDropped }; }); }} />Apply Smart mode filters</label>
+            <label>Split<select value={importSplitMode} onChange={(event) => { setImportSplitMode(event.target.value); setImportParsed(null); setConfirmLargeImport(false); }}><option value="auto">Automatic (suggest headings for Markdown)</option><option value="default">Existing split behavior</option><option value="headings">By headings (Markdown ## / #)</option></select></label>
             <label>Split size<select value={importChunkSize} onChange={(event) => { setImportChunkSize(Number(event.target.value)); setImportParsed(null); setConfirmLargeImport(false); }}><option value="1200">Up to 1,200 characters</option><option value="600">Up to 600 characters</option></select></label>
             <label>Or paste raw text<textarea rows="4" placeholder="Paste conversation text here..." value={importText} onChange={(event) => { setImportText(event.target.value); if (event.target.value) setImportFile(null); setImportParsed(null); setImportSummary(''); setConfirmLargeImport(false); }} /></label>
             {importParsed && <section className="import-preview">
               <strong>Preview</strong>
               {importParsed.detectedSource && <p>Detected source: {importParsed.detectedSource} · change Target source above to override.</p>}
               {skipLogText && importParsed.logSkipped > 0 && <p>{importParsed.logSkipped} chunks look like logs and will be skipped</p>}
-              {importSmart && <p>Smart mode dropped {importParsed.smartDropped || 0} low-importance chunks.</p>}
+              {importSmart && <p>{importParsed.splitMode === 'headings' ? 'Smart mode keeps every non-empty heading section.' : `Smart mode dropped ${importParsed.smartDropped || 0} low-importance chunks.`}</p>}
               <p>{importParsed.total} chunks after skipping · {importDuplicateCount} look like duplicates</p>
+              {importParsed.splitMode === 'headings' && <><p>By headings: {importParsed.total} planned memories · titles (first 10)</p><ol>{importParsed.items.slice(0, 10).map((item, index) => <li key={`heading-${index}`}><b>{item.title}</b></li>)}</ol></>}
               {importParsed.rawTotal > 1500 && <label className="large-import-check"><input type="checkbox" checked={confirmLargeImport} onChange={(event) => setConfirmLargeImport(event.target.checked)} />I understand this is a large import</label>}
               {importParsed.capped && <p className="import-warning">Import is capped at {MAX_IMPORT_ITEMS.toLocaleString()} chunks; only the first {MAX_IMPORT_ITEMS.toLocaleString()} will be imported.</p>}
-              <ol>{importParsed.items.slice(0, 5).map((item, index) => <li key={`${item.title}-${index}`}><b>{item.title}</b><small>{item.content.replace(/\s+/g, ' ').slice(0, 120)}</small></li>)}</ol>
+              {importParsed.splitMode !== 'headings' && <ol>{importParsed.items.slice(0, 5).map((item, index) => <li key={`${item.title}-${index}`}><b>{item.title}</b><small>{item.content.replace(/\s+/g, ' ').slice(0, 120)}</small></li>)}</ol>}
             </section>}
             {importError && <p className="import-error" role="alert">{importError}</p>}
             {importSummary && <p className="import-summary" role="status">{importSummary}</p>}

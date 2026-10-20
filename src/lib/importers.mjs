@@ -49,7 +49,7 @@ function splitLongParagraph(paragraph, maxChars = MAX_CHUNK_LENGTH) {
   return pieces;
 }
 
-function chunkText(text, maxChars = MAX_CHUNK_LENGTH) {
+function chunkText(text, maxChars = MAX_CHUNK_LENGTH, preserveShort = false) {
   const limit = Math.max(MIN_CHUNK_LENGTH, Math.min(MAX_CHUNK_LENGTH, Math.floor(Number(maxChars) || MAX_CHUNK_LENGTH)));
   const paragraphs = String(text || '').replace(/\r\n?/g, '\n').split(/\n\s*\n+/).map((part) => part.trim()).filter(Boolean);
   const chunks = [];
@@ -63,7 +63,49 @@ function chunkText(text, maxChars = MAX_CHUNK_LENGTH) {
     }
   }
   if (current) chunks.push(current);
-  return chunks.filter((chunk) => chunk.trim().length >= MIN_CHUNK_LENGTH);
+  return chunks.filter((chunk) => preserveShort ? Boolean(chunk.trim()) : chunk.trim().length >= MIN_CHUNK_LENGTH);
+}
+
+function markdownHeadingMatch(line) { return String(line || '').match(/^#{1,2}[ \t]+(.+?)\s*#*\s*$/); }
+
+export function hasMarkdownHeadings(text) {
+  return String(text || '').replace(/\r\n?/g, '\n').split('\n').some((line) => markdownHeadingMatch(line));
+}
+
+function splitMarkdownHeadings(text, fallbackTitle, maxChars) {
+  const lines = String(text || '').replace(/\r\n?/g, '\n').split('\n');
+  const sections = [];
+  let current = null;
+  let headingCount = 0;
+  for (const line of lines) {
+    const match = markdownHeadingMatch(line);
+    if (match) {
+      if (current) sections.push(current);
+      current = { title: match[1].trim(), lines: [] };
+      headingCount += 1;
+    } else if (current) current.lines.push(line);
+  }
+  if (current) sections.push(current);
+  if (!headingCount) return null;
+
+  const preamble = [];
+  for (const line of lines) {
+    if (markdownHeadingMatch(line)) break;
+    preamble.push(line);
+  }
+  const chunksForSection = ({ title, body }) => {
+    const chunks = chunkText(body, maxChars, true);
+    if (!chunks.length) return [];
+    return chunks.map((content, index) => ({
+      title: chunks.length > 1 ? `${title} (part ${index + 1})` : title,
+      content
+    }));
+  };
+  const items = [];
+  const preambleText = preamble.join('\n').trim();
+  if (preambleText) items.push(...chunksForSection({ title: fallbackTitle, body: preambleText }));
+  for (const section of sections) items.push(...chunksForSection({ title: section.title, body: section.lines.join('\n').trim() }));
+  return { items: items.slice(0, MAX_IMPORT_ITEMS), total: items.length, recognized: false, capped: items.length > MAX_IMPORT_ITEMS, splitMode: 'headings' };
 }
 
 function messageRole(message) {
@@ -205,7 +247,7 @@ function filterPlainTranscript(text, includeAssistant) {
   }).map(({ line }) => line).join('\n').trim();
 }
 
-export function parseImportText(rawText, fileName = 'Imported text', includeAssistant = false, skipLogText = true, maxChars = MAX_CHUNK_LENGTH) {
+export function parseImportText(rawText, fileName = 'Imported text', includeAssistant = false, skipLogText = true, maxChars = MAX_CHUNK_LENGTH, splitMode = 'auto') {
   const text = String(rawText || '');
   const fallbackTitle = String(fileName).replace(/\\/g, '/').split('/').pop().replace(/\.(json|txt|md)$/i, '').trim() || 'Imported text';
   const isPlainText = /\.(txt|md)$/i.test(fileName);
@@ -219,13 +261,18 @@ export function parseImportText(rawText, fileName = 'Imported text', includeAssi
     return { items: [], total: 0, recognized: false, capped: false, error: 'Unrecognized JSON format', errorType: 'unsupported-json' };
   }
   if (!isPlainText) return { items: [], total: 0, recognized: false, capped: false, error: 'Choose a .json, .txt, or .md file.' };
+  const shouldSplitByHeadings = splitMode === 'headings' || (splitMode === 'auto' && /\.md$/i.test(fileName) && hasMarkdownHeadings(text));
+  if (shouldSplitByHeadings) {
+    const parsed = splitMarkdownHeadings(text, fallbackTitle, maxChars);
+    if (parsed) return { ...applyLogFilter(parsed, skipLogText), detectedSource: inferImportSource(fileName) };
+  }
   const transcript = filterPlainTranscript(text, includeAssistant);
   const chunks = chunkText(transcript, maxChars);
   const items = chunks.slice(0, MAX_IMPORT_ITEMS).map((content, index) => ({
     title: chunks.length > 1 ? `${fallbackTitle} (part ${index + 1}/${chunks.length})` : fallbackTitle,
     content
   }));
-  return { ...applyLogFilter({ items, total: chunks.length, recognized: false, capped: chunks.length > MAX_IMPORT_ITEMS }, skipLogText), detectedSource: inferImportSource(fileName) };
+  return { ...applyLogFilter({ items, total: chunks.length, recognized: false, capped: chunks.length > MAX_IMPORT_ITEMS, splitMode: 'default' }, skipLogText), detectedSource: inferImportSource(fileName) };
 }
 
 function htmlToPlainText(html) {
@@ -268,7 +315,7 @@ async function zipEntries(buffer) {
   return entries;
 }
 
-export async function parseImportFile(file, includeAssistant = false, skipLogText = true, maxChars = MAX_CHUNK_LENGTH) {
+export async function parseImportFile(file, includeAssistant = false, skipLogText = true, maxChars = MAX_CHUNK_LENGTH, splitMode = 'auto') {
   const name = String(file?.name || '');
   if (/\.zip$/i.test(name)) {
     try {
@@ -277,7 +324,7 @@ export async function parseImportFile(file, includeAssistant = false, skipLogTex
       for (const entry of entries) {
         const text = /\.html?$/i.test(entry.name) ? htmlToPlainText(entry.text) : entry.text;
         const fileName = entry.name.replace(/\.html?$/i, '.txt');
-        const parsed = parseImportText(text, fileName, includeAssistant, skipLogText, maxChars);
+        const parsed = parseImportText(text, fileName, includeAssistant, skipLogText, maxChars, splitMode);
         if (parsed.error) {
           if (parsed.errorType === 'invalid-json') throw new Error(parsed.error);
           if (/conversation|chat|export|takeout/i.test(entry.name)) throw new Error(parsed.error);
@@ -291,11 +338,12 @@ export async function parseImportFile(file, includeAssistant = false, skipLogTex
         rawTotal: parsedEntries.reduce((sum, parsed) => sum + (parsed.rawTotal ?? parsed.total), 0),
         logSkipped: parsedEntries.reduce((sum, parsed) => sum + parsed.logSkipped, 0), recognized: true,
         capped: parsedEntries.some((parsed) => parsed.capped) || parsedEntries.reduce((sum, parsed) => sum + parsed.total, 0) > MAX_IMPORT_ITEMS,
+        splitMode: parsedEntries.some((parsed) => parsed.splitMode === 'headings') ? 'headings' : 'default',
         detectedSource: inferImportSource(name) || entries.map((entry) => inferImportSource(entry.name)).find(Boolean) || parsedEntries.map((parsed) => parsed.detectedSource).find(Boolean) || null };
     } catch (error) { return { items: [], total: 0, recognized: false, capped: false, error: error.message || 'Could not read this ZIP archive.' }; }
   }
   if (typeof file?.text !== 'function') return { items: [], total: 0, recognized: false, capped: false, error: 'Choose a .json, .txt, .md, or .zip file.' };
-  return parseImportText(await file.text(), name, includeAssistant, skipLogText, maxChars);
+  return parseImportText(await file.text(), name, includeAssistant, skipLogText, maxChars, splitMode);
 }
 
 export { MAX_IMPORT_ITEMS, MAX_CHUNK_LENGTH, MIN_CHUNK_LENGTH, LOG_LINE_RATIO, isLogLikeChunk, chunkText, inferImportSource, filterPlainTranscript };

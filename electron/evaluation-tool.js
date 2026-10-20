@@ -1,7 +1,7 @@
 'use strict';
 
 const QUESTION_TYPES = Object.freeze(['direct', 'paraphrase', 'multi', 'negative']);
-const DEFAULT_EVALUATION_CONFIG = Object.freeze({ ftsWeight: 1, vectorWeight: 1, rrfK: 60, minScore: 0.015, topN: 10, chunkSize: 1200, chunkOverlap: 0 });
+const DEFAULT_EVALUATION_CONFIG = Object.freeze({ ftsWeight: 1, vectorWeight: 1, rrfK: 60, minScore: 0.3, topN: 10, chunkSize: 1200, chunkOverlap: 0 });
 
 function parseCsv(text) {
   const rows = [];
@@ -81,7 +81,7 @@ function scores(ranks) {
     mrr: ranks.reduce((sum, rank) => sum + (rank ? 1 / rank : 0), 0) / count };
 }
 
-async function runEvaluationQuestions(questions, search, { config: rawConfig = {}, includePrivate = false } = {}) {
+async function runEvaluationQuestions(questions, search, { config: rawConfig = {}, includePrivate = false, diagnose = null } = {}) {
   const config = normalizeEvaluationConfig(rawConfig);
   const records = [];
   for (const question of questions) {
@@ -91,9 +91,11 @@ async function runEvaluationQuestions(questions, search, { config: rawConfig = {
     if (!includePrivate) returned = returned.filter((item) => !item.private);
     const expectedIds = new Set((question.expectedIds || []).map(Number));
     const rankIndex = expectedIds.size ? returned.findIndex((item) => expectedIds.has(Number(item.id))) : -1;
+    const diagnostics = typeof diagnose === 'function' ? await diagnose(question, { config, includePrivate, hybrid: returned }) : null;
     records.push({ id: question.id, question: question.question, type: question.type,
       rank: rankIndex < 0 ? null : rankIndex + 1, topScore: Number(returned[0]?.score) || 0,
-      falsePositive: question.type === 'negative' && Number(returned[0]?.score || 0) >= config.minScore,
+      falsePositive: question.type === 'negative' && returned.some((item) => Number(item.relevanceScore ?? item.cosineSimilarity ?? item.score) >= config.minScore),
+      diagnostics,
       latencyMs, expectedTitle: (question.expectedTitles || []).join('; ') || '',
       returned: returned.slice(0, 3).map((item) => ({ id: Number(item.id), title: String(item.title || 'Untitled') })) });
   }

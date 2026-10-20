@@ -4,6 +4,7 @@ const { app, powerMonitor } = require('electron');
 const path = require('path');
 const os = require('node:os');
 const { createPerformanceMetrics } = require('./performance-metrics');
+const { processDisplayName } = require('./process-display-name');
 const { parseEvaluationCsv } = require('./evaluation-tool');
 const fs = require('node:fs');
 const { createLifecycleLog, instrumentAppExitCalls } = require('./lifecycle-log');
@@ -86,6 +87,7 @@ const { initializeDatabase, getDatabaseStatus, getRuntimeDatabaseStats, setPerfo
 setPerformanceRecorder((name, duration) => performanceMetrics.record(name, duration));
 const { startMcpServer } = require('./mcp-server');
 const { createEmbedder } = require('./embedder');
+const { createLazyEmbedder } = require('./embedder-idle');
 const connectors = require('./connectors');
 const { createClientToken, ensureClientToken, revokeClientTokenFile, tokenPath } = require('./client-tokens');
 const { registerSecurityIpc, registerUnlockIpc } = require('./security-ipc');
@@ -104,6 +106,7 @@ const { createKeepUnlockedWindow } = require('./keep-unlocked');
 const { attachSystemLockEvents } = require('./system-lock');
 const { createSecuritySettings } = require('./security-settings');
 const { deleteOldBackups: deleteOldBackupFiles, hasOldBackups } = require('./private-files');
+const { setMemoryLowQuality, listLowQualityCandidates, reembedStatus, reembedAllMemories } = require('./db');
 
 let mcpConnection;
 let memoryProxy;
@@ -111,8 +114,7 @@ let proxyConnection;
 let gracefulShutdownComplete = false;
 let gracefulShutdownPromise = null;
 let extensionApi;
-let embedder;
-let embedderGeneration = 0;
+let embedderManager;
 let embeddingStatus = { state: 'loading' };
 const performanceMetrics = createPerformanceMetrics({ limit: 100 });
 const appStartedAt = Date.now();
@@ -406,7 +408,7 @@ ipcMain.handle('quick-context:update-settings', (_event, patch = {}) => {
 });
 ipcMain.handle('quick-context:search', async (_event, query) => prepareQuickContext({ query, searchMemories, getMemory,
   getVector: getMemoryEmbeddingVector,
-  embedText: (text) => embedder?.embed(text) || Promise.reject(new Error('Local embedder is unavailable.')) }));
+  embedText: (text) => embedderManager?.embed(text) || Promise.reject(new Error('Local embedder is unavailable.')) }));
 ipcMain.handle('quick-context:copy', (_event, memories) => {
   const safe = (Array.isArray(memories) ? memories : []).slice(0, 5).map((item) => ({ source: String(item?.source || ''), title: String(item?.title || '').slice(0, 160), snippet: String(item?.snippet || '').slice(0, 350), selected: item?.selected !== false, private: Boolean(item?.private), no_suggest: Boolean(item?.no_suggest) }));
   const block = buildQuickContextBlock(safe);
@@ -423,8 +425,8 @@ function publishEmbeddingStatus(status) {
 }
 
 function configureReadyEmbedder(status) {
-  configureEmbeddingProvider(embedder.embed, status.model, {
-    onProgress: ({ done, total }) => publishEmbeddingStatus({ state: total > done ? 'indexing' : 'ready', done, total, model: status.model, fallback: status.fallback }),
+  configureEmbeddingProvider((text) => embedderManager.embed(text), status.model, {
+    onProgress: ({ done, total, state, reembedNeeded }) => publishEmbeddingStatus({ state: state || (total > done ? 'indexing' : reembedNeeded ? 'needs-reembed' : 'ready'), done, total, reembedNeeded, model: status.model, fallback: status.fallback }),
     onLinksChanged: (change = {}) => {
       for (const win of BrowserWindow.getAllWindows()) {
         if (!win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.send('brain:changed', { type: 'semantic-links', ...change });
@@ -435,12 +437,14 @@ function configureReadyEmbedder(status) {
 }
 
 function startEmbedder() {
-  const generation = ++embedderGeneration;
-  embedder = createEmbedder(app.getPath('userData'), (status) => {
-    if (generation !== embedderGeneration) return;
-    if (status.state === 'ready') configureReadyEmbedder(status);
-    else publishEmbeddingStatus(status);
+  if (!embedderManager) embedderManager = createLazyEmbedder({
+    createWorker: (onStatus) => createEmbedder(app.getPath('userData'), onStatus),
+    onStatus: (status) => {
+      if (status.state === 'ready') configureReadyEmbedder(status);
+      else publishEmbeddingStatus(status);
+    },
   });
+  return embedderManager.ensureLoaded().catch((error) => publishEmbeddingStatus({ state: 'error', message: String(error?.message || 'Local embedding model failed to load.').slice(0, 200) }));
 }
 
 ipcMain.handle('memories:add', (_event, memory) => addMemory(memory, { handAdded: true }));
@@ -534,13 +538,23 @@ ipcMain.handle('connectors:disconnect', (_event, client) => {
 ipcMain.handle('connectors:snippet', (_event, client) => connectors.snippetFor(client, connectorAppPath(), connectorEnvironment()));
 ipcMain.handle('embeddings:status', () => embeddingStatus);
 ipcMain.handle('embeddings:retry', async () => {
-  ++embedderGeneration;
-  const previous = embedder;
-  embedder = null;
+  const previous = embedderManager;
+  embedderManager = null;
   try { await previous?.close(); } catch {}
   startEmbedder();
   return true;
 });
+ipcMain.handle('embeddings:reembed', async () => {
+  try {
+    const result = await reembedAllMemories((progress) => {
+      for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.send('brain:embedding-status', progress);
+    });
+    return { ok: true, result };
+  } catch (error) { return { ok: false, error: String(error?.message || 'Re-embedding paused safely.').slice(0, 240) }; }
+});
+ipcMain.handle('embeddings:reembed-status', () => reembedStatus());
+ipcMain.handle('evaluation:low-quality-candidates', () => listLowQualityCandidates());
+ipcMain.handle('evaluation:set-low-quality', (_event, id, lowQuality) => setMemoryLowQuality(id, lowQuality));
 ipcMain.handle('database:status', () => getDatabaseStatus());
 ipcMain.handle('security:status', () => {
   const settings = securitySettings.read();
@@ -633,7 +647,7 @@ ipcMain.on('status:graph-frame', (event, milliseconds) => {
 });
 ipcMain.handle('status:runtime', () => {
   const appMetrics = app.getAppMetrics().map((item) => ({
-    name: item.type === 'Browser' ? 'Main' : item.type === 'Tab' ? `Renderer ${item.id}` : item.type === 'GPU' ? 'GPU' : `${item.type || 'Process'} ${item.id}`,
+    name: processDisplayName(item),
     type: item.type || 'unknown', pid: item.pid,
     cpuPercent: Number(item.cpu?.percentCPUUsage) || 0,
     workingSetMB: Number(item.memory?.workingSetSize) ? Number(item.memory.workingSetSize) / 1024 : null,
@@ -804,9 +818,8 @@ app.whenReady().then(async () => {
   lockController.configure({
     verifyPassword: async (password) => { try { return verifyMasterPassword(userDataPath, password); } catch { return false; } },
     onLock: (reason, details) => {
-      ++embedderGeneration;
-      const previous = embedder;
-      embedder = null;
+      const previous = embedderManager;
+      embedderManager = null;
       publishEmbeddingStatus({ state: 'idle-unloaded' });
       try { void previous?.close(); } catch {}
       lockDatabase();
@@ -876,8 +889,9 @@ app.whenReady().then(async () => {
     revokeToken: (client) => revokeClientTokenFile(userDataPath, client, revokeClientToken),
     isTokenActive: (client) => listClientTokenStates().some((item) => item.client === client && !item.revoked),
     searchMemoriesForClient, getMemoryForClient, getMemoryEmbeddingVector, setMemoryNoSuggest,
+    getMinimumCosine: () => memoryProxy?.publicSettings().minScore ?? 0.3,
     createImport, importMemories, finishImport, getExtensionChatSave, undoExtensionChatSave,
-    embedText: (text) => embedder?.embed(text) || Promise.reject(new Error('Local embedder is unavailable.')),
+    embedText: (text) => embedderManager?.embed(text) || Promise.reject(new Error('Local embedder is unavailable.')),
     addMemory, recordProxyEvent: recordDashboardEvent,
     emitRetrieved: (ids) => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:retrieved', ids); },
     emitAdded: (id) => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:changed', { type: 'add', id }); },
@@ -907,8 +921,8 @@ app.whenReady().then(async () => {
     onSpawn: logChildProcessSpawn,
     onAuthFailure: () => recordSecurityEvent('auth_failed'),
     onActivity: () => autoLockMonitor?.touchActivity(), beginActivity: () => autoLockMonitor?.beginActivity(),
-    searchMemoriesForClient, getEmbeddingVector: getMemoryEmbeddingVector,
-    embedText: (text) => embedder?.embed(text) || Promise.reject(new Error('Local embedder is unavailable.')),
+    searchMemoriesForClient: (query, source, limit, profile) => searchMemoriesForClient(query, source, limit, profile, { minScore: memoryProxy?.publicSettings().minScore ?? 0.3 }), getEmbeddingVector: getMemoryEmbeddingVector,
+    embedText: (text) => embedderManager?.embed(text) || Promise.reject(new Error('Local embedder is unavailable.')),
     listMemories, addMemory, connectionActivity,
     onClientCall: (client, ok, reason = '') => {
       if (!ok && lockController.isLocked()) return;
@@ -956,9 +970,9 @@ function requestGracefulQuit() {
   if (gracefulShutdownComplete) return { ok: true };
   if (!gracefulShutdownPromise) {
     gracefulShutdownPromise = (async () => {
-      const closingEmbedder = embedder;
+      const closingEmbedder = embedderManager;
       // Detach first so the lock hook cannot start a second worker shutdown.
-      embedder = null;
+      embedderManager = null;
       globalShortcut.unregisterAll();
       clearInterval(passwordLockoutTimer);
       if (graphicsStabilityTimer) clearTimeout(graphicsStabilityTimer);
@@ -979,7 +993,7 @@ function requestGracefulQuit() {
           new Promise((resolve) => setTimeout(resolve, 2000)),
         ]);
       }
-      embedder = null;
+      embedderManager = null;
       quickContextTray?.destroy();
       quickContextTray = null;
       cleanupSensitiveTemps(userDataRoot);
