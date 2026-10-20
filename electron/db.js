@@ -844,6 +844,137 @@ async function exportEncryptedRecoveryFile(userDataPath, destinationPath, passwo
   }
 }
 
+function changeMasterPassword(userDataPath, oldPassword, newPassword) {
+  ensureWritable();
+  if (typeof newPassword !== 'string' || newPassword.length < 12) throw new Error('Use a master password with at least 12 characters.');
+  const vaultPath = path.join(userDataPath, 'db.vault.json');
+  const key = readVault(vaultPath, oldPassword);
+  const nextVaultPath = path.join(userDataPath, `.db.vault.${randomBytes(8).toString('hex')}.tmp`);
+  let backupPath;
+  try {
+    if (databaseKey && !timingSafeEqual(key, databaseKey)) throw new Error('Wrong current password.');
+    const currentCounts = databaseCounts(getDatabase());
+    const verifiedCurrent = openEncrypted(path.join(userDataPath, 'onebrain.db'), key, { readonly: true, fileMustExist: true });
+    try { if (JSON.stringify(databaseCounts(verifiedCurrent)) !== JSON.stringify(currentCounts)) throw new Error('Current password verification failed.'); }
+    finally { verifiedCurrent.close(); }
+
+    const backupRoot = path.join(userDataPath, 'migration-backups');
+    fs.mkdirSync(backupRoot, { recursive: true, mode: 0o700 });
+    backupPath = path.join(backupRoot, `password-change-${new Date().toISOString().replaceAll(':', '-').replaceAll('.', '-')}`);
+    fs.mkdirSync(backupPath, { mode: 0o700 });
+    fs.copyFileSync(vaultPath, path.join(backupPath, 'db.vault.json'), fs.constants.COPYFILE_EXCL);
+    fs.chmodSync(path.join(backupPath, 'db.vault.json'), 0o600);
+
+    writeVault(nextVaultPath, key, newPassword);
+    const nextKey = readVault(nextVaultPath, newPassword);
+    try {
+      if (!timingSafeEqual(nextKey, key)) throw new Error('New password verification failed.');
+      const reopened = openEncrypted(path.join(userDataPath, 'onebrain.db'), nextKey, { readonly: true, fileMustExist: true });
+      try { if (JSON.stringify(databaseCounts(reopened)) !== JSON.stringify(currentCounts)) throw new Error('New password verification failed: row counts differ.'); }
+      finally { reopened.close(); }
+      fs.renameSync(nextVaultPath, vaultPath);
+      if (!verifyMasterPassword(userDataPath, newPassword)) throw new Error('New password could not reopen the database.');
+    } finally { nextKey.fill(0); }
+    return { backupPath };
+  } catch (error) {
+    try { fs.rmSync(nextVaultPath, { force: true }); } catch {}
+    if (backupPath && fs.existsSync(path.join(backupPath, 'db.vault.json'))) {
+      try { fs.copyFileSync(path.join(backupPath, 'db.vault.json'), vaultPath); fs.chmodSync(vaultPath, 0o600); } catch {}
+    }
+    throw error;
+  } finally { key.fill(0); }
+}
+
+async function restoreEncryptedRecoveryFile(userDataPath, recoveryPath, password) {
+  ensureWritable();
+  const recovery = JSON.parse(fs.readFileSync(recoveryPath, 'utf8'));
+  if (recovery?.format !== 'one-brain-encrypted-recovery-v1' || typeof recovery.database !== 'string' || !recovery.vault) throw new Error('This is not a valid One Brain encrypted recovery file.');
+  const nextKey = unwrapDatabaseKey(recovery.vault, password);
+  const workDir = fs.mkdtempSync(path.join(userDataPath, '.recovery-restore-'));
+  fs.chmodSync(workDir, 0o700);
+  const dbPath = path.join(userDataPath, 'onebrain.db');
+  const vaultPath = path.join(userDataPath, 'db.vault.json');
+  const pendingDbPath = path.join(workDir, 'onebrain.db');
+  const pendingVaultPath = path.join(workDir, 'db.vault.json');
+  const rollbackDbPath = path.join(workDir, 'onebrain.previous.db');
+  const rollbackVaultPath = path.join(workDir, 'db.vault.previous.json');
+  const oldKey = databaseKey ? Buffer.from(databaseKey) : null;
+  let backedUp = false, swappedDb = false, swappedVault = false, installedDb = false, installedVault = false;
+  let backupPath;
+  try {
+    const dbBytes = Buffer.from(recovery.database, 'base64');
+    if (!dbBytes.length) throw new Error('The recovery file contains no database.');
+    fs.writeFileSync(pendingDbPath, dbBytes, { mode: 0o600, flag: 'wx' });
+    fs.writeFileSync(pendingVaultPath, `${JSON.stringify(recovery.vault)}\n`, { mode: 0o600, flag: 'wx' });
+    const imported = openEncrypted(pendingDbPath, nextKey, { readonly: true, fileMustExist: true });
+    let importedCounts;
+    try {
+      importedCounts = databaseCounts(imported);
+      imported.prepare('SELECT count(*) FROM memories').get();
+      if (!findFtsResult(imported)) throw new Error('Recovery verification failed: search verification failed.');
+    } finally { imported.close(); }
+
+    const current = getDatabase();
+    const checkpoint = current.pragma('wal_checkpoint(TRUNCATE)')[0];
+    if (checkpoint?.busy) throw new Error('Database is busy; recovery restore stopped.');
+    const backupRoot = path.join(userDataPath, 'migration-backups');
+    fs.mkdirSync(backupRoot, { recursive: true, mode: 0o700 });
+    backupPath = path.join(backupRoot, `recovery-restore-${new Date().toISOString().replaceAll(':', '-').replaceAll('.', '-')}`);
+    fs.mkdirSync(backupPath, { mode: 0o700 });
+    fs.copyFileSync(dbPath, path.join(backupPath, 'onebrain.db'), fs.constants.COPYFILE_EXCL);
+    fs.chmodSync(path.join(backupPath, 'onebrain.db'), 0o600);
+    if (fs.existsSync(vaultPath)) {
+      fs.copyFileSync(vaultPath, path.join(backupPath, 'db.vault.json'), fs.constants.COPYFILE_EXCL);
+      fs.chmodSync(path.join(backupPath, 'db.vault.json'), 0o600);
+    }
+    const oldKeyBackup = path.join(userDataPath, 'db.key.bak');
+    if (fs.existsSync(oldKeyBackup)) {
+      fs.copyFileSync(oldKeyBackup, path.join(backupPath, 'db.key.bak'), fs.constants.COPYFILE_EXCL);
+      fs.chmodSync(path.join(backupPath, 'db.key.bak'), 0o600);
+    }
+    backedUp = true;
+    if (database?.open) database.close();
+    database = null;
+    databaseSchemaReady = false;
+    fs.renameSync(dbPath, rollbackDbPath); swappedDb = true;
+    if (fs.existsSync(vaultPath)) { fs.renameSync(vaultPath, rollbackVaultPath); swappedVault = true; }
+    fs.renameSync(pendingDbPath, dbPath); installedDb = true;
+    fs.renameSync(pendingVaultPath, vaultPath); installedVault = true;
+    database = openEncrypted(dbPath, nextKey);
+    if (JSON.stringify(databaseCounts(database)) !== JSON.stringify(importedCounts)) throw new Error('Restored database row counts do not match the recovery file.');
+    databaseKey?.fill(0);
+    databaseKey = Buffer.from(nextKey);
+    databasePath = dbPath;
+    databaseSchemaReady = false;
+    cachesLoaded = false;
+    vectorCache = new Map(); memoryCache = new Map();
+    setDatabaseStatus('ready', true);
+    getDatabase();
+    return { backupPath, counts: importedCounts };
+  } catch (error) {
+    if (database?.open) { try { database.close(); } catch {} }
+    database = null;
+    if (installedDb) { try { fs.rmSync(dbPath, { force: true }); } catch {} }
+    if (installedVault) { try { fs.rmSync(vaultPath, { force: true }); } catch {} }
+    if (swappedDb && fs.existsSync(rollbackDbPath)) { try { fs.renameSync(rollbackDbPath, dbPath); } catch {} }
+    if (swappedVault && fs.existsSync(rollbackVaultPath)) { try { fs.renameSync(rollbackVaultPath, vaultPath); } catch {} }
+    if (backedUp && backupPath && !fs.existsSync(dbPath)) {
+      try { fs.copyFileSync(path.join(backupPath, 'onebrain.db'), dbPath); } catch {}
+      try { if (!fs.existsSync(vaultPath) && fs.existsSync(path.join(backupPath, 'db.vault.json'))) fs.copyFileSync(path.join(backupPath, 'db.vault.json'), vaultPath); } catch {}
+    }
+    if (oldKey) {
+      databaseKey = Buffer.from(oldKey);
+      try { database = openEncrypted(dbPath, oldKey); setDatabaseStatus('ready', true); getDatabase(); }
+      catch { setDatabaseStatus('error', false, 'Recovery restore failed and the previous database could not be reopened.'); }
+    }
+    throw error;
+  } finally {
+    oldKey?.fill(0);
+    nextKey.fill(0);
+    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
 function normalizeContent(content) {
   return String(content || '').normalize('NFKC').replace(/\r\n?/g, '\n').replace(/\s+/g, ' ').trim().toLowerCase();
 }
@@ -2071,3 +2202,5 @@ module.exports.migrateDatabaseToPassword = migrateDatabaseToPassword;
 module.exports.verifyMasterPassword = verifyMasterPassword;
 module.exports.unlockDatabaseWithPassword = unlockDatabaseWithPassword;
 module.exports.exportEncryptedRecoveryFile = exportEncryptedRecoveryFile;
+module.exports.changeMasterPassword = changeMasterPassword;
+module.exports.restoreEncryptedRecoveryFile = restoreEncryptedRecoveryFile;

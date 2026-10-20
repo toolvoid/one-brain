@@ -11,7 +11,7 @@ function reduceHealth(previous = initialHealth(), event = {}) {
   if (event.type === 'disconnect' || event.type === 'revoke') state.configValid = false;
   const evidence = { ts: event.ts || new Date().toISOString(), generation: Number(state.token_generation || 0) };
   if (event.type === 'success') { state.last_success = evidence; state.last_failure = null; }
-  if (event.type === 'failure') state.last_failure = { ...evidence, reason: String(event.reason || 'request_failed') };
+  if (event.type === 'failure' || event.type === 'locked') state.last_failure = { ...evidence, reason: event.type === 'locked' ? 'locked' : String(event.reason || 'request_failed') };
   if (event.type === 'probe') {
     state.probe = { ts: evidence.ts, duration: Number(event.duration) || 0, ok: Boolean(event.ok), reason: String(event.reason || '') };
     if (event.ok) state.last_failure = null;
@@ -20,13 +20,16 @@ function reduceHealth(previous = initialHealth(), event = {}) {
   return state;
 }
 
-function getHealthStatus(state = initialHealth(), { neutral, installed = true, configValid = state.configValid, now = Date.now(), recentMs = 5 * 60_000 } = {}) {
+function getHealthStatus(state = initialHealth(), { neutral, installed = true, configValid = state.configValid, locked = false, now = Date.now(), recentMs = 5 * 60_000 } = {}) {
   if (neutral && NEUTRAL.has(neutral)) return neutral;
   if (state.rate_limited) return 'busy';
   if (!installed) return 'not_installed';
   if (!configValid) return 'not_set_up';
+  if (locked) return 'locked';
   const success = state.last_success;
-  const failure = state.last_failure;
+  // A lock failure describes temporary vault state, not client health. Once
+  // unlocked, resume the last real connection state.
+  const failure = state.last_failure?.reason === 'locked' ? null : state.last_failure;
   const probe = state.probe;
   if (failure && failure.generation === state.token_generation && (!success || Date.parse(failure.ts) > Date.parse(success.ts)) && (!probe?.ok || Date.parse(failure.ts) > Date.parse(probe.ts))) return 'failing';
   if (success && success.generation === state.token_generation) return 'healthy';

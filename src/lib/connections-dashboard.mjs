@@ -22,7 +22,7 @@ export function getWriteSourceReview(client, writeSource) {
 const healthyStatuses = new Set(['Connected', 'Paired', 'Healthy']);
 const byId = (list, key, id) => list.find((item) => item[key] === id);
 
-export function buildConnectionRows({ mcp = [], clients = [], extensions = [], providers = {}, quickContext = {}, activity = [], counts: activityCounts = {}, selectors = {} } = {}) {
+export function buildConnectionRows({ mcp = [], clients = [], extensions = [], providers = {}, quickContext = {}, activity = [], counts: activityCounts = {}, selectors = {}, vaultLocked = false } = {}) {
   const rows = CONNECTION_DEFINITIONS.map((definition) => {
     let status = 'Not connected', reason = 'Not connected yet.', last = null;
     let composerUnavailable = false;
@@ -34,6 +34,7 @@ export function buildConnectionRows({ mcp = [], clients = [], extensions = [], p
       else if (item.tokenStatus === 'revoked') { status = 'Not connected'; reason = 'The client token was revoked.'; }
       else if (profile?.status === 'blocked') { status = 'Broken'; reason = 'This client is blocked in One Brain.'; }
       else if (profile?.status === 'pending') { status = 'Broken'; reason = 'Approve this MCP client in Connect AI settings.'; }
+      else if (item.healthStatus === 'locked' || vaultLocked) { status = 'Locked'; reason = 'Unlock One Brain to resume this connection.'; }
       else if (item.healthStatus === 'failing') { status = 'Failing'; reason = item.health?.last_failure?.reason || 'The last MCP call failed.'; }
       else if (item.healthStatus === 'needs_restart') { status = 'Needs restart'; reason = `Restart ${definition.name} to finish connecting the MCP bridge.`; }
       else if (item.healthStatus === 'healthy') { status = 'Connected'; reason = 'MCP bridge call succeeded with the current token.'; last = item.health?.last_success?.ts || null; }
@@ -52,9 +53,10 @@ export function buildConnectionRows({ mcp = [], clients = [], extensions = [], p
         composerUnavailable = hasEvidence && !composerMatched && (matched.composer !== undefined || matched.input !== undefined);
       const latestUse = activity.filter((event) => event.client === definition.name && ['search', 'save'].includes(event.action)).sort((a, b) => Date.parse(b.time) - Date.parse(a.time));
       const newestSuccess = latestUse.find((event) => event.ok);
-      const newestFailure = latestUse.find((event) => !event.ok);
+      const newestFailure = latestUse.find((event) => !event.ok && event.reason !== 'locked');
       const successfulUseIsCurrent = newestSuccess && (!newestFailure || Date.parse(newestSuccess.time) >= Date.parse(newestFailure.time));
-      if (!item?.paired) { status = 'Not paired'; reason = 'Pair this site from the browser extension.'; }
+      if (vaultLocked) { status = 'Locked'; reason = 'Unlock One Brain to resume this connection.'; }
+      else if (!item?.paired) { status = 'Not paired'; reason = 'Pair this site from the browser extension.'; }
       else if (item.status !== 'approved') { status = 'Needs approval'; reason = 'Approve this extension client in One Brain.'; }
       else {
         const expectedBuild = String(item.buildId || h.buildId || '');
@@ -77,7 +79,7 @@ export function buildConnectionRows({ mcp = [], clients = [], extensions = [], p
       status = quickContext.enabled && quickContext.registered ? 'Connected' : 'Not connected';
       reason = quickContext.enabled && quickContext.registered ? `Quick context hotkey ${quickContext.shortcut || 'enabled'}.` : 'Enable the Quick context hotkey in settings.';
     } else {
-      const lastProviderChange = activity.find((event) => event.client === definition.name && ['test', 'connect', 'disconnect'].includes(event.action));
+      const lastProviderChange = activity.find((event) => event.client === definition.name && ['test', 'connect', 'disconnect'].includes(event.action) && event.reason !== 'locked');
       const test = lastProviderChange?.action === 'test' ? lastProviderChange : null;
       const keyStatus = providers.providerKeyStatus || providers;
       const configured = Boolean(keyStatus[definition.provider]);
@@ -85,6 +87,7 @@ export function buildConnectionRows({ mcp = [], clients = [], extensions = [], p
       reason = !configured ? 'Provider key is missing.' : test ? (test.ok ? 'Key set; last test passed.' : `Key set; last test failed${test.reason ? `: ${test.reason}` : '.'}`) : 'Provider key is set; test it to verify access.';
       last = test?.time || null;
     }
+    if (vaultLocked && !definition.manual) { status = 'Locked'; reason = 'Unlock One Brain to resume this connection.'; }
     const events = activity.filter((event) => event.client === definition.name);
     const latest = events[0];
     const counts = activityCounts[definition.name] || { searches: events.filter((event) => event.action === 'search' && event.time?.startsWith(new Date().toISOString().slice(0, 10))).length,
@@ -108,7 +111,7 @@ export function buildConnectionRows({ mcp = [], clients = [], extensions = [], p
     const recentUseEvents = events.filter((event) => ['search', 'save'].includes(event.action)).sort((a, b) => Date.parse(b.time) - Date.parse(a.time));
     const lastSuccessEvent = recentUseEvents.find((event) => event.ok), lastFailureEvent = recentUseEvents.find((event) => !event.ok);
     const hasCurrentSuccess = lastSuccessEvent && (!lastFailureEvent || Date.parse(lastSuccessEvent.time) >= Date.parse(lastFailureEvent.time));
-    const healthStatus = definition.type.includes('MCP') ? (status === 'Broken' || status === 'Failing' ? 'failing' : sourceHealth === 'not_set_up' && status === 'Connected' ? 'healthy' : sourceHealth === 'not_set_up' && status === 'Needs restart' ? 'needs_restart' : sourceHealth) : definition.manual ? 'manual_only' : definition.type === 'Web via extension' ? (status === 'Not checked' || status === 'Not paired' ? 'not_set_up' : status === 'Degraded' ? (hasCurrentSuccess ? 'healthy' : 'degraded') : status === 'Busy (rate limited)' ? 'busy' : status === 'Needs approval' ? 'needs_approval' : ['Broken', 'Failing'].includes(status) ? 'failing' : 'healthy') : (['Broken', 'Failing'].includes(status) ? 'failing' : status === 'Connected' ? 'healthy' : 'not_set_up');
+    const healthStatus = status === 'Locked' ? 'locked' : definition.type.includes('MCP') ? (status === 'Broken' || status === 'Failing' ? 'failing' : sourceHealth === 'not_set_up' && status === 'Connected' ? 'healthy' : sourceHealth === 'not_set_up' && status === 'Needs restart' ? 'needs_restart' : sourceHealth) : definition.manual ? 'manual_only' : definition.type === 'Web via extension' ? (status === 'Not checked' || status === 'Not paired' ? 'not_set_up' : status === 'Degraded' ? (hasCurrentSuccess ? 'healthy' : 'degraded') : status === 'Busy (rate limited)' ? 'busy' : status === 'Needs approval' ? 'needs_approval' : ['Broken', 'Failing'].includes(status) ? 'failing' : 'healthy') : (['Broken', 'Failing'].includes(status) ? 'failing' : status === 'Connected' ? 'healthy' : 'not_set_up');
     const lastSuccessfulUse = events.find((event) => ['search', 'save'].includes(event.action) && event.ok);
     const healthDetails = ext ? { pingAt: ext.health?.pingAt || null, tokenValid: Boolean(ext.paired), approval: ext.status || 'pending', expectedOrigin: ext.health?.expectedOrigin || ext.origin || null,
       receivedOrigin: ext.health?.receivedOrigin || null, apiVersion: ext.health?.apiVersion || ext.apiVersion || null, apiCompatible: ext.health?.apiCompatible ?? ext.apiCompatible ?? null,

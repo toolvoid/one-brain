@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { createMemoryProxy } = require('../electron/memory-proxy');
+const lockController = require('../electron/lock-controller');
 
 const MESSAGE_KEYS = new Set(['role', 'content', 'name', 'tool_calls', 'tool_call_id']);
 const INTERNAL_KEYS = new Set(['tokens', 'memoryCount']);
@@ -100,3 +101,36 @@ async function exerciseProxy({ dryRun }) {
 
 test('injected request uses only provider-supported message fields', async () => exerciseProxy({ dryRun: false }));
 test('dry run keeps injection metadata local and sends the request unchanged', async () => exerciseProxy({ dryRun: true }));
+
+test('locking during an upstream request aborts it and returns 423 without crashing', async () => {
+  lockController.resetForTest();
+  lockController.configure({ verifyPassword: async () => true });
+  const userDataPath = fs.mkdtempSync(path.join(os.tmpdir(), 'one-brain-proxy-lock-test-'));
+  let announceUpstream;
+  const upstreamStarted = new Promise((resolve) => { announceUpstream = resolve; });
+  const proxy = createMemoryProxy({ userDataPath,
+    safeStorage: { isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'test', encryptString: (value) => Buffer.from(value), decryptString: (value) => value.toString() },
+    authenticateClientToken: () => ({ client: 'test-client' }), getClientProfile: () => ({ client: 'test-client', status: 'approved', allowedSources: ['codex'] }),
+    searchMemoriesForClient: async () => ({ memories: [] }), recordProxyEvent: () => {}, providerUrls: { openai: 'http://mock-upstream' },
+    fetchImpl: (_url, init) => new Promise((_resolve, reject) => { announceUpstream(); init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true }); })
+  });
+  proxy.saveKey('openai', 'test-key');
+  const { server, port } = await proxy.start();
+  try {
+    const responsePromise = new Promise((resolve, reject) => {
+      const request = http.request({ hostname: '127.0.0.1', port, path: '/v1/openai/chat/completions', method: 'POST',
+        headers: { Authorization: `Bearer ${'a'.repeat(64)}`, 'Content-Type': 'application/json' } }, resolve);
+      request.on('error', reject); request.end(JSON.stringify({ model: 'mock', messages: [{ role: 'user', content: 'hello' }] }));
+    });
+    await upstreamStarted;
+    lockController.lock('manual');
+    const response = await responsePromise;
+    const body = await new Promise((resolve) => { let text = ''; response.on('data', (chunk) => { text += chunk; }); response.on('end', () => resolve(text)); });
+    assert.equal(response.statusCode, 423);
+    assert.equal(JSON.parse(body).code, 'ONE_BRAIN_LOCKED');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    lockController.resetForTest();
+    fs.rmSync(userDataPath, { recursive: true, force: true });
+  }
+});

@@ -6,6 +6,10 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { wrapDatabaseKey, unwrapDatabaseKey, writeVault, readVault, lockState } = require('../electron/security-vault');
+const { createAutoLockMonitor } = require('../electron/auto-lock');
+const { attachSystemLockEvents } = require('../electron/system-lock');
+const { EventEmitter } = require('node:events');
+const lockController = require('../electron/lock-controller');
 
 test('password vault wraps a random database key and rejects the wrong password', () => {
   const databaseKey = Buffer.alloc(32, 71);
@@ -38,4 +42,36 @@ test('idle lock blocks guarded access until unlock', () => {
   assert.throws(() => state.assertUnlocked(), (error) => error.code === 'ONE_BRAIN_LOCKED');
   state.unlock();
   assert.doesNotThrow(() => state.assertUnlocked());
+});
+
+test('auto-lock checks the selected timeout and Never disables the timer lock', () => {
+  let tick, idleSeconds = 0, timeout = 1;
+  const reasons = [];
+  const monitor = createAutoLockMonitor({ getSystemIdleSeconds: () => idleSeconds, getTimeoutMinutes: () => timeout,
+    lock: (reason) => { reasons.push(reason); return true; }, setIntervalImpl: (callback) => { tick = callback; return 1; }, clearIntervalImpl: () => {} });
+  idleSeconds = 59; tick(); assert.deepEqual(reasons, []);
+  idleSeconds = 60; tick(); assert.deepEqual(reasons, ['idle']);
+  timeout = 0; idleSeconds = 3600; tick(); assert.deepEqual(reasons, ['idle']);
+  monitor.stop();
+});
+
+test('manual Lock now records manual reason and enters locked state', () => {
+  lockController.resetForTest();
+  const reasons = [];
+  lockController.configure({ onLock: (reason) => reasons.push(reason) });
+  try {
+    assert.equal(lockController.lock('manual'), true);
+    assert.equal(lockController.isLocked(), true);
+    assert.deepEqual(reasons, ['manual']);
+  } finally { lockController.resetForTest(); }
+});
+
+test('system suspend and screen lock trigger the suspend lock reason', () => {
+  const monitor = new EventEmitter(), reasons = [];
+  const detach = attachSystemLockEvents(monitor, (reason) => reasons.push(reason));
+  monitor.emit('suspend'); monitor.emit('lock-screen');
+  assert.deepEqual(reasons, ['suspend', 'suspend']);
+  detach();
+  monitor.emit('suspend');
+  assert.deepEqual(reasons, ['suspend', 'suspend']);
 });

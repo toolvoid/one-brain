@@ -20,8 +20,10 @@ function registerSecurityIpc(ipcMain, {
   getMainWindow,
   dialog,
   migrateDatabaseToPassword,
+  changeMasterPassword,
   verifyMasterPassword,
   exportEncryptedRecoveryFile,
+  restoreEncryptedRecoveryFile,
   logFailure = () => {},
 }) {
   ipcMain.handle('security:has-master-password', async () => {
@@ -40,6 +42,17 @@ function registerSecurityIpc(ipcMain, {
     } catch (error) {
       const safe = safeError(error);
       try { logFailure({ operation: 'set_password', ...safe }); } catch {}
+      return { ok: false, error: safe.message };
+    }
+  });
+
+  ipcMain.handle('security:change-master-password', async (_event, oldPassword, newPassword) => {
+    try {
+      const result = await changeMasterPassword(getUserDataPath(), oldPassword, newPassword);
+      return { ok: true, error: null, ...result };
+    } catch (error) {
+      const safe = safeError(error);
+      try { logFailure({ operation: 'change_password', ...safe }); } catch {}
       return { ok: false, error: safe.message };
     }
   });
@@ -69,6 +82,23 @@ function registerSecurityIpc(ipcMain, {
       return { ok: false, error: safe.message };
     }
   });
+
+  ipcMain.handle('security:restore-recovery', async (_event, password) => {
+    try {
+      const result = await dialog.showOpenDialog(getMainWindow(), {
+        title: 'Restore encrypted One Brain backup',
+        properties: ['openFile'],
+        filters: [{ name: 'One Brain recovery', extensions: ['obr'] }],
+      });
+      if (result.canceled || !result.filePaths?.[0]) return { ok: false, error: 'Recovery restore canceled.', canceled: true };
+      const restored = await restoreEncryptedRecoveryFile(getUserDataPath(), result.filePaths[0], password);
+      return { ok: true, error: null, ...restored };
+    } catch (error) {
+      const safe = safeError(error);
+      try { logFailure({ operation: 'restore_recovery', ...safe }); } catch {}
+      return { ok: false, error: safe.message };
+    }
+  });
 }
 
 function registerUnlockIpc(ipcMain, {
@@ -77,6 +107,7 @@ function registerUnlockIpc(ipcMain, {
   notifyUnlocked = () => {},
   delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   failureDelayMs = 1000,
+  onLockNow = () => {},
 }) {
   let failures = 0;
   ipcMain.handle('security:startup-state', async () => ({ ok: true, error: null, locked: lockController.isLocked() }));
@@ -93,6 +124,10 @@ function registerUnlockIpc(ipcMain, {
     try { logEvent('vault_unlocked'); } catch {}
     try { notifyUnlocked(); } catch {}
     return { ok: true, error: null };
+  });
+  ipcMain.handle('security:lock-now', async () => {
+    try { return { ok: true, error: null, locked: Boolean(onLockNow()) }; }
+    catch { return { ok: false, error: 'Could not lock One Brain.', locked: false }; }
   });
 }
 

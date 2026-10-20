@@ -117,6 +117,8 @@ function createMemoryProxy(options) {
     providerUrls = PROVIDER_URLS, searchTimeoutMs = 800, titleTimeoutMs = 3000, listenPort = null, extensionApi = null } = options;
   const settingsPath = path.join(userDataPath, 'memory-proxy-settings.json');
   const keysPath = path.join(userDataPath, 'provider-keys.enc');
+  const inFlightUpstream = new Set();
+  lockController.onLocked(() => { for (const controller of inFlightUpstream) controller.abort(); });
   const readSettings = () => ({ ...DEFAULT_SETTINGS, ...safeReadJson(settingsPath, {}) });
   const readKeys = () => safeReadJson(keysPath, {});
   const savedKey = (provider) => {
@@ -295,6 +297,7 @@ function createMemoryProxy(options) {
       for await (const chunk of req) { size += chunk.length; if (size > 8 * 1024 * 1024) { logRejected('request_too_large'); return sendJson(res, 413, { error: 'Request body is too large.' }); } chunks.push(chunk); }
       rawBody = Buffer.concat(chunks).toString('utf8');
     } catch { logRejected('invalid_request_body'); return sendJson(res, 400, { error: 'Invalid request body.' }); }
+    if (lockController.isLocked()) { logRejected('ONE_BRAIN_LOCKED'); return sendJson(res, 423, { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' }); }
     let body;
     try { body = JSON.parse(rawBody); } catch { logRejected('invalid_json'); return sendJson(res, 400, { error: 'Request body must be JSON.' }); }
     if (!body || typeof body !== 'object' || Array.isArray(body) || !Array.isArray(body.messages)) { logRejected('messages_required'); return sendJson(res, 400, { error: 'Request must contain a messages array.' }); }
@@ -306,6 +309,7 @@ function createMemoryProxy(options) {
       try {
         const query = requestQuery(body.messages);
         memories = await selectMemories(query, profile, cfg);
+        if (lockController.isLocked()) { logRejected('ONE_BRAIN_LOCKED'); return sendJson(res, 423, { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' }); }
         if (memories.length) {
           const preview = appendMemoryMessage(body, memories, 1500);
           memories = memories.slice(0, preview.memoryCount);
@@ -317,10 +321,14 @@ function createMemoryProxy(options) {
     const saveBackOn = Boolean(cfg.saveBackClients?.[identity.client]) && Boolean(key);
     const stream = body.stream === true;
     let status = null, ok = false, errorCode = injectionError;
+    const abortController = new AbortController();
+    inFlightUpstream.add(abortController);
     try {
+      if (lockController.isLocked()) { logRejected('ONE_BRAIN_LOCKED'); return sendJson(res, 423, { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' }); }
       const upstream = await fetchImpl(`${providerUrls[provider]}/chat/completions`, {
-        method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': req.headers['content-type'] || 'application/json' }, body: JSON.stringify(actualBody)
+        method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': req.headers['content-type'] || 'application/json' }, body: JSON.stringify(actualBody), signal: abortController.signal
       });
+      if (lockController.isLocked()) { logRejected('ONE_BRAIN_LOCKED'); return sendJson(res, 423, { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' }); }
       status = upstream.status; ok = upstream.ok;
       const headers = {};
       for (const name of ['content-type', 'cache-control', 'x-request-id']) if (upstream.headers.get(name)) headers[name] = upstream.headers.get(name);
@@ -340,8 +348,9 @@ function createMemoryProxy(options) {
           try { const data = JSON.parse(output.toString('utf8')); const answer = data.choices?.[0]?.message?.content; if (typeof answer === 'string') void saveBack(provider, key, identity.client, body.messages, answer, cfg.saveBackModel, { titleModel: body.model, source: PROVIDER_SOURCES[provider] || null }); } catch {}
         }
       }
-    } catch { errorCode = 'upstream_unreachable'; if (!res.headersSent) sendJson(res, 502, { error: 'Provider request failed.' }); else res.destroy(); }
+    } catch { errorCode = lockController.isLocked() ? 'ONE_BRAIN_LOCKED' : 'upstream_unreachable'; if (!res.headersSent) sendJson(res, lockController.isLocked() ? 423 : 502, lockController.isLocked() ? { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' } : { error: 'Provider request failed.' }); else res.destroy(); }
     finally {
+      inFlightUpstream.delete(abortController);
       recordProxyEvent({ client: identity.client, provider, memories_injected: memories.length, estimated_tokens_added: tokensAdded, latency_ms: Date.now() - started, upstream_status: status, ok, error: errorCode || null }, dryRun ? [] : memories.map((memory) => memory.id));
     }
   }

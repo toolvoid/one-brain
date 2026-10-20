@@ -1,4 +1,4 @@
-const { app } = require('electron');
+const { app, powerMonitor } = require('electron');
 const path = require('path');
 const fs = require('node:fs');
 const { createLifecycleLog, instrumentAppExitCalls } = require('./lifecycle-log');
@@ -43,7 +43,10 @@ const { createConnectionActivity } = require('./connection-activity');
 const { initialHealth, reduceHealth, getHealthStatus } = require('./connection-health');
 const lockController = require('./lock-controller');
 const { lockDatabase } = require('./db');
-const { migrateDatabaseToPassword, verifyMasterPassword, unlockDatabaseWithPassword, exportEncryptedRecoveryFile } = require('./db');
+const { migrateDatabaseToPassword, verifyMasterPassword, unlockDatabaseWithPassword, exportEncryptedRecoveryFile, changeMasterPassword, restoreEncryptedRecoveryFile } = require('./db');
+const { createAutoLockMonitor } = require('./auto-lock');
+const { attachSystemLockEvents } = require('./system-lock');
+const { createSecuritySettings } = require('./security-settings');
 
 let mcpConnection;
 let memoryProxy;
@@ -62,6 +65,10 @@ let mainWindow = null;
 let recoveryPageShown = false;
 const mainWindowCrashLimiter = createCrashLoopLimiter({ maxRestarts: 3, windowMs: 60_000 });
 const pendingReloads = new WeakSet();
+const securitySettings = createSecuritySettings(app.getPath('userData'));
+let autoLockMonitor = null;
+let detachSystemLockEvents = () => {};
+const lockIfVaultConfigured = (reason) => fs.existsSync(path.join(app.getPath('userData'), 'db.vault.json')) && lockController.lock(reason);
 
 function logChildProcessSpawn(command) { lifecycleLog.append('child_process_spawn', { command }); }
 
@@ -308,7 +315,7 @@ ipcMain.handle('memories:count-by-source', () => countBySource());
 ipcMain.handle('mcp:config', () => mcpConnection ? { endpoint: mcpConnection.config.endpoint, port: mcpConnection.config.port } : null);
 ipcMain.handle('connectors:list', () => connectors.discoverClients(app.getPath('home'), connectorAppPath(), listClients(), getConnectorTokenStates(), connectorEnvironment()).map((item) => {
   const state = getConnectionHealthState(item.id) || initialHealth();
-  return { ...item, health: state, healthStatus: item.status === 'not found' ? 'not_installed' : getHealthStatus(state, { installed: true, configValid: Boolean(item.tokenStatus === 'active' && !item.configError) }) };
+  return { ...item, health: state, healthStatus: item.status === 'not found' ? 'not_installed' : getHealthStatus(state, { installed: true, locked: lockController.isLocked(), configValid: Boolean(item.tokenStatus === 'active' && !item.configError) }) };
 }));
 ipcMain.handle('connections:activity', (_event, client) => connectionActivity?.list(String(client || '').slice(0, 120)) || []);
 ipcMain.handle('connections:counts', () => Object.fromEntries(require('./connection-activity').CLIENTS.map((client) => [client, connectionActivity?.counts(client) || { searches: 0, saves: 0 }])));
@@ -378,20 +385,33 @@ ipcMain.handle('embeddings:retry', async () => {
   return true;
 });
 ipcMain.handle('database:status', () => getDatabaseStatus());
+ipcMain.handle('security:status', () => {
+  const settings = securitySettings.read();
+  let backend = 'unknown';
+  try { backend = safeStorage.getSelectedStorageBackend?.() || (safeStorage.isEncryptionAvailable() ? 'safeStorage' : 'basic_text'); } catch { backend = 'unavailable'; }
+  return { ok: true, error: null, locked: lockController.isLocked(), vaultSet: fs.existsSync(path.join(app.getPath('userData'), 'db.vault.json')), backend, lastUnlockAt: settings.lastUnlockAt, autoLockMinutes: settings.autoLockMinutes };
+});
+ipcMain.handle('security:set-auto-lock', (_event, minutes) => {
+  try { return { ok: true, error: null, ...securitySettings.write({ autoLockMinutes: Number(minutes) }) }; }
+  catch (error) { return { ok: false, error: error?.message || 'Could not save auto-lock setting.' }; }
+});
 registerSecurityIpc(ipcMain, {
   getUserDataPath: () => app.getPath('userData'),
   getHomePath: () => app.getPath('home'),
   getMainWindow: () => mainWindow,
   dialog,
   migrateDatabaseToPassword,
+  changeMasterPassword,
   verifyMasterPassword,
   exportEncryptedRecoveryFile,
+  restoreEncryptedRecoveryFile,
   logFailure: (details) => lifecycleLog.append('vault_operation_failed', details),
 });
 registerUnlockIpc(ipcMain, {
   lockController,
   logEvent: (event) => lifecycleLog.append(event),
   notifyUnlocked: () => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:unlocked'); },
+  onLockNow: () => lockIfVaultConfigured('manual'),
 });
 ipcMain.handle('app:quit', () => { app.quit(); return true; });
 ipcMain.handle('clients:list', () => listClients());
@@ -538,20 +558,33 @@ app.whenReady().then(async () => {
   const userDataPath = app.getPath('userData');
   lockController.configure({
     verifyPassword: async (password) => { try { return verifyMasterPassword(userDataPath, password); } catch { return false; } },
-    onLock: () => {
+    onLock: (reason) => {
+      ++embedderGeneration;
+      const previous = embedder;
+      embedder = null;
+      try { void previous?.close(); } catch {}
       lockDatabase();
+      if (['idle', 'manual', 'suspend'].includes(reason)) lifecycleLog.append('vault_locked', { reason });
       for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:locked');
     },
     onUnlock: async (password) => {
       await unlockDatabaseWithPassword(userDataPath, password);
+      securitySettings.write({ lastUnlockAt: new Date().toISOString() });
       startEmbedder();
     }
   });
   const databaseStatus = await initializeDatabase(app.getPath('userData'), safeStorage);
-  if (databaseStatus.state === 'password-required') lockController.lock();
+  if (databaseStatus.state === 'password-required') lockController.lock('startup');
   if (databaseStatus.message) console.error(databaseStatus.message);
 
   if (!lockController.isLocked()) startEmbedder();
+  autoLockMonitor = createAutoLockMonitor({
+    getSystemIdleSeconds: () => powerMonitor.getSystemIdleTime(),
+    getTimeoutMinutes: () => fs.existsSync(path.join(userDataPath, 'db.vault.json')) ? securitySettings.read().autoLockMinutes : 0,
+    lock: lockIfVaultConfigured,
+  });
+  detachSystemLockEvents = attachSystemLockEvents(powerMonitor, () => lockIfVaultConfigured('suspend'));
+  try { globalShortcut.register('CommandOrControl+Shift+L', () => lockIfVaultConfigured('manual')); } catch {}
   try { applyQuickContextSettings(readQuickContextSettings()); } catch { /* Keep the app usable if the OS reserves the selected shortcut. */ }
   createWindow();
 
@@ -562,7 +595,7 @@ app.whenReady().then(async () => {
     const labels = { chatgpt: 'ChatGPT web', claude: 'Claude web', gemini: 'Gemini web', deepseek: 'DeepSeek web', groq: 'Groq playground' };
     const providerClient = event.provider === 'groq' ? 'Groq API' : event.provider === 'deepseek' ? 'DeepSeek API' : null;
     const action = ['search', 'save'].includes(event.tool) ? event.tool : providerClient ? 'search' : 'test';
-    connectionActivity.add({ client: providerClient || labels[site] || 'One Brain', action, ok: Boolean(event.ok), reason: event.error === 'pending_approval' ? 'needs_approval' : event.error === 'unknown_token' ? 'not_paired' : event.error ? 'request_failed' : '' });
+    connectionActivity.add({ client: providerClient || labels[site] || 'One Brain', action, ok: Boolean(event.ok), reason: event.error === 'ONE_BRAIN_LOCKED' ? 'locked' : event.error === 'pending_approval' ? 'needs_approval' : event.error === 'unknown_token' ? 'not_paired' : event.error ? 'request_failed' : '' });
   };
   extensionApi = createExtApi({ userDataPath, authenticateClientToken, getClientTokenState, getClientProfile: getProxyClientProfile,
     getMcpClientProfile: (client, identity) => {
@@ -602,6 +635,7 @@ app.whenReady().then(async () => {
     embedText: (text) => embedder?.embed(text) || Promise.reject(new Error('Local embedder is unavailable.')),
     listMemories, addMemory, connectionActivity,
     onClientCall: (client, ok, reason = '') => {
+      if (!ok && lockController.isLocked()) return;
       const state = reduceHealth(getConnectionHealthState(client) || initialHealth(), { type: ok ? 'success' : 'failure', reason });
       setConnectionHealthState(client, state);
     }
@@ -619,8 +653,11 @@ app.whenReady().then(async () => {
   });
 });
 
-app.on('before-quit', () => {
+  app.on('before-quit', () => {
   globalShortcut.unregisterAll();
+  autoLockMonitor?.stop();
+  detachSystemLockEvents();
+  lockController.lock('quit');
   if (mcpConnection?.server.listening) mcpConnection.server.close();
   embedder?.close();
 });

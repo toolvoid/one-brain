@@ -44,6 +44,7 @@ function createMcpServer(identity, dependencies = {}) {
       if (profile.status === 'blocked') outcome = { denied: true, result: { isError: true, content: [{ type: 'text', text: 'This client is blocked in the One Brain app.' }] }, count: 0 };
       else if (profile.status !== 'approved') outcome = { denied: true, result: { isError: true, content: [{ type: 'text', text: 'Waiting for approval in the One Brain app' }] }, count: 0 };
       else outcome = await handler(args, profile);
+      lockController.assertUnlocked();
       if (outcome.denied) recordEvent(mcpActivityMetadata({ kind: 'permission_denied', tool: name, client, identity: eventIdentity,
         source: outcome.source || args.source || null, resultCount: outcome.count ?? 0, ok: false, error: outcome.reason || 'permission_denied' }));
       recordEvent({ ...mcpActivityMetadata({ tool: name, client, identity: eventIdentity, source: outcome.source || args.source || null,
@@ -59,6 +60,10 @@ function createMcpServer(identity, dependencies = {}) {
       if (!isConnectionTest && identity.verified && identity.profileClient) dependencies.onClientCall?.(identity.profileClient, !outcome.result?.isError, outcome.result?.isError ? 'request_failed' : '');
       return outcome.result;
     } catch (error) {
+      if (lockController.isLocked()) {
+        dependencies.connectionActivity?.add({ client: identity.reportedName || 'One Brain', action: 'search', ok: false, reason: 'locked' });
+        throw error;
+      }
       recordEvent(mcpActivityMetadata({ tool: name, client, identity: eventIdentity, source: args.source || null,
         resultCount: 0, latencyMs: Date.now() - startedAt, ok: false, error: error?.name || 'Tool failed.' }));
       if (identity.reportedName !== 'one-brain-connection-test' && identity.verified && identity.profileClient) dependencies.onClientCall?.(identity.profileClient, false, 'request_failed');
@@ -229,6 +234,7 @@ async function handleRequest(request, response, token, dependencies) {
     }
 
     const body = await readBody(request);
+    if (lockController.isLocked()) { sendJson(response, 423, { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' }); return; }
     const initializeRequest = (Array.isArray(body) ? body : [body]).find((item) => item?.method === 'initialize');
     if (initializeRequest) {
       const reportedName = safeReportedName(initializeRequest.params?.clientInfo?.name, readBearer(request) || '');
@@ -255,7 +261,11 @@ async function handleRequest(request, response, token, dependencies) {
     if (!sameSessionIdentity(auth, session)) { sendJson(response, 401, { error: 'Session identity mismatch.' }); return; }
     await session.transport.handleRequest(request, response, body);
   } catch (error) {
-    if (!response.headersSent) sendJson(response, 500, { jsonrpc: '2.0', error: { code: -32603, message: error.message }, id: null });
+    if (lockController.isLocked() || error?.status === 423 || error?.code === 'ONE_BRAIN_LOCKED') {
+      if (!response.headersSent) sendJson(response, 423, { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' });
+      else response.destroy();
+    }
+    else if (!response.headersSent) sendJson(response, 500, { jsonrpc: '2.0', error: { code: -32603, message: error.message }, id: null });
     else response.destroy(error);
   }
 }

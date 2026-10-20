@@ -260,6 +260,71 @@ function ProviderKeysPanel({ clients }) {
   </section>;
 }
 
+function SecuritySettingsPanel() {
+  const [status, setStatus] = useState(null);
+  const [mode, setMode] = useState(null);
+  const [oldPassword, setOldPassword] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [visible, setVisible] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  async function refresh() {
+    const result = await window.brain.getSecurityStatus();
+    if (!result?.ok) throw new Error(result?.error || 'Could not read security status.');
+    setStatus(result);
+  }
+  useEffect(() => { let active = true; window.brain.getSecurityStatus().then((result) => { if (active && result?.ok) setStatus(result); else if (active) setError(result?.error || 'Could not read security status.'); }).catch((reason) => { if (active) setError(reason?.message || 'Could not read security status.'); }); return () => { active = false; }; }, []);
+  function open(next) { setMode(next); setOldPassword(''); setPassword(''); setConfirmPassword(''); setVisible(false); setError(''); setNotice(''); }
+  async function submit(event) {
+    event.preventDefault();
+    if (mode !== 'restore' && password.length < 12) { setError('Use at least 12 characters.'); return; }
+    if (['set', 'change'].includes(mode) && password !== confirmPassword) { setError('The passwords do not match.'); return; }
+    if (mode === 'change' && !oldPassword) { setError('Enter your current master password.'); return; }
+    setBusy(true); setError('');
+    try {
+      const result = mode === 'set' ? await window.brain.setMasterPassword(password)
+        : mode === 'change' ? await window.brain.changeMasterPassword(oldPassword, password)
+          : mode === 'export' ? await window.brain.exportRecoveryFile(password)
+            : await window.brain.restoreRecoveryFile(password);
+      if (!result?.ok) {
+        if (result?.canceled) { setNotice(result.error || 'Canceled.'); setMode(null); }
+        else setError(result?.error || 'The operation failed.');
+        return;
+      }
+      if (mode === 'restore') {
+        setNotice('Encrypted backup restored. Reloading your memories…');
+        setTimeout(() => window.location.reload(), 700);
+      } else if (mode === 'export') setNotice(`Encrypted recovery file saved to ${result.path}.`);
+      else if (mode === 'set') setNotice('Master password set. A timestamped backup was created.');
+      else setNotice('Master password changed.');
+      setMode(null); setOldPassword(''); setPassword(''); setConfirmPassword('');
+      await refresh();
+    } catch (reason) { setError(reason?.message || 'The operation failed.'); }
+    finally { setBusy(false); }
+  }
+  const modeLabel = mode === 'set' ? 'Set master password' : mode === 'change' ? 'Change master password' : mode === 'export' ? 'Export recovery file' : 'Restore encrypted backup';
+  return <section className="connection-security security-settings-page">
+    <h3>Vault security</h3>
+    {status ? <dl className="security-status-list"><dt>Vault</dt><dd>{status.vaultSet ? status.locked ? 'Locked' : 'Unlocked' : 'No master password set'}</dd><dt>Key backend</dt><dd>{status.backend}</dd><dt>Last unlock</dt><dd>{status.lastUnlockAt ? new Date(status.lastUnlockAt).toLocaleString() : 'Not recorded'}</dd></dl> : <p>Loading security status…</p>}
+    <label className="proxy-setting">Auto-lock after<select value={status?.autoLockMinutes ?? 15} disabled={!status} onChange={async (event) => { const result = await window.brain.setAutoLockMinutes(Number(event.target.value)); if (result?.ok) await refresh(); else setError(result?.error || 'Could not save auto-lock setting.'); }}><option value={1}>1 minute</option><option value={5}>5 minutes</option><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option value={0}>Never</option></select></label>
+    <div className="security-settings-actions"><button type="button" disabled={!status?.vaultSet} onClick={async () => { const result = await window.brain.lockNow(); if (!result?.ok) setError(result?.error || 'Could not lock One Brain.'); }}>Lock now</button><button type="button" onClick={() => open(status?.vaultSet ? 'change' : 'set')}>{status?.vaultSet ? 'Change password' : 'Set password'}</button><button type="button" disabled={!status?.vaultSet} onClick={() => open('export')}>Export recovery file</button><button type="button" onClick={() => open('restore')}>Restore encrypted backup</button></div>
+    {!status?.vaultSet && <p role="note">Set a master password first. Until then, the vault has no password protection.</p>}
+    <p role="note">If you forget your master password and have no encrypted recovery file, the data cannot be recovered and will be lost.</p>
+    <p role="note">Full-disk encryption (LUKS) is the OS-level protection and is recommended.</p>
+    {notice && <p role="status">{notice}</p>}{error && !mode && <p role="alert">{error}</p>}
+    {mode && createPortal(<div className="connection-window-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setMode(null); }}><form className="security-password-modal" role="dialog" aria-modal="true" aria-labelledby="security-password-title" noValidate onSubmit={(event) => void submit(event)}><header><div><h2 id="security-password-title">{modeLabel}</h2><small>{mode === 'export' ? 'Verify your current master password before exporting.' : mode === 'restore' ? 'Enter the password used to encrypt this backup.' : mode === 'change' ? 'Your current password is verified before the key is re-wrapped.' : 'A timestamped safety backup is created before re-keying.'}</small></div><button type="button" aria-label="Close password dialog" disabled={busy} onClick={() => setMode(null)}>×</button></header>
+      {mode === 'change' && <label>Current master password<input autoFocus type={visible ? 'text' : 'password'} autoComplete="current-password" value={oldPassword} onChange={(event) => setOldPassword(event.target.value)} disabled={busy} /></label>}
+      <label>{mode === 'restore' ? 'Backup password' : mode === 'export' ? 'Current master password' : 'New master password'}<input autoFocus={mode !== 'change'} type={visible ? 'text' : 'password'} minLength={mode === 'restore' ? undefined : 12} autoComplete={mode === 'export' || mode === 'change' ? 'current-password' : 'new-password'} required value={password} onChange={(event) => setPassword(event.target.value)} disabled={busy} /></label>
+      {['set', 'change'].includes(mode) && <label>Confirm new password<input type={visible ? 'text' : 'password'} minLength={12} autoComplete="new-password" required value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} disabled={busy} /></label>}
+      <button type="button" className="security-password-toggle" aria-pressed={visible} onClick={() => setVisible((value) => !value)}>{visible ? 'Hide passwords' : 'Show passwords'}</button>
+      {error && <p className="security-password-error" role="alert">{error}</p>}
+      <footer><button type="button" disabled={busy} onClick={() => setMode(null)}>Cancel</button><button type="submit" disabled={busy}>{busy ? 'Working…' : mode === 'export' ? 'Choose save location' : mode === 'restore' ? 'Choose backup file' : modeLabel}</button></footer>
+    </form></div>, document.body)}
+  </section>;
+}
+
 function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContext, activity, counts, mcpConfig, onRefresh, onConnect, onDisconnect, onTest, onConnectAll, onRotateAll }) {
   const [tab, setTab] = useState('connections');
   const [filter, setFilter] = useState('');
@@ -269,14 +334,6 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
   const [selectedConnection, setSelectedConnection] = useState(null);
   const [dismissedRows, setDismissedRows] = useState(() => new Set());
   const [statusFilter, setStatusFilter] = useState('all');
-  const [securityBusy, setSecurityBusy] = useState(false);
-  const [securityNotice, setSecurityNotice] = useState('');
-  const [securityVaultSet, setSecurityVaultSet] = useState(null);
-  const [securityModal, setSecurityModal] = useState(null);
-  const [securityPassword, setSecurityPassword] = useState('');
-  const [securityPasswordConfirm, setSecurityPasswordConfirm] = useState('');
-  const [securityPasswordVisible, setSecurityPasswordVisible] = useState(false);
-  const [securityModalError, setSecurityModalError] = useState('');
   const rows = buildConnectionRows({ mcp, clients, extensions, providers, quickContext, activity, counts });
   const health = summarizeConnectionHealth(rows);
   const connectedCount = rows.filter((row) => row.healthy && row.status !== 'Degraded').length;
@@ -288,65 +345,6 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
     if (statusFilter === 'setup') return ['not_set_up', 'not_installed', 'manual_only', 'not_checked'].includes(row.healthStatus);
     return true;
   });
-  useEffect(() => {
-    let active = true;
-    window.brain.hasMasterPassword().then((result) => {
-      if (!active) return;
-      setSecurityVaultSet(result?.ok ? Boolean(result.set) : false);
-      if (!result?.ok) setSecurityNotice(result?.error || 'Could not check master password status.');
-    }).catch((error) => {
-      if (!active) return;
-      setSecurityVaultSet(false);
-      setSecurityNotice(error?.message || 'Could not check master password status.');
-    });
-    return () => { active = false; };
-  }, []);
-  function openSecurityModal(mode) {
-    setSecurityModal(mode);
-    setSecurityPassword('');
-    setSecurityPasswordConfirm('');
-    setSecurityPasswordVisible(false);
-    setSecurityModalError('');
-    setSecurityNotice('');
-  }
-  function closeSecurityModal() {
-    if (securityBusy) return;
-    setSecurityModal(null);
-    setSecurityPassword('');
-    setSecurityPasswordConfirm('');
-    setSecurityModalError('');
-  }
-  async function submitSecurityModal(event) {
-    event.preventDefault();
-    if (securityPassword.length < 12) { setSecurityModalError('Use at least 12 characters.'); return; }
-    if (securityModal === 'set' && securityPassword !== securityPasswordConfirm) { setSecurityModalError('The passwords do not match.'); return; }
-    setSecurityBusy(true);
-    setSecurityModalError('');
-    try {
-      const result = securityModal === 'set'
-        ? await window.brain.setMasterPassword(securityPassword)
-        : await window.brain.exportRecoveryFile(securityPassword);
-      if (!result?.ok) {
-        const message = result?.error || 'The operation failed. Please try again.';
-        if (result?.canceled) {
-          setSecurityNotice(message);
-          setSecurityModal(null);
-          setSecurityPassword('');
-          setSecurityPasswordConfirm('');
-        } else setSecurityModalError(message);
-        return;
-      }
-      setSecurityNotice(securityModal === 'set'
-        ? `Master password set. Backup saved in ${result.backupPath}. Export an encrypted recovery file now.`
-        : `Encrypted recovery file saved to ${result.path}.`);
-      if (securityModal === 'set') setSecurityVaultSet(true);
-      setSecurityModal(null);
-      setSecurityPassword('');
-      setSecurityPasswordConfirm('');
-    } catch (error) {
-      setSecurityModalError(error?.message || 'The operation failed. Please try again.');
-    } finally { setSecurityBusy(false); }
-  }
   const filteredActivity = activity.filter((event) => !filter || event.client === filter);
   const seenSuccessfulChecks = new Set();
   const visibleActivity = filteredActivity.filter((event) => {
@@ -451,11 +449,11 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
   return <section className="connections-dashboard">
     <header className="connections-header"><div><h2>Connections</h2><p>Connection status, capabilities and recent usage.</p></div><button type="button" onClick={() => void onRefresh()}>Refresh</button></header>
     <div className="connection-health"><strong>{connectedCount} connected · {limitedCount} limited · {health.needAction} need attention · {health.notSetUp} not set up</strong><small>Limited means the connection works, but a feature such as context insertion needs attention. Set up only the apps you use.</small></div>
-    <nav className="connection-tabs"><button type="button" aria-pressed={tab === 'connections'} onClick={() => setTab('connections')}>Connections</button><button type="button" aria-pressed={tab === 'activity'} onClick={() => setTab('activity')}>Activity log</button><button type="button" onClick={() => void onConnectAll()}>Connect all detected</button><button type="button" onClick={() => void testAll()}>Test all</button></nav>
+    <nav className="connection-tabs"><button type="button" aria-pressed={tab === 'connections'} onClick={() => setTab('connections')}>Connections</button><button type="button" aria-pressed={tab === 'activity'} onClick={() => setTab('activity')}>Activity log</button><button type="button" aria-pressed={tab === 'security'} onClick={() => setTab('security')}>Security</button><button type="button" onClick={() => void onConnectAll()}>Connect all detected</button><button type="button" onClick={() => void testAll()}>Test all</button></nav>
     {notice && <p className="connection-notice" role="status">{notice}</p>}
     {pairCode && <p className="extension-pair-code" role="status">Pairing code <strong>{pairCode.code}</strong> · expires in 2 minutes<br />API address <code>{pairCode.endpoint}</code></p>}
     {testResults && <div className="connection-test-results">{testResults.map((result) => <small key={result.name}>{result.name}: {result.skipped ? 'Setup needed' : result.ok ? 'Pass' : 'Fail'} · {result.reason}</small>)}</div>}
-    {tab === 'connections' ? <>
+    {tab === 'security' ? <SecuritySettingsPanel /> : tab === 'connections' ? <>
       <nav className="connection-filters" aria-label="Filter connections">{[['all', 'All', rows.length], ['connected', 'Connected', connectedCount], ['attention', 'Needs attention', limitedCount + health.needAction], ['setup', 'Not set up', health.notSetUp]].map(([value, label, count]) => <button type="button" key={value} aria-pressed={statusFilter === value} onClick={() => setStatusFilter(value)}>{label} <span>{count}</span></button>)}</nav>
       <div className="connection-compact-list">{visibleRows.map((row) => <article className="connection-compact-row" key={row.id}>
         <div className="connection-compact-heading"><div><strong>{row.name}</strong><small className="connection-type">{row.type}</small></div><span className={`connection-status ${row.status.toLowerCase().replaceAll(' ', '-')}`}>{row.status === 'Degraded' ? 'Limited' : row.status}</span></div>
@@ -469,9 +467,7 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
         <div className="connection-compact-meta"><span>{row.lastActivity ? `${row.lastActivity.action} ${relative(row.lastActivity.time)}` : 'No activity'}</span><span>{row.counts.searches} searches · {row.counts.saves} saves today</span></div>
         <button type="button" className="connection-details-button" onClick={() => setSelectedConnection(row)}>View details</button>
       </article>)}</div>{visibleRows.length === 0 && <p className="empty-note">No connections match this filter.</p>}
-      <section className="connection-security"><h3>Security</h3><p>Stdio bridge: loopback listener at <code>127.0.0.1:{mcpConfig?.port || '—'}</code>. Preferred port <code>{mcpConfig?.preferredPort || 3737}</code>{mcpConfig?.preferredPortInUseBy ? ` is held by ${mcpConfig.preferredPortInUseBy}` : ''}. Every request requires a valid client token.</p><p role="note">If you forget the master password and have no encrypted recovery file, your memories cannot be recovered and the data will be lost.</p>{securityVaultSet === false && <p role="note">Set a master password first.</p>}{securityNotice && <p role="status">{securityNotice}</p>}<div><button type="button" disabled={securityBusy} onClick={() => openSecurityModal('set')}>Set password</button><button type="button" disabled={securityBusy || securityVaultSet !== true} onClick={() => openSecurityModal('export')}>Export recovery file</button><button type="button" onClick={onRotateAll}>Rotate token</button></div></section>
     </> : <section className="connection-activity"><header><div><h3>Recent activity</h3><small>Repeated successful checks are grouped by service.</small></div><label>Filter by client<select value={filter} onChange={(event) => setFilter(event.target.value)}><option value="">All clients</option>{[...new Set(activity.map((event) => event.client))].sort().map((client) => <option key={client}>{client}</option>)}</select></label><button type="button" onClick={async () => { await window.brain.clearConnectionActivity(); await onRefresh(); }}>Clear log</button></header>{visibleActivity.map((event) => <article key={`${event.time}-${event.client}-${event.action}`}><time>{new Date(event.time).toLocaleString()}</time><strong>{event.client}</strong><span>{event.action}</span><span>{event.ok ? 'OK' : 'Fail'}</span><small>{event.reason || '—'}{event.probe ? ` · probe ${event.duration} ms` : ''}</small></article>)}{visibleActivity.length === 0 && <p className="empty-note">No connection activity yet.</p>}</section>}
-    {securityModal && createPortal(<div className="connection-window-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) closeSecurityModal(); }}><form className="security-password-modal" role="dialog" aria-modal="true" aria-labelledby="security-password-title" noValidate onSubmit={(event) => void submitSecurityModal(event)}><header><div><h2 id="security-password-title">{securityModal === 'set' ? 'Set master password' : 'Export recovery file'}</h2><small>{securityModal === 'set' ? 'This re-keys your local database after creating a timestamped backup.' : 'Your recovery file will be encrypted with this password.'}</small></div><button type="button" aria-label="Close password dialog" disabled={securityBusy} onClick={closeSecurityModal}>×</button></header><label>Password<input autoFocus type={securityPasswordVisible ? 'text' : 'password'} minLength={12} autoComplete="new-password" required value={securityPassword} onChange={(event) => setSecurityPassword(event.target.value)} /></label>{securityModal === 'set' && <label>Confirm password<input type={securityPasswordVisible ? 'text' : 'password'} minLength={12} autoComplete="new-password" required value={securityPasswordConfirm} onChange={(event) => setSecurityPasswordConfirm(event.target.value)} /></label>}<button type="button" className="security-password-toggle" aria-pressed={securityPasswordVisible} onClick={() => setSecurityPasswordVisible((visible) => !visible)}>{securityPasswordVisible ? 'Hide passwords' : 'Show passwords'}</button>{securityModalError && <p className="security-password-error" role="alert">{securityModalError}</p>}<footer><button type="button" disabled={securityBusy} onClick={closeSecurityModal}>Cancel</button><button type="submit" disabled={securityBusy}>{securityBusy ? 'Working…' : securityModal === 'set' ? 'Set password' : 'Choose save location'}</button></footer></form></div>, document.body)}
     {selectedConnection && createPortal(<div className="connection-window-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedConnection(null); }}><section className="connection-detail-window" role="dialog" aria-modal="true" aria-labelledby="connection-detail-title"><header><div><h2 id="connection-detail-title">{selectedConnection.name}</h2><small>{selectedConnection.type}</small></div><button type="button" aria-label="Close connection details" onClick={() => setSelectedConnection(null)}>×</button></header><div className="connection-detail-status"><span className={`connection-status ${selectedConnection.status.toLowerCase().replaceAll(' ', '-')}`}>{selectedConnection.status}</span><p>{selectedConnection.reason || 'No issues reported.'}</p></div><section className="connection-detail-works"><h3>Works</h3>{['Search', 'Save', 'Auto-insert'].map((feature) => <div key={feature}><strong>{selectedConnection.work[feature].supported ? '✓' : '—'} {feature}</strong>{!selectedConnection.work[feature].supported && <small>{selectedConnection.work[feature].reason || 'Not supported'}</small>}</div>)}</section><div className="connection-detail-activity"><strong>Last activity</strong><span>{selectedConnection.lastActivity ? `${selectedConnection.lastActivity.action} ${relative(selectedConnection.lastActivity.time)}` : 'No activity yet'}</span><strong>Today</strong><span>{selectedConnection.counts.searches} searches · {selectedConnection.counts.saves} saves</span></div><footer><button type="button" onClick={() => void connect(selectedConnection)}>Reconnect</button><button type="button" onClick={() => void onDisconnect(selectedConnection)}>Disconnect</button><button type="button" onClick={() => void testOne(selectedConnection)}>Test connection</button>{selectedConnection.type.includes('MCP') && <><button type="button" onClick={async () => { if (window.confirm(`Rotate ${selectedConnection.name}'s token? Its current token will stop working.`)) { await window.brain.rotateConnectorToken(selectedConnection.id); await onRefresh(); } }}>Rotate token</button><button type="button" onClick={async () => { if (window.confirm(`Revoke ${selectedConnection.name}'s token?`)) { await window.brain.revokeConnectorToken(selectedConnection.id); await onRefresh(); } }}>Revoke</button></>}{selectedConnection.site && <button type="button" onClick={() => void openSite(selectedConnection)}>Open site</button>}</footer></section></div>, document.body)}
   </section>;
 }
@@ -1996,6 +1992,7 @@ function App() {
         .connection-type { color:#91a4bb!important; }.connection-status { display:inline-block;padding:3px 5px;border-radius:5px;color:#d7e4f4;background:#26364d;font-size:9px;white-space:nowrap; }.connection-status.connected,.connection-status.paired { color:#b7f0ca;background:#173b2c; }.connection-status.broken,.connection-status.selectors-broken,.connection-status.needs-reconnect,.connection-status.needs-restart,.connection-status.failing { color:#ffcbc3;background:#48272a; }.connection-status.not-installed,.connection-status.not-paired,.connection-status.not-connected,.connection-status.needs-approval { color:#d1d6df;background:#343b49; }.connection-status.degraded,.connection-status.not-checked,.connection-status[class*="busy-"] { color:#f3d18a;background:#493b1d; }
         .connection-works { display:grid;gap:4px;min-width:180px; }.connection-works span { color:#b9c9dc; }.connection-works span:first-letter { color:#9ce0b9; }.connection-works small { display:block;padding-left:14px;color:#8393a7;font-size:8px; }
         .connection-security,.connection-activity { display:grid;gap:7px;padding:9px;border:1px solid rgba(175,195,224,.14);border-radius:7px;background:rgba(15,24,37,.7); }.connection-security p { margin:0;color:#aab9cb;font-size:10px;line-height:1.5; }.connection-security code { color:#cde3ff; }
+        .security-settings-page { align-content:start; }.security-settings-page h3 { margin:0;color:#e5edf8;font-size:13px; }.security-status-list { display:grid;grid-template-columns:auto 1fr;gap:7px 14px;margin:0;padding:10px;border:1px solid rgba(175,195,224,.12);border-radius:7px;background:rgba(8,14,22,.4);font-size:10px; }.security-status-list dt { color:#91a4bb; }.security-status-list dd { margin:0;color:#d9e5f4; }.security-settings-actions { display:flex;gap:7px;flex-wrap:wrap; }
         .connection-window-backdrop { position:fixed;z-index:1200;inset:0;display:grid;place-items:center;padding:16px;background:rgba(3,7,13,.68); }.connection-detail-window { display:grid;gap:13px;width:min(620px,100%);max-height:min(84vh,780px);overflow:auto;padding:18px;border:1px solid rgba(143,196,255,.3);border-radius:12px;background:#111a28;box-shadow:0 20px 70px rgba(0,0,0,.5);color:#dce6f2; }.connection-detail-window > header { display:flex;justify-content:space-between;align-items:flex-start;gap:12px; }.connection-detail-window h2 { margin:0;color:#eef5ff;font-size:17px; }.connection-detail-window header small { display:block;margin-top:4px;color:#91a4bb;font-size:10px; }.connection-detail-window header button { font-size:16px; }.connection-detail-status p { margin:7px 0 0;color:#aab9cb;font-size:11px;line-height:1.5; }.connection-detail-works { display:grid;gap:7px; }.connection-detail-works h3 { margin:0;color:#e2eaf5;font-size:12px; }.connection-detail-works > div { display:grid;gap:3px;padding:8px;border:1px solid rgba(175,195,224,.12);border-radius:6px;background:rgba(255,255,255,.025);font-size:11px; }.connection-detail-works small { color:#91a0b4;font-size:9px; }.connection-detail-activity { display:grid;grid-template-columns:auto 1fr;gap:7px 12px;color:#aab9cb;font-size:10px; }.connection-detail-activity strong { color:#e2eaf5; }.connection-detail-window footer { display:flex;gap:6px;flex-wrap:wrap; }
         .security-password-modal { display:grid;gap:12px;width:min(440px,100%);padding:18px;border:1px solid rgba(143,196,255,.3);border-radius:12px;background:#111a28;box-shadow:0 20px 70px rgba(0,0,0,.5);color:#dce6f2; }.security-password-modal header { display:flex;justify-content:space-between;align-items:flex-start;gap:12px; }.security-password-modal h2 { margin:0;color:#eef5ff;font-size:16px; }.security-password-modal header small { display:block;margin-top:5px;color:#91a4bb;font-size:10px;line-height:1.5; }.security-password-modal label { display:grid;gap:5px;color:#c6d2e2;font-size:11px; }.security-password-modal input { width:100%;min-height:36px;padding:8px;border:1px solid #3d5068;border-radius:6px;background:#0b111a;color:#eff6ff;font:inherit; }.security-password-modal footer { display:flex;justify-content:flex-end;gap:7px; }.security-password-toggle { justify-self:start; }.security-password-error { margin:0;padding:8px;border:1px solid #6c3539;border-radius:6px;background:#351b21;color:#ffc3bd;font-size:11px; }
         .connection-activity header { flex-wrap:wrap; }.connection-activity header label { display:flex;align-items:center;gap:5px;color:#aab9cb;font-size:9px; }.connection-activity article { display:grid;grid-template-columns:1fr 1fr 1fr 35px 1fr;gap:6px;padding:6px 0;border-top:1px solid rgba(175,195,224,.1);color:#c6d2e2;font-size:9px; }.connection-activity article small,.connection-activity time { color:#8697ad;font-size:8px; }

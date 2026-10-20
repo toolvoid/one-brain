@@ -53,6 +53,17 @@ test('window visibility lifecycle events preserve event and window name only', (
   assert.doesNotMatch(fs.readFileSync(log.filePath, 'utf8'), /private page text|synthetic-secret/);
 });
 
+test('vault lock and unlock events log only the allowed lock reason', (t) => {
+  const directory = temporaryDirectory(t);
+  const log = createLifecycleLog(directory);
+  log.append('vault_locked', { reason: 'suspend', password: 'not-a-secret-to-log' });
+  log.append('vault_locked', { reason: 'other', memory: 'must not be logged' });
+  log.append('vault_unlocked', { password: 'not-a-secret-to-log' });
+  const records = log.tail(3).map((line) => JSON.parse(line));
+  assert.deepEqual(records.map(({ event, reason }) => [event, reason]), [['vault_locked', 'suspend'], ['vault_locked', undefined], ['vault_unlocked', undefined]]);
+  assert.doesNotMatch(fs.readFileSync(log.filePath, 'utf8'), /not-a-secret-to-log|must not be logged/);
+});
+
 test('lifecycle log trims oversized files already present at startup', (t) => {
   const directory = temporaryDirectory(t);
   fs.writeFileSync(path.join(directory, 'lifecycle.log'), 'x'.repeat(900));

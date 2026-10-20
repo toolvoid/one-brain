@@ -33,7 +33,7 @@ function safeDetails(event, details = {}) {
     safe.isMainFrame = Boolean(details.isMainFrame);
   }
   if (event === 'vault_operation_failed') {
-    if (['set_password', 'export_recovery'].includes(details.operation)) safe.operation = details.operation;
+    if (['set_password', 'change_password', 'export_recovery', 'restore_recovery'].includes(details.operation)) safe.operation = details.operation;
     if (/^[\w.-]{1,40}$/.test(String(details.name || ''))) safe.name = String(details.name);
     if (typeof details.message === 'string') {
       safe.message = details.message
@@ -43,6 +43,7 @@ function safeDetails(event, details = {}) {
         .slice(0, 200);
     }
   }
+  if (event === 'vault_locked' && ['idle', 'manual', 'suspend'].includes(details.reason)) safe.reason = details.reason;
   if (['window_created', 'window_closed', 'window_unresponsive', 'window_shown', 'window_hidden', 'window_minimized', 'window_restored'].includes(event)) {
     safe.window = String(details.window || 'main').slice(0, 32);
   }

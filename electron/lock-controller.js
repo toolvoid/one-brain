@@ -4,6 +4,7 @@ let locked = false;
 let verifyPassword = null;
 let onLock = () => {};
 let onUnlock = () => {};
+const lockListeners = new Set();
 
 function configure(hooks = {}) {
   if (typeof hooks.verifyPassword === 'function') verifyPassword = hooks.verifyPassword;
@@ -13,10 +14,11 @@ function configure(hooks = {}) {
 
 function isLocked() { return locked; }
 
-function lock() {
+function lock(reason = 'manual') {
   if (locked) return false;
   locked = true;
-  try { onLock(); } catch { /* A failed cleanup must never reopen access. */ }
+  try { onLock(reason); } catch { /* A failed cleanup must never reopen access. */ }
+  for (const listener of lockListeners) { try { listener(reason); } catch {} }
   return true;
 }
 
@@ -40,6 +42,7 @@ function assertUnlocked() {
   throw error;
 }
 
-function resetForTest() { locked = false; verifyPassword = null; onLock = () => {}; onUnlock = () => {}; }
+function onLocked(listener) { lockListeners.add(listener); return () => lockListeners.delete(listener); }
+function resetForTest() { locked = false; verifyPassword = null; onLock = () => {}; onUnlock = () => {}; lockListeners.clear(); }
 
-module.exports = { configure, isLocked, lock, unlock, assertUnlocked, resetForTest };
+module.exports = { configure, isLocked, lock, unlock, assertUnlocked, onLocked, resetForTest };

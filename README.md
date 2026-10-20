@@ -41,7 +41,7 @@ The dev script starts Vite and Electron. The Electron main process opens the SQL
 
 The SQLite database uses SQLCipher encryption. Its key is protected with Electron `safeStorage` on supported backends; the app disables database writes when storage is unavailable or reports the `basic_text` backend. Browser extension and MCP tokens are created with owner-only file permissions where the operating system supports them. Local HTTP services bind to loopback and require authentication.
 
-Connections → Security has a **Set password** action. It first saves a timestamped backup of the encrypted database and its current key, then re-keys a verified database copy with a random key wrapped by a password-derived scrypt key. The original key remains as `db.key.bak`. Export an encrypted recovery file after setting the password; forgetting the password without that file means the data cannot be recovered. Full-disk encryption (LUKS on Linux) is still recommended as the OS-level protection. The password unlock window and automatic locking are provided in the next security hardening step.
+Settings → Connections → Security has master-password, encrypted recovery/restore, vault-status and auto-lock controls. Re-keying makes a timestamped backup first; the original key remains as `db.key.bak`. Forgetting the password without an encrypted recovery file means the data cannot be recovered. The vault locks after 15 minutes idle by default (choose 1, 5, 15, 30 minutes, or Never), on screen lock/suspend, with **Lock now**, or with `Ctrl/Cmd+Shift+L`. Locked MCP, proxy and extension requests return HTTP 423. Full-disk encryption (LUKS on Linux) remains the recommended OS-level protection.
 
 ## Project structure
 

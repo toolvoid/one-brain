@@ -32,6 +32,8 @@ test('password migration runs on a temporary DB copy, backs up db and key, and e
     assert.equal(fs.existsSync(beforeSetPath), false);
     const oldKeyFile = fs.readFileSync(path.join(userData, 'db.key'));
     const result = await db.migrateDatabaseToPassword(userData, 'correct migration password');
+    assert.throws(() => db.changeMasterPassword(userData, 'wrong old password', 'new migration password'), /Incorrect master password|damaged vault/);
+    assert.equal(db.verifyMasterPassword(userData, 'correct migration password'), true);
     assert.equal(db.getMemory(memory.id).content, 'Synthetic migration data never written to the real profile.');
     assert.ok(fs.existsSync(path.join(userData, 'db.key.bak')));
     assert.equal(fs.existsSync(path.join(userData, 'db.key')), false);

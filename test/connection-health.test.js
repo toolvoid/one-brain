@@ -28,6 +28,20 @@ test('health summary counts healthy, actionable, and neutral rows', () => {
   assert.deepEqual(summarizeConnectionHealth([{ healthStatus: 'healthy', healthy: true }, { healthStatus: 'needs_restart' }, { healthStatus: 'not_installed' }]), { healthy: 1, degraded: 0, needAction: 1, notSetUp: 1, total: 3, broken: [] });
 });
 
+test('lock is shown as Locked and previous real connection state returns after unlock', () => {
+  const connected = reduceHealth(initialHealth(), { type: 'success', ts: '2026-01-01T00:00:00Z' });
+  const locked = reduceHealth(connected, { type: 'locked', ts: '2026-01-01T00:01:00Z' });
+  assert.equal(getHealthStatus(locked, { configValid: true, locked: true }), 'locked');
+  assert.equal(getHealthStatus(locked, { configValid: true, locked: false }), 'healthy');
+  const rows = buildConnectionRows({
+    vaultLocked: true,
+    mcp: [{ id: 'codex', status: 'found', tokenStatus: 'active', healthStatus: 'locked' }],
+    providers: { providerKeyStatus: { groq: true } }
+  });
+  assert.equal(rows.find((row) => row.id === 'codex').status, 'Locked');
+  assert.equal(rows.find((row) => row.id === 'provider:groq').status, 'Locked');
+});
+
 test('extension health rows aggregate pairing, loop-guard build, permissions, and stale page state', () => {
   const rows = buildConnectionRows({ extensions: [
     { site: 'chatgpt', paired: true, status: 'approved', health: { buildId: '1.2.0-loopguard', contentScriptVersion: '1.2.0-loopguard', tabContentScriptVersion: '1.1.0', hostPermission: true, pingAt: new Date().toISOString(), selfCheck: { matched: { input: 1 } } } },
