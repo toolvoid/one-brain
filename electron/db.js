@@ -475,44 +475,32 @@ async function createPreCleanupBackup() {
   fs.chmodSync(folder, 0o700);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const backupPath = path.join(folder, `onebrain-${stamp}-${randomBytes(4).toString('hex')}.db`);
-  // Keep the transient plaintext snapshot in userData so startup/lock cleanup
-  // can find it; the completed backup is SQLCipher-encrypted before it leaves.
-  const pendingPath = path.join(path.dirname(databasePath), `.precleanup-pending-${randomBytes(8).toString('hex')}.db`);
   const expected = databaseCounts(getDatabase());
   try {
-    const serialized = getDatabase().serialize();
-    if (!Buffer.isBuffer(serialized) || serialized.length === 0) throw new Error('Could not snapshot the live database.');
-    const plainSnapshot = new Database(serialized);
-    try {
-      await plainSnapshot.backup(pendingPath);
-    } finally { plainSnapshot.close(); }
-    fs.chmodSync(pendingPath, 0o600);
-    const backup = openPlain(pendingPath);
-    try {
-      backup.pragma("cipher = 'sqlcipher'");
-      backup.pragma('legacy = 4');
-      backup.rekey(databaseKey);
-    } finally { backup.close(); }
-
-    const verified = openEncrypted(pendingPath, databaseKey, { readonly: true, fileMustExist: true });
+    const checkpoint = getDatabase().pragma('wal_checkpoint(TRUNCATE)')[0];
+    if (checkpoint?.busy) throw new Error('Database is busy; pre-cleanup backup stopped.');
+    // The live database is already SQLCipher-encrypted. After a successful
+    // WAL checkpoint, a same-filesystem copy stays encrypted end to end.
+    fs.copyFileSync(databasePath, backupPath, fs.constants.COPYFILE_EXCL);
+    fs.chmodSync(backupPath, 0o600);
+    const verified = openEncrypted(backupPath, databaseKey, { readonly: true, fileMustExist: true });
     try {
       if (JSON.stringify(databaseCounts(verified)) !== JSON.stringify(expected)) throw new Error('Backup verification failed: row counts differ.');
       if (!findFtsResult(verified)) throw new Error('Backup verification failed: FTS search returned no result.');
     } finally { verified.close(); }
-    fs.renameSync(pendingPath, backupPath);
-    fs.chmodSync(backupPath, 0o600);
     return backupPath;
   } catch (error) {
-    try { secureRemovePath(pendingPath); } catch {}
     try { secureRemovePath(backupPath); } catch {}
     throw error;
   }
 }
 
-async function encryptPlainBackupFile(backupPath, key, expectedCounts) {
-  const temporaryPath = `${backupPath}.${randomBytes(6).toString('hex')}.encrypted.tmp`;
+async function encryptPlainBackupFile(sourcePath, key, expectedCounts, destinationPath = sourcePath) {
+  // This copy is plaintext until rekey completes, so keep it under the startup/
+  // lock/quit cleanup namespace instead of leaving it beside a durable backup.
+  const temporaryPath = path.join(path.dirname(databasePath || sourcePath), `.precleanup-pending-${randomBytes(6).toString('hex')}.db`);
   try {
-    const source = openPlain(backupPath, { readonly: true, fileMustExist: true });
+    const source = openPlain(sourcePath, { readonly: true, fileMustExist: true });
     try {
       if (JSON.stringify(databaseCounts(source)) !== JSON.stringify(expectedCounts)) throw new Error('Legacy backup row counts do not match.');
       await source.backup(temporaryPath);
@@ -525,13 +513,13 @@ async function encryptPlainBackupFile(backupPath, key, expectedCounts) {
     try {
       if (JSON.stringify(databaseCounts(verified)) !== JSON.stringify(expectedCounts) || !findFtsResult(verified)) throw new Error('Encrypted legacy backup verification failed.');
     } finally { verified.close(); }
-    secureRemovePath(backupPath);
-    fs.renameSync(temporaryPath, backupPath);
-    fs.chmodSync(backupPath, 0o600);
+    secureRemovePath(sourcePath);
+    fs.renameSync(temporaryPath, destinationPath);
+    fs.chmodSync(destinationPath, 0o600);
   } catch (error) {
     try { secureRemovePath(temporaryPath); } catch {}
     // A plaintext legacy backup must not remain if encryption or verification fails.
-    try { secureRemovePath(backupPath); } catch {}
+    try { secureRemovePath(sourcePath); } catch {}
     throw error;
   }
 }
@@ -576,6 +564,7 @@ function readEncryptedKey(safeStorage, keyPath) {
 
 async function encryptPlainDatabase(dbPath, key) {
   const backupPath = `${dbPath}.pre-encryption.bak`;
+  const stagingBackupPath = path.join(path.dirname(dbPath), `.precleanup-pending-legacy-${randomBytes(6).toString('hex')}.db`);
   const temporaryPath = path.join(path.dirname(dbPath), 'onebrain.enc.db');
   if (fs.existsSync(backupPath)) throw new Error(`Preserved backup already exists at ${backupPath}; migration stopped.`);
   if (fs.existsSync(temporaryPath)) throw new Error(`Migration file already exists at ${temporaryPath}; migration stopped.`);
@@ -605,14 +594,15 @@ async function encryptPlainDatabase(dbPath, key) {
       if (!findFtsResult(verified)) throw new Error('Encrypted database verification failed: FTS search returned no result.');
     } finally { verified.close(); }
 
-    fs.renameSync(dbPath, backupPath);
+    fs.renameSync(dbPath, stagingBackupPath);
     try { fs.renameSync(temporaryPath, dbPath); }
-    catch (error) { fs.renameSync(backupPath, dbPath); throw error; }
+    catch (error) { fs.renameSync(stagingBackupPath, dbPath); throw error; }
     for (const sidecar of [`${dbPath}-wal`, `${dbPath}-shm`]) { try { secureRemovePath(sidecar); } catch {} }
-    await encryptPlainBackupFile(backupPath, key, expected);
+    await encryptPlainBackupFile(stagingBackupPath, key, expected, backupPath);
     return backupPath;
   } catch (error) {
     try { secureRemovePath(temporaryPath); } catch {}
+    try { if (fs.existsSync(stagingBackupPath)) secureRemovePath(stagingBackupPath); } catch {}
     throw error;
   }
 }
@@ -679,7 +669,9 @@ async function initializeDatabase(userDataPath = app.getPath('userData'), safeSt
         const plainBackup = openPlain(legacyBackupPath, { readonly: true, fileMustExist: true });
         const legacyCounts = databaseCounts(plainBackup);
         plainBackup.close();
-        await encryptPlainBackupFile(legacyBackupPath, key, legacyCounts);
+        const stagingBackupPath = path.join(userDataPath, `.precleanup-pending-legacy-${randomBytes(6).toString('hex')}.db`);
+        fs.renameSync(legacyBackupPath, stagingBackupPath);
+        await encryptPlainBackupFile(stagingBackupPath, key, legacyCounts, legacyBackupPath);
       }
     }
     setDatabaseStatus('ready', true);

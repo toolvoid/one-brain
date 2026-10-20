@@ -73,7 +73,18 @@ function deleteOldBackups(userDataPath, fsImpl = fs) {
   try { deleted = secureRemovePath(backupRoot, fsImpl) || deleted; } catch (error) { if (error.code !== 'ENOENT') throw error; }
   try { deleted = secureRemovePath(path.join(allowedRoot, 'db.key.bak'), fsImpl) || deleted; } catch (error) { if (error.code !== 'ENOENT') throw error; }
   try { deleted = secureRemovePath(path.join(allowedRoot, '.precleanup-backups'), fsImpl) || deleted; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  try { deleted = secureRemovePath(path.join(allowedRoot, 'onebrain.db.pre-encryption.bak'), fsImpl) || deleted; } catch (error) { if (error.code !== 'ENOENT') throw error; }
   return deleted;
 }
 
-module.exports = { enforcePrivateTree, secureRemovePath, cleanupSensitiveTemps, deleteOldBackups };
+function hasOldBackups(userDataPath, fsImpl = fs) {
+  for (const entry of ['migration-backups', '.precleanup-backups']) {
+    try { if (fsImpl.readdirSync(path.join(userDataPath, entry)).length > 0) return true; } catch {}
+  }
+  for (const name of ['db.key.bak', 'onebrain.db.pre-encryption.bak']) {
+    try { if (fsImpl.statSync(path.join(userDataPath, name)).isFile()) return true; } catch {}
+  }
+  return false;
+}
+
+module.exports = { enforcePrivateTree, secureRemovePath, cleanupSensitiveTemps, deleteOldBackups, hasOldBackups };

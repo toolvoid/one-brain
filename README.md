@@ -43,6 +43,8 @@ The SQLite database and its WAL/SHM files use SQLCipher. Its key is protected wi
 
 Settings → Connections → Security has master-password, encrypted recovery/restore, vault-status and auto-lock controls. Auto-lock is ON by default at 15 minutes (choose 1, 5, 15, 30, or 60 minutes); OFF disables idle locking only. Screen-lock/suspend locking is a separate ON-by-default setting. User input and active MCP/proxy/extension requests reset the idle timer; a one-minute warning offers **Stay unlocked**. Lock now and `Ctrl/Cmd+Shift+L` remain available. Locked MCP, proxy and extension requests return HTTP 423. Re-keying makes a timestamped backup first; the old key is retained until explicitly deleted. The Security page warns that old pre-password backups may be read without the password and requires the master password plus typed confirmation to delete them. Forgetting the password without an encrypted recovery file means data loss. Full-disk encryption (LUKS on Linux) is the recommended OS-level protection.
 
+The [user-data audit](docs/security-userdata-audit.md) documents persistent data, encryption, cleanup, permissions, and renderer storage. A temp-directory marker test checks that saved memory text does not leak into plaintext files. Temporary SQLCipher conversion snapshots are securely removed after use and during lock/quit/startup cleanup; secure overwrite on flash storage is best-effort.
+
 ## Project structure
 
 ```text

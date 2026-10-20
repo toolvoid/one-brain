@@ -61,7 +61,7 @@ const { createAutoLockMonitor } = require('./auto-lock');
 const { createKeepUnlockedWindow } = require('./keep-unlocked');
 const { attachSystemLockEvents } = require('./system-lock');
 const { createSecuritySettings } = require('./security-settings');
-const { deleteOldBackups: deleteOldBackupFiles } = require('./private-files');
+const { deleteOldBackups: deleteOldBackupFiles, hasOldBackups } = require('./private-files');
 
 let mcpConnection;
 let memoryProxy;
@@ -437,7 +437,7 @@ ipcMain.handle('security:status', () => {
   const settings = securitySettings.read();
   let backend = 'unknown';
   try { backend = safeStorage.getSelectedStorageBackend?.() || (safeStorage.isEncryptionAvailable() ? 'safeStorage' : 'basic_text'); } catch { backend = 'unavailable'; }
-  return { ok: true, error: null, locked: lockController.isLocked(), vaultSet: fs.existsSync(path.join(userDataRoot, 'db.vault.json')), oldBackupsExist: fs.existsSync(path.join(userDataRoot, 'migration-backups')) || fs.existsSync(path.join(userDataRoot, 'db.key.bak')) || fs.existsSync(path.join(userDataRoot, '.precleanup-backups')), backend, lastUnlockAt: settings.lastUnlockAt, ...settings };
+  return { ok: true, error: null, locked: lockController.isLocked(), vaultSet: fs.existsSync(path.join(userDataRoot, 'db.vault.json')), oldBackupsExist: hasOldBackups(userDataRoot), backend, lastUnlockAt: settings.lastUnlockAt, ...settings };
 });
 ipcMain.handle('security:set-auto-lock', (_event, minutes) => {
   try { return { ok: true, error: null, ...securitySettings.write(typeof minutes === 'object' && minutes ? minutes : { autoLockMinutes: Number(minutes) }) }; }
