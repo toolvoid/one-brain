@@ -3,10 +3,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-test('software renderer detection recognizes SwiftShader and llvmpipe only', async () => {
+test('software renderer detection recognizes common software rasterizers', async () => {
   const { isSoftwareRenderer } = await import('../src/lib/graph-performance.mjs');
   assert.equal(isSoftwareRenderer('Google SwiftShader'), true);
   assert.equal(isSoftwareRenderer('Mesa llvmpipe (LLVM 18.1.8)'), true);
+  assert.equal(isSoftwareRenderer('Mesa softpipe'), true);
+  assert.equal(isSoftwareRenderer('Software Rasterizer'), true);
   assert.equal(isSoftwareRenderer('ANGLE (NVIDIA GeForce)'), false);
   assert.equal(isSoftwareRenderer(''), false);
   assert.equal(isSoftwareRenderer(null), false);

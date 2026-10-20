@@ -9,8 +9,10 @@ const { readGraphicsSettings, writeGraphicsSettings, graphicsSettingsPath } = re
 test('graphics settings persist in a small JSON file and default safely', (t) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'one-brain-graphics-'));
   t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
-  assert.deepEqual(readGraphicsSettings(tempRoot), { safeGraphicsMode: false, restartNotice: false });
-  assert.deepEqual(writeGraphicsSettings(tempRoot, { safeGraphicsMode: true, restartNotice: true, extra: 'ignored' }), { safeGraphicsMode: true, restartNotice: true });
-  assert.deepEqual(readGraphicsSettings(tempRoot), { safeGraphicsMode: true, restartNotice: true });
-  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(graphicsSettingsPath(tempRoot), 'utf8'))).sort(), ['restartNotice', 'safeGraphicsMode']);
+  assert.deepEqual(readGraphicsSettings(tempRoot), { mode: 'auto', hardwareStrategy: 'angle-gl', restartNotice: false, renderer: '' });
+  const saved = writeGraphicsSettings(tempRoot, { mode: 'hardware', hardwareStrategy: 'egl', restartNotice: true, renderer: 'Mesa Intel GPU', extra: 'ignored' });
+  assert.deepEqual(saved, { mode: 'hardware', hardwareStrategy: 'egl', restartNotice: true, renderer: 'Mesa Intel GPU' });
+  assert.deepEqual(readGraphicsSettings(tempRoot), saved);
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(graphicsSettingsPath(tempRoot), 'utf8'))).sort(), ['hardwareStrategy', 'mode', 'renderer', 'restartNotice']);
+  assert.equal(writeGraphicsSettings(tempRoot, { safeGraphicsMode: true }).mode, 'safe-software', 'legacy safe mode migrates to the explicit mode');
 });

@@ -3,10 +3,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-test('performance mode caps static frames at 30 fps but allows moving-camera frames at 60 fps', async () => {
+test('performance mode caps graph frames at 30 fps, including during camera movement', async () => {
   const { graphFrameIntervalMs } = await import('../src/lib/graph-animation.mjs');
   assert.equal(graphFrameIntervalMs(true, false), 1000 / 30);
-  assert.equal(graphFrameIntervalMs(true, true), 1000 / 60);
+  assert.equal(graphFrameIntervalMs(true, true), 1000 / 30);
   assert.equal(graphFrameIntervalMs(false, false), 1000 / 60);
 });
 

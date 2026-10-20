@@ -1,8 +1,11 @@
 export const PERFORMANCE_STATIC_FPS = 30;
-export const PERFORMANCE_MOVING_FPS = 60;
+export const PERFORMANCE_MOVING_FPS = 30;
+export const NORMAL_GRAPH_FPS = 60;
 
 export function graphFrameIntervalMs(performanceMode = false, cameraMoving = false) {
-  const fps = performanceMode && !cameraMoving ? PERFORMANCE_STATIC_FPS : PERFORMANCE_MOVING_FPS;
+  const fps = performanceMode
+    ? (cameraMoving ? PERFORMANCE_MOVING_FPS : PERFORMANCE_STATIC_FPS)
+    : NORMAL_GRAPH_FPS;
   return 1000 / fps;
 }
 

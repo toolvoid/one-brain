@@ -1,30 +1,32 @@
 'use strict';
 function getGraphicsStartupConfig(platform, env = {}, savedSettings = {}) {
   const linux = platform === 'linux';
-  if (!linux) return { ozonePlatform: null, disableFeatures: null, useGl: null, useAngle: null, disableHardwareAcceleration: false, disable3dApiDomainBlocking: false, safeGraphicsMode: false };
+  if (!linux) return { ozonePlatform: null, useGl: null, useAngle: null, disableHardwareAcceleration: false, safeGraphicsMode: false, mode: 'auto' };
   const args = Array.isArray(env.argv) ? env.argv : [];
   const explicitOzone = args.some((arg) => String(arg).startsWith('--ozone-platform'));
-  const safeGraphicsMode = savedSettings.safeGraphicsMode === true;
+  const mode = ['auto', 'hardware', 'safe-software'].includes(savedSettings.mode)
+    ? savedSettings.mode
+    : (savedSettings.safeGraphicsMode === true ? 'safe-software' : 'auto');
+  const safeGraphicsMode = mode === 'safe-software';
+  const hardwareStrategy = savedSettings.hardwareStrategy === 'egl' ? 'egl' : 'angle-gl';
   return {
-    // Force XWayland for the normal Linux path. In safe mode, let Electron
-    // choose the native display backend: X11's software presenter can fail
-    // on Wayland desktops after hardware acceleration is disabled.
+    // Preserve the existing X11 path; safe software rendering leaves ozone selection to Electron.
     ozonePlatform: explicitOzone || safeGraphicsMode ? null : 'x11',
-    disableFeatures: 'Vulkan,VaapiVideoDecoder',
-    useGl: 'angle',
-    useAngle: safeGraphicsMode ? 'swiftshader' : 'gl',
+    useGl: safeGraphicsMode ? 'angle' : hardwareStrategy === 'egl' ? 'egl' : 'angle',
+    useAngle: safeGraphicsMode ? 'swiftshader' : hardwareStrategy === 'egl' ? null : 'gl',
     disableHardwareAcceleration: safeGraphicsMode,
-    disable3dApiDomainBlocking: safeGraphicsMode,
-    safeGraphicsMode
+    safeGraphicsMode,
+    mode,
+    hardwareStrategy
   };
 }
-function recordGpuCrash(platform, currentCount, details, safeGraphicsMode = false) {
+function recordGpuCrash(platform, currentCount, details, mode = 'auto') {
   const crashed = details?.reason === 'crashed' || (details?.reason === 'abnormal-exit' && Number(details.exitCode) !== 0);
   if (platform !== 'linux' || details?.type !== 'GPU' || !crashed) {
     return { count: currentCount, enableSafeMode: false };
   }
   const count = currentCount + 1;
-  return { count, enableSafeMode: count >= 3 && !safeGraphicsMode };
+  return { count, enableSafeMode: mode === 'auto' };
 }
 function registerShortcutWithFallback(requested, fallbacks, register) {
   const attempts = [...new Set([String(requested || '').trim(), ...(fallbacks || []).map((value) => String(value).trim())].filter(Boolean))];

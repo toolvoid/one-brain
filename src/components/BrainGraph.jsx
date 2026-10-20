@@ -126,10 +126,13 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     const renderer = safeCreateWebGLRenderer(THREE.WebGLRenderer, { antialias: true, alpha: false });
     if (!renderer) {
       setWebglUnavailable(true);
+      void Promise.resolve(window.brain?.reportGraphicsContextFailure?.()).catch(() => {});
       return undefined;
     }
     const normalPixelRatio = Math.min(window.devicePixelRatio || 1, 2);
-    const automaticPerformanceMode = isSoftwareRenderer(rendererString(renderer));
+    const detectedRenderer = rendererString(renderer);
+    const automaticPerformanceMode = isSoftwareRenderer(detectedRenderer);
+    void Promise.resolve(window.brain?.reportGraphicsRenderer?.(detectedRenderer)).catch(() => {});
     let manualPerformanceMode = readManualPerformanceMode();
     let performanceMode = automaticPerformanceMode || manualPerformanceMode;
     renderer.setPixelRatio(performanceMode ? 1 : normalPixelRatio);
@@ -137,6 +140,10 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     renderer.toneMappingExposure = 1.0;
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.domElement.className = 'brain-webgl';
+    renderer.domElement.addEventListener('webglcontextlost', (event) => {
+      event.preventDefault();
+      void Promise.resolve(window.brain?.reportGraphicsContextFailure?.()).catch(() => {});
+    }, { once: true });
     host.appendChild(renderer.domElement);
     const labels = new CSS2DRenderer();
     labels.domElement.className = 'brain-label-layer';
@@ -177,7 +184,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     document.addEventListener('visibilitychange', onVisibilityChange);
     const composer = new EffectComposer(renderer);
     composer.addPass(new RenderPass(scene, camera));
-    const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.18, 0.25, 0.86);
+    const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), performanceMode ? 0.08 : 0.18, 0.25, 0.86);
     composer.addPass(bloomPass);
 
     const pointMat = new THREE.ShaderMaterial({
@@ -399,6 +406,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
         const n = Number(nextCounts[key]) || 0;
         labelCounts[key].textContent = `${n} ${n === 1 ? 'memory' : 'memories'}`;
         const active = n > 0;
+        labelObjects[key].hidden = performanceMode && !active;
         const c = active ? new THREE.Color(COLORS[key]) : new THREE.Color('#63738a');
         labelObjects[key].querySelector('.brain-label-dot').style.background = active ? COLORS[key] : '#63738a';
         labelObjects[key].querySelector('.brain-label-dot').style.boxShadow = active ? `0 0 9px ${COLORS[key]}` : 'none';
@@ -580,6 +588,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
       if (nextMode === performanceMode) return;
       performanceMode = nextMode;
       renderer.setPixelRatio(performanceMode ? 1 : normalPixelRatio);
+      bloomPass.strength = performanceMode ? 0.08 : 0.18;
       pointMat.uniforms.pixelRatio.value = renderer.getPixelRatio();
       composer.setPixelRatio(renderer.getPixelRatio());
       resize(true);

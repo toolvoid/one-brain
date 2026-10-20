@@ -28,15 +28,14 @@ const { getGraphicsStartupConfig, recordGpuCrash, registerShortcutWithFallback }
 const { createCrashLoopLimiter } = require('./window-lifecycle');
 const { rendererErrorLocation, rendererErrorMessage } = require('./renderer-errors');
 const { readGraphicsSettings, writeGraphicsSettings } = require('./graphics-settings');
+const { getAutomaticSoftwareFallback } = require('./graphics-fallback');
 const graphicsUserDataPath = userDataRoot;
 let graphicsSettings = readGraphicsSettings(graphicsUserDataPath);
 const graphicsStartupConfig = getGraphicsStartupConfig(process.platform, { ...process.env, argv: process.argv }, graphicsSettings);
 let gpuCrashCount = 0;
 if (graphicsStartupConfig.ozonePlatform) app.commandLine.appendSwitch('ozone-platform', graphicsStartupConfig.ozonePlatform);
-if (graphicsStartupConfig.disableFeatures) app.commandLine.appendSwitch('disable-features', graphicsStartupConfig.disableFeatures);
 if (graphicsStartupConfig.useGl) app.commandLine.appendSwitch('use-gl', graphicsStartupConfig.useGl);
 if (graphicsStartupConfig.useAngle) app.commandLine.appendSwitch('use-angle', graphicsStartupConfig.useAngle);
-if (graphicsStartupConfig.disable3dApiDomainBlocking) app.disableDomainBlockingFor3DAPIs();
 if (graphicsStartupConfig.disableHardwareAcceleration) app.disableHardwareAcceleration();
 
 const { BrowserWindow, ipcMain, Menu, safeStorage, globalShortcut, clipboard, Tray, nativeImage, dialog } = require('electron');
@@ -164,26 +163,47 @@ function attachWindowLifecycle(win, windowName) {
 
 app.on('child-process-gone', (_event, details) => {
   lifecycleLog.append('child_process_gone', { type: details?.type, reason: details?.reason, exitCode: details?.exitCode });
-  const result = recordGpuCrash(process.platform, gpuCrashCount, details, graphicsSettings.safeGraphicsMode);
+  const result = recordGpuCrash(process.platform, gpuCrashCount, details, graphicsSettings.mode);
   gpuCrashCount = result.count;
   if (!result.enableSafeMode) return;
-  graphicsSettings = writeGraphicsSettings(graphicsUserDataPath, { safeGraphicsMode: true, restartNotice: true });
-  graphicsRestartNoticePending = true;
-  for (const win of BrowserWindow.getAllWindows()) {
-    if (!win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.send('graphics:safe-mode-enabled');
-  }
+  activateAutomaticSoftwareFallback('gpu-process-crash');
 });
+
+function activateAutomaticSoftwareFallback(reason) {
+  const next = getAutomaticSoftwareFallback(process.platform, graphicsSettings, reason);
+  if (!next) return false;
+  graphicsSettings = writeGraphicsSettings(graphicsUserDataPath, { ...next, restartNotice: false });
+  graphicsRestartNoticePending = false;
+  lifecycleLog.append('graphics_software_fallback', { reason });
+  app.relaunch();
+  app.quit();
+  return true;
+}
 
 ipcMain.handle('graphics:get-settings', () => ({
   supported: process.platform === 'linux',
-  safeGraphicsMode: graphicsSettings.safeGraphicsMode,
-  restartRequired: graphicsSettings.safeGraphicsMode !== graphicsStartupConfig.safeGraphicsMode,
+  mode: graphicsSettings.mode,
+  hardwareStrategy: graphicsSettings.hardwareStrategy,
+  renderer: graphicsSettings.renderer,
+  rendererSoftware: /swiftshader|llvmpipe|software rasterizer/i.test(graphicsSettings.renderer),
+  restartRequired: graphicsSettings.mode !== graphicsStartupConfig.mode || graphicsSettings.hardwareStrategy !== graphicsStartupConfig.hardwareStrategy,
   restartNotice: graphicsRestartNoticePending
 }));
-ipcMain.handle('graphics:set-safe-mode', (_event, enabled) => {
-  if (process.platform !== 'linux') return { supported: false, safeGraphicsMode: false, restartRequired: false };
-  graphicsSettings = writeGraphicsSettings(graphicsUserDataPath, { safeGraphicsMode: enabled === true, restartNotice: graphicsSettings.restartNotice });
-  return { supported: true, safeGraphicsMode: graphicsSettings.safeGraphicsMode, restartRequired: graphicsSettings.safeGraphicsMode !== graphicsStartupConfig.safeGraphicsMode, restartNotice: graphicsRestartNoticePending };
+ipcMain.handle('graphics:set-mode', (_event, mode, hardwareStrategy) => {
+  if (process.platform !== 'linux') return { supported: false, mode: graphicsSettings.mode, restartRequired: false };
+  if (!['auto', 'hardware', 'safe-software'].includes(mode)) throw new Error('Invalid graphics mode.');
+  const strategy = hardwareStrategy === 'egl' ? 'egl' : hardwareStrategy === 'angle-gl' ? 'angle-gl' : graphicsSettings.hardwareStrategy;
+  graphicsSettings = writeGraphicsSettings(graphicsUserDataPath, { ...graphicsSettings, mode, hardwareStrategy: strategy });
+  return { supported: true, mode: graphicsSettings.mode, hardwareStrategy: graphicsSettings.hardwareStrategy, restartRequired: graphicsSettings.mode !== graphicsStartupConfig.mode || graphicsSettings.hardwareStrategy !== graphicsStartupConfig.hardwareStrategy, restartNotice: graphicsRestartNoticePending };
+});
+ipcMain.handle('graphics:report-renderer', (_event, renderer) => {
+  graphicsSettings = writeGraphicsSettings(graphicsUserDataPath, { ...graphicsSettings, renderer: typeof renderer === 'string' ? renderer.slice(0, 200) : '' });
+  if (/swiftshader|llvmpipe|software rasterizer/i.test(graphicsSettings.renderer)) lifecycleLog.append('graphics_software_renderer_detected');
+  return { ok: true };
+});
+ipcMain.handle('graphics:context-failed', () => {
+  const activated = activateAutomaticSoftwareFallback('webgl-context-failure');
+  return { ok: activated, fallback: activated };
 });
 ipcMain.handle('graphics:acknowledge-restart-notice', () => {
   if (!graphicsRestartNoticePending) return false;

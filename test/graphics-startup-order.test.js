@@ -8,10 +8,8 @@ test('Linux graphics switches and safe-mode call run before Electron window and 
   const source = fs.readFileSync(path.join(__dirname, '../electron/main.js'), 'utf8');
   const switches = [
     'app.commandLine.appendSwitch(\'ozone-platform\'',
-    'app.commandLine.appendSwitch(\'disable-features\'',
     'app.commandLine.appendSwitch(\'use-gl\'',
     'app.commandLine.appendSwitch(\'use-angle\'',
-    'app.disableDomainBlockingFor3DAPIs()',
     'app.disableHardwareAcceleration()'
   ];
   const secondElectronRequire = source.indexOf("const { BrowserWindow, ipcMain", source.indexOf("require('electron')") + 1);

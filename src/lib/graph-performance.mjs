@@ -3,7 +3,7 @@ export const PERFORMANCE_MODE_EVENT = 'one-brain:performance-mode-change';
 export const PERFORMANCE_NODE_LIMIT = 3000;
 
 export function isSoftwareRenderer(rendererString) {
-  return /swiftshader|llvmpipe/i.test(String(rendererString || ''));
+  return /swiftshader|llvmpipe|softpipe|software rasterizer/i.test(String(rendererString || ''));
 }
 
 /**
