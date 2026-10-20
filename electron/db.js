@@ -10,7 +10,7 @@ const { JOIN_ALL_MIN } = require('../src/lib/link-constants.json');
 const { rankExtensionResults } = require('./ext-search');
 const lockController = require('./lock-controller');
 const { secureRemovePath } = require('./private-files');
-const { writeVault, readVault, atomicPrivateWrite, unwrapDatabaseKey } = require('./security-vault');
+const { writeVault, readVault, atomicPrivateWrite, unwrapDatabaseKey, passwordCharacterCount } = require('./security-vault');
 const MEMORY_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 
 let database;
@@ -733,7 +733,7 @@ function migrationBackup(userDataPath, keyPath, oldKey) {
 
 async function migrateDatabaseToPassword(userDataPath, password, options = {}) {
   ensureWritable();
-  if (typeof password !== 'string' || password.length < 12) throw new Error('Use a master password with at least 12 characters.');
+  if (typeof password !== 'string' || passwordCharacterCount(password) < 12) throw new Error('Use a master password with at least 12 characters.');
   if (!databaseKey) throw new Error('The current encrypted database key is unavailable.');
   const dbPath = path.join(userDataPath, 'onebrain.db');
   const keyPath = path.join(userDataPath, 'db.key');
@@ -888,9 +888,11 @@ async function exportEncryptedRecoveryFile(userDataPath, destinationPath, passwo
 
 function changeMasterPassword(userDataPath, oldPassword, newPassword) {
   ensureWritable();
-  if (typeof newPassword !== 'string' || newPassword.length < 12) throw new Error('Use a master password with at least 12 characters.');
+  if (typeof newPassword !== 'string' || passwordCharacterCount(newPassword) < 12) throw new Error('Use a master password with at least 12 characters.');
   const vaultPath = path.join(userDataPath, 'db.vault.json');
-  const key = readVault(vaultPath, oldPassword);
+  let key;
+  try { key = readVault(vaultPath, oldPassword); }
+  catch { throw new Error('Wrong current password'); }
   const nextVaultPath = path.join(userDataPath, `.db.vault.${randomBytes(8).toString('hex')}.tmp`);
   let backupPath;
   try {

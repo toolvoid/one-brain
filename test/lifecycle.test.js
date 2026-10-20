@@ -64,6 +64,17 @@ test('vault lock events include reason and idle duration without secrets', (t) =
   assert.doesNotMatch(fs.readFileSync(log.filePath, 'utf8'), /not-a-secret-to-log|must not be logged/);
 });
 
+test('password lockout lifecycle events keep only escalation level and duration', (t) => {
+  const directory = temporaryDirectory(t);
+  const log = createLifecycleLog(directory);
+  log.append('vault_lockout_started', { level: 3, durationMs: 1_800_000, password: 'never-log-this' });
+  log.append('vault_lockout_ended', { password: 'never-log-this' });
+  const lines = fs.readFileSync(log.filePath, 'utf8');
+  assert.doesNotMatch(lines, /never-log-this|password/i);
+  assert.match(lines, /"event":"vault_lockout_started".*"level":3.*"durationMs":1800000/);
+  assert.match(lines, /"event":"vault_lockout_ended"/);
+});
+
 test('renderer error lifecycle event keeps a redacted error and source location', (t) => {
   const directory = temporaryDirectory(t);
   const log = createLifecycleLog(directory);

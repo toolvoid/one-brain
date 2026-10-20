@@ -7,9 +7,10 @@ const { randomBytes, scryptSync, createCipheriv, createDecipheriv, timingSafeEqu
 // scrypt's 256 MiB working set makes offline guessing materially expensive.
 const SCRYPT = Object.freeze({ N: 1 << 18, r: 8, p: 1, maxmem: 300 * 1024 * 1024 });
 const IDLE_MINUTES = Object.freeze([1, 5, 10, 15, 30, 60]);
+const passwordCharacterCount = (password) => Array.from(String(password ?? '')).length;
 
 function deriveWrappingKey(password, salt, params = SCRYPT) {
-  if (typeof password !== 'string' || password.length < 12) throw new Error('Use a master password with at least 12 characters.');
+  if (typeof password !== 'string' || passwordCharacterCount(password) < 12) throw new Error('Use a master password with at least 12 characters.');
   return scryptSync(password, salt, 32, params);
 }
 
@@ -77,4 +78,4 @@ function lockState({ idleMinutes = 10, onLock = () => {}, now = () => Date.now()
   };
 }
 
-module.exports = { SCRYPT, IDLE_MINUTES, deriveWrappingKey, wrapDatabaseKey, unwrapDatabaseKey, writeVault, readVault, atomicPrivateWrite, checkPrivatePermissions, lockState };
+module.exports = { SCRYPT, IDLE_MINUTES, passwordCharacterCount, deriveWrappingKey, wrapDatabaseKey, unwrapDatabaseKey, writeVault, readVault, atomicPrivateWrite, checkPrivatePermissions, lockState };

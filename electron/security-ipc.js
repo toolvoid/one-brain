@@ -2,6 +2,7 @@
 
 const path = require('node:path');
 const fs = require('node:fs');
+const { createPasswordLockout } = require('./password-lockout');
 
 function safeError(error) {
   const name = String(error?.name || 'Error').replace(/[^\w.-]/g, '').slice(0, 40) || 'Error';
@@ -12,6 +13,23 @@ function safeError(error) {
     .slice(0, 200);
   if (!message) message = 'The operation failed.';
   return { name, message };
+}
+
+function passwordCheckBlocked(lockout) {
+  const status = lockout?.status?.();
+  if (!status?.locked) return null;
+  const seconds = Math.ceil(status.remainingMs / 1000);
+  const countdown = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+  return { ok: false, error: `Password checks are locked. Try again in ${countdown}.`, lockedOut: true, ...status };
+}
+
+function failedPasswordCheck(lockout, error = 'Wrong password') {
+  const status = lockout?.recordFailure?.() || {};
+  return { ok: false, error, ...status };
+}
+
+function wrongRecoveryPassword(error) {
+  return /^(Wrong current password|Incorrect master password or damaged vault\.)$/.test(String(error?.message || ''));
 }
 
 function registerSecurityIpc(ipcMain, {
@@ -26,6 +44,8 @@ function registerSecurityIpc(ipcMain, {
   restoreEncryptedRecoveryFile,
   deleteOldBackups,
   logFailure = () => {},
+  logEvent = () => {},
+  passwordLockout = createPasswordLockout(),
 }) {
   ipcMain.handle('security:has-master-password', async () => {
     try { return { ok: true, error: null, set: fs.existsSync(path.join(getUserDataPath(), 'db.vault.json')) }; }
@@ -48,10 +68,18 @@ function registerSecurityIpc(ipcMain, {
   });
 
   ipcMain.handle('security:change-master-password', async (_event, oldPassword, newPassword) => {
+    const blocked = passwordCheckBlocked(passwordLockout);
+    if (blocked) return blocked;
     try {
       const result = await changeMasterPassword(getUserDataPath(), oldPassword, newPassword);
+      passwordLockout?.recordSuccess?.();
+      try { logEvent('vault_password_changed'); } catch {}
       return { ok: true, error: null, ...result };
     } catch (error) {
+      if (wrongRecoveryPassword(error)) {
+        try { logFailure({ operation: 'change_password', name: 'WrongPasswordError', message: 'Wrong current password' }); } catch {}
+        return failedPasswordCheck(passwordLockout, 'Wrong current password');
+      }
       const safe = safeError(error);
       try { logFailure({ operation: 'change_password', ...safe }); } catch {}
       return { ok: false, error: safe.message };
@@ -59,6 +87,8 @@ function registerSecurityIpc(ipcMain, {
   });
 
   ipcMain.handle('security:export-recovery', async (_event, password) => {
+    const blocked = passwordCheckBlocked(passwordLockout);
+    if (blocked) return blocked;
     try {
       const userDataPath = getUserDataPath();
       if (!fs.existsSync(path.join(userDataPath, 'db.vault.json'))) return { ok: false, error: 'Set a master password first.' };
@@ -67,8 +97,9 @@ function registerSecurityIpc(ipcMain, {
       if (!validPassword) {
         const safe = { name: 'WrongPasswordError', message: 'Wrong password' };
         try { logFailure({ operation: 'export_recovery', ...safe }); } catch {}
-        return { ok: false, error: 'Wrong password' };
+        return failedPasswordCheck(passwordLockout, 'Wrong password');
       }
+      passwordLockout?.recordSuccess?.();
       const result = await dialog.showSaveDialog(getMainWindow(), {
         title: 'Export encrypted recovery file',
         defaultPath: path.join(getHomePath(), 'one-brain-recovery.obr'),
@@ -76,6 +107,7 @@ function registerSecurityIpc(ipcMain, {
       });
       if (result.canceled || !result.filePath) return { ok: false, error: 'Recovery export canceled.', canceled: true };
       const exported = await exportEncryptedRecoveryFile(userDataPath, result.filePath, password);
+      passwordLockout?.recordSuccess?.();
       return { ok: true, error: null, ...exported };
     } catch (error) {
       const safe = safeError(error);
@@ -85,6 +117,8 @@ function registerSecurityIpc(ipcMain, {
   });
 
   ipcMain.handle('security:restore-recovery', async (_event, password) => {
+    const blocked = passwordCheckBlocked(passwordLockout);
+    if (blocked) return blocked;
     try {
       const result = await dialog.showOpenDialog(getMainWindow(), {
         title: 'Restore encrypted One Brain backup',
@@ -93,8 +127,13 @@ function registerSecurityIpc(ipcMain, {
       });
       if (result.canceled || !result.filePaths?.[0]) return { ok: false, error: 'Recovery restore canceled.', canceled: true };
       const restored = await restoreEncryptedRecoveryFile(getUserDataPath(), result.filePaths[0], password);
+      passwordLockout?.recordSuccess?.();
       return { ok: true, error: null, ...restored };
     } catch (error) {
+      if (wrongRecoveryPassword(error)) {
+        try { logFailure({ operation: 'restore_recovery', name: 'WrongPasswordError', message: 'Wrong password' }); } catch {}
+        return failedPasswordCheck(passwordLockout, 'Wrong password');
+      }
       const safe = safeError(error);
       try { logFailure({ operation: 'restore_recovery', ...safe }); } catch {}
       return { ok: false, error: safe.message };
@@ -105,13 +144,16 @@ function registerSecurityIpc(ipcMain, {
     try {
       if (confirmation !== 'DELETE OLD BACKUPS') return { ok: false, error: 'Type DELETE OLD BACKUPS to confirm.' };
       if (!fs.existsSync(path.join(getUserDataPath(), 'db.vault.json'))) return { ok: false, error: 'Set a master password first.' };
+      const blocked = passwordCheckBlocked(passwordLockout);
+      if (blocked) return blocked;
       let valid = false;
       try { valid = await verifyMasterPassword(getUserDataPath(), password); } catch {}
       if (!valid) {
         try { logFailure({ operation: 'delete_old_backups', name: 'WrongPasswordError', message: 'Wrong password' }); } catch {}
-        return { ok: false, error: 'Wrong password' };
+        return failedPasswordCheck(passwordLockout, 'Wrong password');
       }
       const deleted = deleteOldBackups(getUserDataPath());
+      passwordLockout?.recordSuccess?.();
       return { ok: true, error: null, deleted };
     } catch (error) {
       const safe = safeError(error);
@@ -126,22 +168,22 @@ function registerUnlockIpc(ipcMain, {
   getEpoch = () => lockController.getEpoch?.() || 0,
   logEvent = () => {},
   notifyUnlocked = () => {},
-  delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-  failureDelayMs = 1000,
+  passwordLockout = createPasswordLockout(),
   onLockNow = () => {},
 }) {
-  let failures = 0;
   ipcMain.handle('security:startup-state', async () => ({ ok: true, error: null, locked: lockController.isLocked(), epoch: getEpoch() }));
+  ipcMain.handle('security:unlock-lockout-status', async () => ({ ok: true, ...passwordLockout.status() }));
   ipcMain.handle('security:unlock', async (_event, password) => {
+    const current = passwordLockout.status();
+    if (current.locked) return { ok: false, error: 'Unlock attempts are temporarily locked.', lockedOut: true, ...current };
     let ok = false;
     try { ok = await lockController.unlock(password); } catch { ok = false; }
     if (!ok) {
-      failures += 1;
+      const status = passwordLockout.recordFailure();
       try { logEvent('vault_unlock_failed'); } catch {}
-      if (failures % 5 === 0) await delay(failureDelayMs);
-      return { ok: false, error: 'Wrong password' };
+      return { ok: false, error: 'Wrong password', ...status };
     }
-    failures = 0;
+    passwordLockout.recordSuccess();
     try { logEvent('vault_unlocked'); } catch {}
     try { notifyUnlocked(); } catch {}
     return { ok: true, error: null };

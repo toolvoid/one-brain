@@ -4,10 +4,17 @@ const { app, powerMonitor } = require('electron');
 const path = require('path');
 const fs = require('node:fs');
 const { createLifecycleLog, instrumentAppExitCalls } = require('./lifecycle-log');
+const { createPasswordLockout } = require('./password-lockout');
 const userDataRoot = app.getPath('userData');
 const userDataPermissionFix = enforcePrivateTree(userDataRoot);
 cleanupSensitiveTemps(userDataRoot);
 const lifecycleLog = createLifecycleLog(userDataRoot);
+const passwordLockout = createPasswordLockout({
+  filePath: path.join(userDataRoot, 'password-lockout.json'),
+  onEvent: (event, details) => lifecycleLog.append(event, details),
+});
+const passwordLockoutTimer = setInterval(() => passwordLockout.status(), 1000);
+passwordLockoutTimer.unref?.();
 lifecycleLog.append('app_start');
 if (userDataPermissionFix.changed.length) lifecycleLog.append('user_data_permissions_fixed', { count: userDataPermissionFix.changed.length });
 if (userDataPermissionFix.failed.length) lifecycleLog.append('user_data_permissions_failed', { count: userDataPermissionFix.failed.length });
@@ -52,6 +59,7 @@ const lockController = require('./lock-controller');
 const { lockDatabase } = require('./db');
 const { migrateDatabaseToPassword, verifyMasterPassword, unlockDatabaseWithPassword, exportEncryptedRecoveryFile, changeMasterPassword, restoreEncryptedRecoveryFile } = require('./db');
 const { createAutoLockMonitor } = require('./auto-lock');
+const { createKeepUnlockedWindow } = require('./keep-unlocked');
 const { attachSystemLockEvents } = require('./system-lock');
 const { createSecuritySettings } = require('./security-settings');
 const { deleteOldBackups: deleteOldBackupFiles } = require('./private-files');
@@ -75,8 +83,12 @@ const mainWindowCrashLimiter = createCrashLoopLimiter({ maxRestarts: 3, windowMs
 const pendingReloads = new WeakSet();
 const securitySettings = createSecuritySettings(userDataRoot);
 let autoLockMonitor = null;
+let keepUnlockedWindow = null;
 let detachSystemLockEvents = () => {};
-const lockIfVaultConfigured = (reason, elapsedIdleMs) => fs.existsSync(path.join(userDataRoot, 'db.vault.json')) && lockController.lock(reason, elapsedIdleMs);
+const lockIfVaultConfigured = (reason, elapsedIdleMs) => {
+  if (reason !== 'idle') keepUnlockedWindow?.end(reason === 'suspend' ? 'suspend' : reason === 'quit' ? 'quit' : 'manual');
+  return fs.existsSync(path.join(userDataRoot, 'db.vault.json')) && lockController.lock(reason, elapsedIdleMs);
+};
 
 function logChildProcessSpawn(command) { lifecycleLog.append('child_process_spawn', { command }); }
 
@@ -412,8 +424,16 @@ ipcMain.handle('security:set-auto-lock', (_event, minutes) => {
   catch (error) { return { ok: false, error: error?.message || 'Could not save auto-lock setting.' }; }
 });
 ipcMain.handle('security:stay-unlocked', () => {
-  autoLockMonitor?.touchActivity();
-  return { ok: true, error: null };
+  try {
+    if (lockController.isLocked()) return { ok: false, error: 'One Brain is locked.' };
+    autoLockMonitor?.touchActivity();
+    return { ok: true, error: null, ...keepUnlockedWindow?.start() };
+  } catch (error) { return { ok: false, error: error?.message || 'Could not stay unlocked.' }; }
+});
+ipcMain.handle('security:keep-unlocked-status', () => ({ ok: true, ...keepUnlockedWindow?.getStatus() || { active: false, remainingMs: 0 } }));
+ipcMain.handle('security:cancel-keep-unlocked', () => {
+  const ended = keepUnlockedWindow?.end('cancelled') || false;
+  return { ok: true, ended };
 });
 ipcMain.on('security:activity', (event) => {
   const window = BrowserWindow.fromWebContents(event.sender);
@@ -432,9 +452,12 @@ registerSecurityIpc(ipcMain, {
   restoreEncryptedRecoveryFile,
   deleteOldBackups: deleteOldBackupFiles,
   logFailure: (details) => lifecycleLog.append('vault_operation_failed', details),
+  logEvent: (event) => lifecycleLog.append(event),
+  passwordLockout,
 });
 registerUnlockIpc(ipcMain, {
   lockController,
+  passwordLockout,
   logEvent: (event) => lifecycleLog.append(event),
   notifyUnlocked: () => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:unlocked', lockController.getEpoch()); },
   onLockNow: () => lockIfVaultConfigured('manual'),
@@ -608,9 +631,21 @@ app.whenReady().then(async () => {
     getEnabled: () => securitySettings.read().autoLockEnabled,
     getTimeoutMinutes: () => fs.existsSync(path.join(userDataPath, 'db.vault.json')) ? securitySettings.read().autoLockMinutes : 0,
     lock: lockIfVaultConfigured,
+    isKeepUnlockedActive: () => keepUnlockedWindow?.isActive() || false,
     onWarning: (visible) => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:auto-lock-warning', visible); },
   });
-  detachSystemLockEvents = attachSystemLockEvents(powerMonitor, () => { if (securitySettings.read().lockOnSystemLock) lockIfVaultConfigured('suspend'); });
+  keepUnlockedWindow = createKeepUnlockedWindow({
+    getDurationMinutes: () => securitySettings.read().keepUnlockedMinutes,
+    onChange: (status) => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:keep-unlocked-status', status); },
+    onEvent: (event, details = {}) => {
+      lifecycleLog.append(event, details);
+      if (event === 'keep_unlocked_ended' && ['expired', 'cancelled', 'restarted'].includes(details.reason)) autoLockMonitor?.resumeAfterGrace();
+    },
+  });
+  detachSystemLockEvents = attachSystemLockEvents(powerMonitor, () => {
+    const graceWasActive = keepUnlockedWindow?.end('suspend') || false;
+    if (graceWasActive || securitySettings.read().lockOnSystemLock) lockIfVaultConfigured('suspend');
+  });
   try { globalShortcut.register('CommandOrControl+Shift+L', () => lockIfVaultConfigured('manual')); } catch {}
   try { applyQuickContextSettings(readQuickContextSettings()); } catch { /* Keep the app usable if the OS reserves the selected shortcut. */ }
   createWindow();
@@ -684,9 +719,11 @@ app.whenReady().then(async () => {
 
   app.on('before-quit', () => {
   globalShortcut.unregisterAll();
+  clearInterval(passwordLockoutTimer);
   autoLockMonitor?.stop();
   detachSystemLockEvents();
   cleanupSensitiveTemps(userDataRoot);
+  keepUnlockedWindow?.end('quit');
   lockController.lock('quit');
   if (mcpConnection?.server.listening) mcpConnection.server.close();
   embedder?.close();

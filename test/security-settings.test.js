@@ -11,9 +11,10 @@ test('security settings default to a 15-minute timeout and accept only supported
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'one-brain-security-settings-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const settings = createSecuritySettings(directory);
-  assert.deepEqual(settings.read(), { autoLockEnabled: true, autoLockMinutes: 15, lockOnSystemLock: true, lastUnlockAt: null });
-  assert.deepEqual(settings.write({ autoLockEnabled: false, autoLockMinutes: 60, lockOnSystemLock: false, lastUnlockAt: '2026-10-21T00:00:00.000Z' }), { autoLockEnabled: false, autoLockMinutes: 60, lockOnSystemLock: false, lastUnlockAt: '2026-10-21T00:00:00.000Z' });
+  assert.deepEqual(settings.read(), { autoLockEnabled: true, autoLockMinutes: 15, lockOnSystemLock: true, keepUnlockedMinutes: 120, lastUnlockAt: null });
+  assert.deepEqual(settings.write({ autoLockEnabled: false, autoLockMinutes: 60, lockOnSystemLock: false, keepUnlockedMinutes: 240, lastUnlockAt: '2026-10-21T00:00:00.000Z' }), { autoLockEnabled: false, autoLockMinutes: 60, lockOnSystemLock: false, keepUnlockedMinutes: 240, lastUnlockAt: '2026-10-21T00:00:00.000Z' });
   assert.throws(() => settings.write({ autoLockMinutes: 2 }), /Choose 1, 5, 15, 30, or 60 minutes/);
+  assert.throws(() => settings.write({ keepUnlockedMinutes: 45 }), /Choose 30 minutes, 1 hour, 2 hours, or 4 hours/);
   if (process.platform !== 'win32') {
     assert.equal(fs.statSync(settings.filePath).mode & 0o777, 0o600);
     assert.equal(fs.statSync(directory).mode & 0o777, 0o700);

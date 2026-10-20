@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const lockController = require('../electron/lock-controller');
 const { registerUnlockIpc } = require('../electron/security-ipc');
+const { createPasswordLockout } = require('../electron/password-lockout');
 const { registerMemoryReadIpc } = require('../electron/memory-ipc');
 const { handleAllWindowsClosed } = require('../electron/window-quit-policy');
 
@@ -30,36 +31,49 @@ test('vault startup stays open with no windows and exposes only the locked start
 test('wrong password remains locked; right password unlocks and signals the renderer', async () => {
   const handlers = new Map();
   const events = [];
+  const passwordLockout = createPasswordLockout({ nowWall: () => 1_000, nowMonotonic: () => 1_000, bootId: 'unlock-test' });
   let reopened = 0;
   lockController.resetForTest();
   lockController.configure({ verifyPassword: async (password) => password === 'right password', onUnlock: async () => { reopened++; } });
   lockController.lock();
   registerUnlockIpc({ handle: (channel, handler) => handlers.set(channel, handler) }, {
     lockController,
+    passwordLockout,
     logEvent: (event) => events.push(event),
     notifyUnlocked: () => events.push('renderer_unlocked'),
     delay: async () => {},
   });
   try {
-    assert.deepEqual(await handlers.get('security:unlock')({}, 'wrong password'), { ok: false, error: 'Wrong password' });
+    const wrong = await handlers.get('security:unlock')({}, 'wrong password');
+    assert.equal(wrong.ok, false);
+    assert.equal(wrong.error, 'Wrong password');
+    assert.equal(wrong.failedCount, 1);
     assert.equal(lockController.isLocked(), true);
     assert.deepEqual(await handlers.get('security:unlock')({}, 'right password'), { ok: true, error: null });
     assert.equal(lockController.isLocked(), false);
     assert.equal(reopened, 1);
+    assert.equal(passwordLockout.status().failedCount, 0);
+    assert.equal(passwordLockout.status().level, 0);
     assert.deepEqual(events, ['vault_unlock_failed', 'vault_unlocked', 'renderer_unlocked']);
   } finally { lockController.resetForTest(); }
 });
 
-test('unlock IPC delays after each fifth failed password attempt', async () => {
+test('unlock IPC blocks after five wrong attempts and exposes the cooldown status', async () => {
   const handlers = new Map();
-  const delays = [];
+  let wall = 1_000_000, monotonic = 1_000;
+  const passwordLockout = createPasswordLockout({ nowWall: () => wall, nowMonotonic: () => monotonic, bootId: 'test-boot' });
   lockController.resetForTest();
   lockController.configure({ verifyPassword: async () => false });
   lockController.lock();
-  registerUnlockIpc({ handle: (channel, handler) => handlers.set(channel, handler) }, { lockController, delay: async (ms) => delays.push(ms), failureDelayMs: 750 });
+  registerUnlockIpc({ handle: (channel, handler) => handlers.set(channel, handler) }, { lockController, passwordLockout });
   try {
-    for (let attempt = 0; attempt < 5; attempt++) await handlers.get('security:unlock')({}, 'wrong');
-    assert.deepEqual(delays, [750]);
+    let result;
+    for (let attempt = 0; attempt < 5; attempt++) result = await handlers.get('security:unlock')({}, 'wrong');
+    assert.equal(result.locked, true);
+    assert.equal(result.remainingMs, 120_000);
+    result = await handlers.get('security:unlock')({}, 'wrong');
+    assert.equal(result.lockedOut, true);
+    assert.equal(result.failedCount, 5);
     assert.equal(lockController.isLocked(), true);
   } finally { lockController.resetForTest(); }
 });

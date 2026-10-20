@@ -32,26 +32,29 @@ test('password migration runs on a temporary DB copy, backs up db and key, and e
     assert.equal(fs.existsSync(beforeSetPath), false);
     const oldKeyFile = fs.readFileSync(path.join(userData, 'db.key'));
     const result = await db.migrateDatabaseToPassword(userData, 'correct migration password');
-    assert.throws(() => db.changeMasterPassword(userData, 'wrong old password', 'new migration password'), /Incorrect master password|damaged vault/);
-    assert.equal(db.verifyMasterPassword(userData, 'correct migration password'), true);
+    assert.throws(() => db.changeMasterPassword(userData, 'wrong old password', 'new migration password'), /Wrong current password/);
+    assert.throws(() => db.changeMasterPassword(userData, 'correct migration password', '12345678901'), /at least 12 characters/);
+    const newMasterPassword = 'newpass 12!!';
+    db.changeMasterPassword(userData, 'correct migration password', newMasterPassword);
+    assert.equal(db.verifyMasterPassword(userData, newMasterPassword), true, 'the new password re-opens the encrypted database');
+    assert.throws(() => db.verifyMasterPassword(userData, 'correct migration password'), /Incorrect master password/);
     assert.equal(db.getMemory(memory.id).content, 'Synthetic migration data never written to the real profile.');
     assert.ok(fs.existsSync(path.join(userData, 'db.key.bak')));
     assert.equal(fs.existsSync(path.join(userData, 'db.key')), false);
     assert.ok(fs.existsSync(path.join(result.backupPath, 'onebrain.db')));
     assert.deepEqual(fs.readFileSync(path.join(result.backupPath, 'db.key')), oldKeyFile);
-    assert.equal(db.verifyMasterPassword(userData, 'correct migration password'), true);
     assert.throws(() => unwrapDatabaseKey(JSON.parse(fs.readFileSync(path.join(userData, 'db.vault.json'), 'utf8')), 'wrong password'), /Incorrect master password/);
     const recoveryPath = path.join(root, 'recovery.obr');
     const wrongPasswordPath = path.join(root, 'wrong-password.obr');
     await assert.rejects(db.exportEncryptedRecoveryFile(userData, wrongPasswordPath, 'wrong recovery password'), /Incorrect master password/);
     assert.equal(fs.existsSync(wrongPasswordPath), false);
-    await db.exportEncryptedRecoveryFile(userData, recoveryPath, 'correct migration password');
+    await db.exportEncryptedRecoveryFile(userData, recoveryPath, newMasterPassword);
     const recovery = JSON.parse(fs.readFileSync(recoveryPath, 'utf8'));
     assert.equal(recovery.format, 'one-brain-encrypted-recovery-v1');
     assert.equal(recovery.database.includes('Synthetic migration data'), false);
     const recoveredDbPath = path.join(root, 'recovered.db');
     fs.writeFileSync(recoveredDbPath, Buffer.from(recovery.database, 'base64'));
-    const recoveryKey = unwrapDatabaseKey(recovery.vault, 'correct migration password');
+    const recoveryKey = unwrapDatabaseKey(recovery.vault, newMasterPassword);
     const countRows = (file) => {
       const connection = new Database(file, { readonly: true, fileMustExist: true });
       try { connection.pragma("cipher = 'sqlcipher'"); connection.pragma('legacy = 4'); connection.key(recoveryKey); return connection.prepare('SELECT count(*) AS count FROM memories').get().count; }
@@ -68,7 +71,7 @@ test('password migration runs on a temporary DB copy, backs up db and key, and e
     lockController.lock();
     assert.equal(await lockController.unlock('wrong recovery password'), false);
     assert.equal(lockController.isLocked(), true);
-    assert.equal(await lockController.unlock('correct migration password'), true);
+    assert.equal(await lockController.unlock(newMasterPassword), true);
     assert.equal(lockController.isLocked(), false);
     assert.equal(db.getMemory(memory.id).content, 'Synthetic migration data never written to the real profile.');
   } finally {

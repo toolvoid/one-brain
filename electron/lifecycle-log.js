@@ -47,6 +47,11 @@ function safeDetails(event, details = {}) {
     safe.reason = details.reason;
     if (Number.isFinite(Number(details.elapsedIdleMs))) safe.elapsedIdleMs = Math.max(0, Math.floor(Number(details.elapsedIdleMs)));
   }
+  if (event === 'keep_unlocked_ended' && ['expired', 'cancelled', 'manual', 'suspend', 'quit', 'restarted'].includes(details.reason)) safe.reason = details.reason;
+  if (event === 'vault_lockout_started') {
+    if (Number.isSafeInteger(details.level) && details.level >= 1 && details.level <= 8) safe.level = details.level;
+    if (Number.isSafeInteger(details.durationMs) && details.durationMs > 0 && details.durationMs <= 7 * 24 * 60 * 60_000) safe.durationMs = details.durationMs;
+  }
   if (event === 'renderer_error') {
     if (/^[\w.$-]{1,60}$/.test(String(details.name || ''))) safe.name = String(details.name);
     if (/^[\w.-]{1,100}$/.test(String(details.source || ''))) safe.source = String(details.source);

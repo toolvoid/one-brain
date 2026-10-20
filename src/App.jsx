@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import BrainGraph from './components/BrainGraph.jsx';
+import PanelErrorBoundary from './components/PanelErrorBoundary.jsx';
+import SecuritySettingsPanel from './components/SecuritySettingsPanel.jsx';
 import { MAX_IMPORT_ITEMS, isLogLikeChunk, parseImportText, parseImportFile, inferImportSource } from './lib/importers.mjs';
 import '../extension/src/smart-save.js';
 import { fallbackMemoryTitle, heuristicMemoryTitle, isChatModel, memorySourceForProvider } from './lib/chat-models.mjs';
@@ -260,79 +262,6 @@ function ProviderKeysPanel({ clients }) {
   </section>;
 }
 
-function SecuritySettingsPanel() {
-  const [status, setStatus] = useState(null);
-  const [mode, setMode] = useState(null);
-  const [oldPassword, setOldPassword] = useState('');
-  const [password, setPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [typedConfirmation, setTypedConfirmation] = useState('');
-  const [visible, setVisible] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const [notice, setNotice] = useState('');
-  async function refresh() {
-    const result = await window.brain.getSecurityStatus();
-    if (!result?.ok) throw new Error(result?.error || 'Could not read security status.');
-    setStatus(result);
-  }
-  useEffect(() => { let active = true; window.brain.getSecurityStatus().then((result) => { if (active && result?.ok) setStatus(result); else if (active) setError(result?.error || 'Could not read security status.'); }).catch((reason) => { if (active) setError(reason?.message || 'Could not read security status.'); }); return () => { active = false; }; }, []);
-  function open(next) { setMode(next); setOldPassword(''); setPassword(''); setConfirmPassword(''); setTypedConfirmation(''); setVisible(false); setError(''); setNotice(''); }
-  async function submit(event) {
-    event.preventDefault();
-    if (['set', 'change'].includes(mode) && password.length < 12) { setError('Use at least 12 characters.'); return; }
-    if (['set', 'change'].includes(mode) && password !== confirmPassword) { setError('The passwords do not match.'); return; }
-    if (mode === 'change' && !oldPassword) { setError('Enter your current master password.'); return; }
-    if (mode === 'delete-backups' && typedConfirmation !== 'DELETE OLD BACKUPS') { setError('Type DELETE OLD BACKUPS exactly to confirm.'); return; }
-    setBusy(true); setError('');
-    try {
-      const result = mode === 'set' ? await window.brain.setMasterPassword(password)
-        : mode === 'change' ? await window.brain.changeMasterPassword(oldPassword, password)
-            : mode === 'export' ? await window.brain.exportRecoveryFile(password)
-              : mode === 'restore' ? await window.brain.restoreRecoveryFile(password)
-                : await window.brain.deleteOldBackups(password, typedConfirmation);
-      if (!result?.ok) {
-        if (result?.canceled) { setNotice(result.error || 'Canceled.'); setMode(null); }
-        else setError(result?.error || 'The operation failed.');
-        return;
-      }
-      if (mode === 'restore') {
-        setNotice('Encrypted backup restored. Reloading your memories…');
-        setTimeout(() => window.location.reload(), 700);
-      } else if (mode === 'export') setNotice(`Encrypted recovery file saved to ${result.path}.`);
-      else if (mode === 'delete-backups') setNotice('Old migration backups deleted.');
-      else if (mode === 'set') setNotice('Master password set. A timestamped backup was created.');
-      else setNotice('Master password changed.');
-      setMode(null); setOldPassword(''); setPassword(''); setConfirmPassword('');
-      await refresh();
-    } catch (reason) { setError(reason?.message || 'The operation failed.'); }
-    finally { setBusy(false); }
-  }
-  const modeLabel = mode === 'set' ? 'Set master password' : mode === 'change' ? 'Change master password' : mode === 'export' ? 'Export recovery file' : mode === 'restore' ? 'Restore encrypted backup' : 'Delete old backups';
-  return <section className="connection-security security-settings-page">
-    <h3>Vault security</h3>
-    {status ? <dl className="security-status-list"><dt>Vault</dt><dd>{status.vaultSet ? status.locked ? 'Locked' : 'Unlocked' : 'No master password set'}</dd><dt>Key backend</dt><dd>{status.backend}</dd><dt>Last unlock</dt><dd>{status.lastUnlockAt ? new Date(status.lastUnlockAt).toLocaleString() : 'Not recorded'}</dd></dl> : <p>Loading security status…</p>}
-    <label className="proxy-setting"><span>Auto-lock</span><input type="checkbox" checked={status?.autoLockEnabled ?? true} disabled={!status} onChange={async (event) => { const result = await window.brain.setAutoLockSettings({ autoLockEnabled: event.target.checked }); if (result?.ok) await refresh(); else setError(result?.error || 'Could not save auto-lock setting.'); }} /><span>{status?.autoLockEnabled ? 'On' : 'Off'}</span></label>
-    {status?.autoLockEnabled && <label className="proxy-setting">Lock after<select value={status.autoLockMinutes} onChange={async (event) => { const result = await window.brain.setAutoLockSettings({ autoLockMinutes: Number(event.target.value) }); if (result?.ok) await refresh(); else setError(result?.error || 'Could not save auto-lock setting.'); }}><option value={1}>1 minute</option><option value={5}>5 minutes</option><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option value={60}>60 minutes</option></select></label>}
-    <label className="proxy-setting"><span>Lock on suspend / screen lock</span><input type="checkbox" checked={status?.lockOnSystemLock ?? true} disabled={!status} onChange={async (event) => { const result = await window.brain.setAutoLockSettings({ lockOnSystemLock: event.target.checked }); if (result?.ok) await refresh(); else setError(result?.error || 'Could not save lock setting.'); }} /><span>{status?.lockOnSystemLock ? 'On' : 'Off'}</span></label>
-    <div className="security-settings-actions"><button type="button" disabled={!status?.vaultSet} onClick={async () => { const result = await window.brain.lockNow(); if (!result?.ok) setError(result?.error || 'Could not lock One Brain.'); }}>Lock now</button><button type="button" onClick={() => open(status?.vaultSet ? 'change' : 'set')}>{status?.vaultSet ? 'Change password' : 'Set password'}</button><button type="button" disabled={!status?.vaultSet} onClick={() => open('export')}>Export recovery file</button><button type="button" onClick={() => open('restore')}>Restore encrypted backup</button></div>
-    {status?.oldBackupsExist && <section className="old-backup-warning"><strong>Old pre-password backup still exists and can be read without your password</strong><p>Deleting these backups is permanent. Enter your master password and type the confirmation phrase.</p><button type="button" onClick={() => open('delete-backups')}>Delete old backups</button></section>}
-    {!status?.vaultSet && <p role="note">Set a master password first. Until then, the vault has no password protection.</p>}
-    <p role="note">If you forget your master password and have no encrypted recovery file, the data cannot be recovered and will be lost.</p>
-    <p role="note">Full-disk encryption (LUKS) is the OS-level protection and is recommended.</p>
-    {notice && <p role="status">{notice}</p>}{error && !mode && <p role="alert">{error}</p>}
-    {mode && createPortal(<div className="connection-window-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setMode(null); }}><form className="security-password-modal" role="dialog" aria-modal="true" aria-labelledby="security-password-title" noValidate onSubmit={(event) => void submit(event)}><header><div><h2 id="security-password-title">{modeLabel}</h2><small>{mode === 'export' ? 'Verify your current master password before exporting.' : mode === 'restore' ? 'Enter the password used to encrypt this backup.' : mode === 'change' ? 'Your current password is verified before the key is re-wrapped.' : 'A timestamped safety backup is created before re-keying.'}</small></div><button type="button" aria-label="Close password dialog" disabled={busy} onClick={() => setMode(null)}>×</button></header>
-      {mode === 'change' && <label>Current master password<input autoFocus type={visible ? 'text' : 'password'} autoComplete="current-password" value={oldPassword} onChange={(event) => setOldPassword(event.target.value)} disabled={busy} /></label>}
-      {mode !== 'change' && <label>{mode === 'restore' ? 'Backup password' : mode === 'export' || mode === 'delete-backups' ? 'Current master password' : 'New master password'}<input autoFocus type={visible ? 'text' : 'password'} minLength={['set', 'change'].includes(mode) ? 12 : undefined} autoComplete={mode === 'export' || mode === 'delete-backups' || mode === 'change' ? 'current-password' : 'new-password'} required value={password} onChange={(event) => setPassword(event.target.value)} disabled={busy} /></label>}
-      {['set', 'change'].includes(mode) && <label>Confirm new password<input type={visible ? 'text' : 'password'} minLength={12} autoComplete="new-password" required value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} disabled={busy} /></label>}
-      {mode === 'delete-backups' && <label>Type DELETE OLD BACKUPS to confirm<input autoComplete="off" value={typedConfirmation} onChange={(event) => setTypedConfirmation(event.target.value)} disabled={busy} /></label>}
-      <button type="button" className="security-password-toggle" aria-pressed={visible} onClick={() => setVisible((value) => !value)}>{visible ? 'Hide passwords' : 'Show passwords'}</button>
-      {error && <p className="security-password-error" role="alert">{error}</p>}
-      <footer><button type="button" disabled={busy} onClick={() => setMode(null)}>Cancel</button><button type="submit" disabled={busy}>{busy ? 'Working…' : mode === 'export' ? 'Choose save location' : mode === 'restore' ? 'Choose backup file' : modeLabel}</button></footer>
-    </form></div>, document.body)}
-  </section>;
-}
-
 function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContext, activity, counts, mcpConfig, onRefresh, onConnect, onDisconnect, onTest, onConnectAll, onRotateAll }) {
   const [tab, setTab] = useState('connections');
   const [filter, setFilter] = useState('');
@@ -461,7 +390,7 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
     {notice && <p className="connection-notice" role="status">{notice}</p>}
     {pairCode && <p className="extension-pair-code" role="status">Pairing code <strong>{pairCode.code}</strong> · expires in 2 minutes<br />API address <code>{pairCode.endpoint}</code></p>}
     {testResults && <div className="connection-test-results">{testResults.map((result) => <small key={result.name}>{result.name}: {result.skipped ? 'Setup needed' : result.ok ? 'Pass' : 'Fail'} · {result.reason}</small>)}</div>}
-    {tab === 'security' ? <SecuritySettingsPanel /> : tab === 'connections' ? <>
+    {tab === 'security' ? <PanelErrorBoundary><SecuritySettingsPanel /></PanelErrorBoundary> : tab === 'connections' ? <>
       <nav className="connection-filters" aria-label="Filter connections">{[['all', 'All', rows.length], ['connected', 'Connected', connectedCount], ['attention', 'Needs attention', limitedCount + health.needAction], ['setup', 'Not set up', health.notSetUp]].map(([value, label, count]) => <button type="button" key={value} aria-pressed={statusFilter === value} onClick={() => setStatusFilter(value)}>{label} <span>{count}</span></button>)}</nav>
       <div className="connection-compact-list">{visibleRows.map((row) => <article className="connection-compact-row" key={row.id}>
         <div className="connection-compact-heading"><div><strong>{row.name}</strong><small className="connection-type">{row.type}</small></div><span className={`connection-status ${row.status.toLowerCase().replaceAll(' ', '-')}`}>{row.status === 'Degraded' ? 'Limited' : row.status}</span></div>
@@ -2002,7 +1931,7 @@ function App() {
         .connection-security,.connection-activity { display:grid;gap:7px;padding:9px;border:1px solid rgba(175,195,224,.14);border-radius:7px;background:rgba(15,24,37,.7); }.connection-security p { margin:0;color:#aab9cb;font-size:10px;line-height:1.5; }.connection-security code { color:#cde3ff; }
         .security-settings-page { align-content:start; }.security-settings-page h3 { margin:0;color:#e5edf8;font-size:13px; }.security-status-list { display:grid;grid-template-columns:auto 1fr;gap:7px 14px;margin:0;padding:10px;border:1px solid rgba(175,195,224,.12);border-radius:7px;background:rgba(8,14,22,.4);font-size:10px; }.security-status-list dt { color:#91a4bb; }.security-status-list dd { margin:0;color:#d9e5f4; }.security-settings-actions { display:flex;gap:7px;flex-wrap:wrap; }
         .connection-window-backdrop { position:fixed;z-index:1200;inset:0;display:grid;place-items:center;padding:16px;background:rgba(3,7,13,.68); }.connection-detail-window { display:grid;gap:13px;width:min(620px,100%);max-height:min(84vh,780px);overflow:auto;padding:18px;border:1px solid rgba(143,196,255,.3);border-radius:12px;background:#111a28;box-shadow:0 20px 70px rgba(0,0,0,.5);color:#dce6f2; }.connection-detail-window > header { display:flex;justify-content:space-between;align-items:flex-start;gap:12px; }.connection-detail-window h2 { margin:0;color:#eef5ff;font-size:17px; }.connection-detail-window header small { display:block;margin-top:4px;color:#91a4bb;font-size:10px; }.connection-detail-window header button { font-size:16px; }.connection-detail-status p { margin:7px 0 0;color:#aab9cb;font-size:11px;line-height:1.5; }.connection-detail-works { display:grid;gap:7px; }.connection-detail-works h3 { margin:0;color:#e2eaf5;font-size:12px; }.connection-detail-works > div { display:grid;gap:3px;padding:8px;border:1px solid rgba(175,195,224,.12);border-radius:6px;background:rgba(255,255,255,.025);font-size:11px; }.connection-detail-works small { color:#91a0b4;font-size:9px; }.connection-detail-activity { display:grid;grid-template-columns:auto 1fr;gap:7px 12px;color:#aab9cb;font-size:10px; }.connection-detail-activity strong { color:#e2eaf5; }.connection-detail-window footer { display:flex;gap:6px;flex-wrap:wrap; }
-        .security-password-modal { display:grid;gap:12px;width:min(440px,100%);padding:18px;border:1px solid rgba(143,196,255,.3);border-radius:12px;background:#111a28;box-shadow:0 20px 70px rgba(0,0,0,.5);color:#dce6f2; }.security-password-modal header { display:flex;justify-content:space-between;align-items:flex-start;gap:12px; }.security-password-modal h2 { margin:0;color:#eef5ff;font-size:16px; }.security-password-modal header small { display:block;margin-top:5px;color:#91a4bb;font-size:10px;line-height:1.5; }.security-password-modal label { display:grid;gap:5px;color:#c6d2e2;font-size:11px; }.security-password-modal input { width:100%;min-height:36px;padding:8px;border:1px solid #3d5068;border-radius:6px;background:#0b111a;color:#eff6ff;font:inherit; }.security-password-modal footer { display:flex;justify-content:flex-end;gap:7px; }.security-password-toggle { justify-self:start; }.security-password-error { margin:0;padding:8px;border:1px solid #6c3539;border-radius:6px;background:#351b21;color:#ffc3bd;font-size:11px; }
+        .security-password-modal { display:grid;gap:12px;width:min(440px,100%);padding:18px;border:1px solid rgba(143,196,255,.3);border-radius:12px;background:#111a28;box-shadow:0 20px 70px rgba(0,0,0,.5);color:#dce6f2; }.security-password-modal header { display:flex;justify-content:space-between;align-items:flex-start;gap:12px; }.security-password-modal h2 { margin:0;color:#eef5ff;font-size:16px; }.security-password-modal header small { display:block;margin-top:5px;color:#91a4bb;font-size:10px;line-height:1.5; }.security-password-modal label { display:grid;gap:5px;color:#c6d2e2;font-size:11px; }.security-password-modal input { width:100%;min-height:36px;padding:8px;border:1px solid #3d5068;border-radius:6px;background:#0b111a;color:#eff6ff;font:inherit; }.security-password-modal footer { display:flex;justify-content:flex-end;gap:7px; }.security-password-toggle { justify-self:start; }.security-password-error { margin:0;padding:8px;border:1px solid #6c3539;border-radius:6px;background:#351b21;color:#ffc3bd;font-size:11px; }.security-password-counter { color:#91a4bb;font-size:10px; }.security-password-field-error { color:#ffaaa4;font-size:10px; }
         .connection-activity header { flex-wrap:wrap; }.connection-activity header label { display:flex;align-items:center;gap:5px;color:#aab9cb;font-size:9px; }.connection-activity article { display:grid;grid-template-columns:1fr 1fr 1fr 35px 1fr;gap:6px;padding:6px 0;border-top:1px solid rgba(175,195,224,.1);color:#c6d2e2;font-size:9px; }.connection-activity article small,.connection-activity time { color:#8697ad;font-size:8px; }
         .client-card { display:grid;gap:8px;margin-top:10px;padding:10px;border:1px solid rgba(175,195,224,.14);border-radius:8px;background:rgba(20,29,43,.45); }
         .client-heading { display:flex;justify-content:space-between;gap:8px;color:#e1eaf6;font-size:11px; }

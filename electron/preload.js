@@ -8,7 +8,7 @@ const INVOKE_CHANNELS = new Set([
   'memories:delete', 'memories:set-private', 'memories:set-no-suggest', 'memories:move-source', 'memories:conversation-parts:count', 'memories:conversation-parts:delete',
   'memories:list', 'memories:search', 'memories:count-by-source', 'mcp:config', 'connectors:list', 'connections:activity', 'connections:counts', 'connections:clear-activity', 'connections:log', 'connections:rotate-all', 'connections:rotate-preview',
   'connectors:preview', 'connectors:connect', 'connectors:test', 'connectors:disconnect-preview', 'connectors:disconnect', 'connectors:snippet', 'connectors:revoke-token', 'connectors:rotate-token',
-  'extension:check', 'embeddings:status', 'embeddings:retry', 'database:status', 'security:set-master-password', 'security:has-master-password', 'security:export-recovery', 'security:change-master-password', 'security:restore-recovery', 'security:status', 'security:set-auto-lock', 'security:stay-unlocked', 'security:lock-now', 'security:delete-old-backups', 'security:startup-state', 'security:unlock', 'app:quit',
+  'extension:check', 'embeddings:status', 'embeddings:retry', 'database:status', 'security:set-master-password', 'security:has-master-password', 'security:export-recovery', 'security:change-master-password', 'security:restore-recovery', 'security:status', 'security:set-auto-lock', 'security:stay-unlocked', 'security:keep-unlocked-status', 'security:cancel-keep-unlocked', 'security:lock-now', 'security:delete-old-backups', 'security:startup-state', 'security:unlock-lockout-status', 'security:unlock', 'app:quit',
   'clients:list', 'clients:approve', 'clients:grant', 'clients:update', 'clients:remove-legacy', 'analytics:insights', 'analytics:run-sql', 'analytics:reset-retrieval-counts',
   'evaluation:cases', 'evaluation:add-case', 'evaluation:update-case', 'evaluation:delete-case', 'evaluation:recent-queries', 'evaluation:history', 'evaluation:update-note', 'evaluation:run', 'evaluation:run-results',
   'memory-proxy:settings', 'memory-proxy:update-settings', 'memory-proxy:save-key', 'memory-proxy:delete-key', 'memory-proxy:test-key', 'extension:status', 'extension:pair-code', 'extension:revoke', 'extension:rotate',
@@ -16,12 +16,13 @@ const INVOKE_CHANNELS = new Set([
   'chat:models', 'chat:generate-title', 'chat:grant', 'chat:grant-save', 'chat:list', 'chat:create', 'chat:update', 'chat:delete', 'chat:send', 'chat:stop', 'chat:save-memory',
   'pending-memories:list', 'pending-memories:approve', 'pending-memories:set-source', 'pending-memories:reject'
 ]);
-const EVENT_CHANNELS = new Set(['brain:locked', 'brain:unlocked', 'brain:auto-lock-warning', 'graphics:safe-mode-enabled', 'chat:chunk', 'brain:embedding-status', 'brain:retrieved', 'brain:changed', 'brain:client-pending', 'brain:pending-memories-changed']);
+const EVENT_CHANNELS = new Set(['brain:locked', 'brain:unlocked', 'brain:auto-lock-warning', 'brain:keep-unlocked-status', 'graphics:safe-mode-enabled', 'chat:chunk', 'brain:embedding-status', 'brain:retrieved', 'brain:changed', 'brain:client-pending', 'brain:pending-memories-changed']);
 const SEND_CHANNELS = new Set(['security:activity']);
 
 const lockedListeners = new Set();
 const unlockedListeners = new Set();
 const autoLockWarningListeners = new Set();
+const keepUnlockedStatusListeners = new Set();
 function notify(listeners, ...args) { for (const listener of listeners) { try { listener(...args); } catch {} } }
 function listen(channel, listener) {
   if (!EVENT_CHANNELS.has(channel)) throw new Error('Preload event channel is not allowed.');
@@ -35,6 +36,7 @@ listen('brain:unlocked', (_event, epoch) => {
   notify(unlockedListeners, epoch);
 });
 listen('brain:auto-lock-warning', (_event, visible) => { for (const listener of autoLockWarningListeners) { try { listener(Boolean(visible)); } catch {} } });
+listen('brain:keep-unlocked-status', (_event, status) => { for (const listener of keepUnlockedStatusListeners) { try { listener(status); } catch {} } });
 let lastActivitySent = 0;
 function sendUserActivity() {
   const now = Date.now();
@@ -115,14 +117,18 @@ contextBridge.exposeInMainWorld('brain', {
   setAutoLockMinutes: (minutes) => invoke('security:set-auto-lock', minutes),
   setAutoLockSettings: (settings) => invoke('security:set-auto-lock', settings),
   stayUnlocked: () => invoke('security:stay-unlocked'),
+  getKeepUnlockedStatus: () => invoke('security:keep-unlocked-status'),
+  cancelKeepUnlocked: () => invoke('security:cancel-keep-unlocked'),
   lockNow: () => invoke('security:lock-now'),
   deleteOldBackups: (password, confirmation) => invoke('security:delete-old-backups', password, confirmation),
   getSecurityStartupState: () => invoke('security:startup-state'),
+  getUnlockLockoutStatus: () => invoke('security:unlock-lockout-status'),
   unlock: (password) => invoke('security:unlock', password),
   quitApp: () => invoke('app:quit'),
   onLocked: (callback) => { lockedListeners.add(callback); return () => lockedListeners.delete(callback); },
   onUnlocked: (callback) => { unlockedListeners.add(callback); return () => unlockedListeners.delete(callback); },
   onAutoLockWarning: (callback) => { autoLockWarningListeners.add(callback); return () => autoLockWarningListeners.delete(callback); },
+  onKeepUnlockedStatus: (callback) => { keepUnlockedStatusListeners.add(callback); return () => keepUnlockedStatusListeners.delete(callback); },
   listClients: () => invoke('clients:list'),
   approveClient: (client, readSources, writeSource) => invoke('clients:approve', client, readSources, writeSource),
   updateClientGrant: (client, source, status) => invoke('clients:grant', client, source, status),
