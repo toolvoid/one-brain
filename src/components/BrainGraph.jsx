@@ -52,6 +52,11 @@ function hashPosition(id, source) {
   return anchor.add(new THREE.Vector3(q * Math.cos(a), z, q * Math.sin(a)).multiplyScalar(r));
 }
 
+function graphLinkPairKey(a, b) {
+  const left = String(a), right = String(b);
+  return left < right ? `${left}\u0000${right}` : `${right}\u0000${left}`;
+}
+
 const POINT_VERTEX = `
   attribute vec3 baseColor;
   attribute float baseSize;
@@ -241,6 +246,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     let segmentToEdge = [];
     let currentMemories = [];
     let currentLinks = [];
+    let currentLinkByPair = new Map();
     let currentCounts = {};
     let totalMemoryCount = 0;
     let lastSnapshot = null;
@@ -396,6 +402,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
       const oldLine = lineGeometry;
       currentMemories = displayMemories;
       currentLinks = displayLinks;
+      currentLinkByPair = new Map(displayLinks.map((link) => [graphLinkPairKey(link.a_id, link.b_id), link]));
       currentCounts = nextCounts;
       nodeMeta = [];
       edgeMeta = [];
@@ -915,13 +922,10 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
             const linkedIndex = memorySlot.get(id);
             const anchorEdge = linkedIndex === undefined ? undefined : edgeIndex.get(`anchor:${nodeMeta[linkedIndex].source}`);
             if (anchorEdge !== undefined) brightenEdge(edgeMeta[anchorEdge], 0.4 * strength * edgeStrength, null, lineGlow, lineColors);
-            for (let linkIndex = 0; linkIndex < currentLinks.length; linkIndex++) {
-              const link = currentLinks[linkIndex];
-              const a = String(link.a_id), b = String(link.b_id);
-              if ((a === event.memoryId && b === id) || (b === event.memoryId && a === id)) {
-                const linkEdge = edgeIndex.get(`link:${String(link.id ?? `${a}-${b}`)}`);
-                if (linkEdge !== undefined) brightenEdge(edgeMeta[linkEdge], 0.5 * strength * edgeStrength, whiteColor, lineGlow, lineColors);
-              }
+            const link = currentLinkByPair.get(graphLinkPairKey(event.memoryId, id));
+            if (link) {
+              const linkEdge = edgeIndex.get(`link:${String(link.id ?? `${link.a_id}-${link.b_id}`)}`);
+              if (linkEdge !== undefined) brightenEdge(edgeMeta[linkEdge], 0.5 * strength * edgeStrength, whiteColor, lineGlow, lineColors);
             }
           }
         }

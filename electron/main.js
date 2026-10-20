@@ -108,6 +108,8 @@ const { deleteOldBackups: deleteOldBackupFiles, hasOldBackups } = require('./pri
 let mcpConnection;
 let memoryProxy;
 let proxyConnection;
+let gracefulShutdownComplete = false;
+let gracefulShutdownPromise = null;
 let extensionApi;
 let embedder;
 let embedderGeneration = 0;
@@ -354,7 +356,7 @@ function createQuickContextTray() {
   try {
     quickContextTray = new Tray(nativeImage.createEmpty());
     quickContextTray.setToolTip('One Brain Quick context');
-    quickContextTray.setContextMenu(Menu.buildFromTemplate([{ label: 'Quick context', click: toggleQuickContextWindow }, { label: 'Quit One Brain', click: () => app.quit() }]));
+    quickContextTray.setContextMenu(Menu.buildFromTemplate([{ label: 'Quick context', click: toggleQuickContextWindow }, { label: 'Quit One Brain', click: requestGracefulQuit }]));
     quickContextTray.on('click', toggleQuickContextWindow);
   } catch { quickContextTray = null; }
 }
@@ -595,7 +597,7 @@ registerUnlockIpc(ipcMain, {
   },
   onLockNow: () => lockIfVaultConfigured('manual'),
 });
-ipcMain.handle('app:quit', () => { app.quit(); return true; });
+ipcMain.handle('app:quit', () => requestGracefulQuit());
 ipcMain.handle('clients:list', () => listClients());
 ipcMain.handle('clients:approve', (_event, client, readSources, writeSource) => approveClient(client, readSources, writeSource));
 ipcMain.handle('clients:grant', (_event, client, source, status) => updateClientGrant(client, source, status));
@@ -927,16 +929,78 @@ app.whenReady().then(async () => {
   });
 });
 
-  app.on('before-quit', () => {
-  globalShortcut.unregisterAll();
-  clearInterval(passwordLockoutTimer);
-  autoLockMonitor?.stop();
-  detachSystemLockEvents();
-  cleanupSensitiveTemps(userDataRoot);
-  keepUnlockedWindow?.end('quit');
-  lockController.lock('quit');
-  if (mcpConnection?.server.listening) mcpConnection.server.close();
-  embedder?.close();
+function closeServerForQuit(server, graceMs = 1500) {
+  if (!server?.listening) return Promise.resolve();
+  return new Promise((resolve) => {
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      try { server.closeAllConnections?.(); } catch {}
+      finish();
+    }, graceMs);
+    timer.unref?.();
+    try {
+      server.close(finish);
+      // Stop accepting new requests, then give active work a short chance to finish.
+      server.closeIdleConnections?.();
+    } catch { finish(); }
+  });
+}
+
+function requestGracefulQuit() {
+  if (gracefulShutdownComplete) return { ok: true };
+  if (!gracefulShutdownPromise) {
+    gracefulShutdownPromise = (async () => {
+      const closingEmbedder = embedder;
+      // Detach first so the lock hook cannot start a second worker shutdown.
+      embedder = null;
+      globalShortcut.unregisterAll();
+      clearInterval(passwordLockoutTimer);
+      if (graphicsStabilityTimer) clearTimeout(graphicsStabilityTimer);
+      autoLockMonitor?.stop();
+      detachSystemLockEvents();
+      keepUnlockedWindow?.end('quit');
+
+      await Promise.all([
+        closeServerForQuit(mcpConnection?.server),
+        closeServerForQuit(proxyConnection?.server),
+      ]);
+      lockController.lock('quit');
+      // Also close and clear the DB if the vault was already locked.
+      lockDatabase();
+      if (closingEmbedder?.close) {
+        await Promise.race([
+          Promise.resolve().then(() => closingEmbedder.close()).catch(() => {}),
+          new Promise((resolve) => setTimeout(resolve, 2000)),
+        ]);
+      }
+      embedder = null;
+      quickContextTray?.destroy();
+      quickContextTray = null;
+      cleanupSensitiveTemps(userDataRoot);
+      securityEventLogger.flush(true);
+      gracefulShutdownComplete = true;
+      app.quit();
+    })().catch(() => {
+      lifecycleLog.append('app_graceful_shutdown_failed');
+      try { lockDatabase(); } catch {}
+      try { cleanupSensitiveTemps(userDataRoot); } catch {}
+      gracefulShutdownComplete = true;
+      app.quit();
+    });
+  }
+  return { ok: true };
+}
+
+app.on('before-quit', (event) => {
+  if (gracefulShutdownComplete) return;
+  event.preventDefault();
+  requestGracefulQuit();
 });
 
 app.on('window-all-closed', () => {

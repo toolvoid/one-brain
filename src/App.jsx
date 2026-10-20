@@ -1004,6 +1004,8 @@ function App() {
   const [connectorSnippet, setConnectorSnippet] = useState(null);
   const [copied, setCopied] = useState('');
   const [copyError, setCopyError] = useState('');
+  const [quitPending, setQuitPending] = useState(false);
+  const [quitError, setQuitError] = useState('');
   const graphRef = useRef(null);
   const searchRequest = useRef(0);
   const typedSearchPending = useRef(null);
@@ -1685,16 +1687,29 @@ function App() {
     }
   }
 
+  async function quitApp() {
+    setQuitPending(true);
+    setQuitError('');
+    try {
+      const result = await window.brain.quitApp();
+      if (!result?.ok) throw new Error(result?.error || 'One Brain could not close safely.');
+    } catch (error) {
+      setQuitPending(false);
+      setQuitError(error?.message || 'One Brain could not close safely.');
+    }
+  }
+
   return (
     <main className="memory-app">
       {graphicsNotice && <div role="alert" style={{ position: 'fixed', zIndex: 10000, top: 12, left: '50%', transform: 'translateX(-50%)', display: 'flex', alignItems: 'center', gap: 12, maxWidth: 'calc(100vw - 32px)', padding: '10px 14px', border: '1px solid #b68138', borderRadius: 8, background: '#302515', color: '#ffe2ad', boxShadow: '0 8px 30px #0008' }}><span>{graphicsNotice}</span><button type="button" aria-label="Dismiss graphics notice" onClick={() => void dismissGraphicsNotice()}>×</button></div>}
       {copied && <div role="status" className="connection-notice" style={{ position: 'fixed', zIndex: 10000, right: 16, bottom: 16 }}>{copied}</div>}
       {copyError && <div role="alert" className="connection-notice" style={{ position: 'fixed', zIndex: 10000, right: 16, bottom: 16 }}>{copyError}</div>}
+      {quitError && <div role="alert" className="connection-notice" style={{ position: 'fixed', zIndex: 10002, top: 56, right: 16, maxWidth: 320 }}>{quitError}</div>}
       <BrainGraph ref={graphRef} memories={memories} links={graphLinks} allLinks={links} counts={counts} linkCounts={graphLinkCountValues} linkVisibility={linkVisibility} onLinkVisibilityChange={setLinkVisibility} fitRevision={graphFitRevision} dataReady={dataReady} sidebarCollapsed={sidebarCollapsed} onMemoryClick={openDetail} />
     {insightsOpen && (insightsData ? <InsightsView data={insightsData} onBack={() => { setInsightsOpen(false); setGraphFitRevision((value) => value + 1); }} sql={sql} setSql={setSql} runSql={runAnalyticsQuery} sqlResult={sqlResult} sqlRunning={sqlRunning} onResetRetrievalCounts={resetRetrievalCounts} /> : <section className="insights-view"><header className="insights-header"><button className="back-button" type="button" onClick={() => { setInsightsOpen(false); setGraphFitRevision((value) => value + 1); }}>‹</button><div><h1>Insights</h1><p>Local activity and retrieval analytics</p></div></header><ChannelNotice channel="insights" loading={insightsLoading} error={insightsLoadError} onRetry={() => void openInsights()} /></section>)}
       {chatOpen && <ChatView onBack={() => { setChatOpen(false); setGraphFitRevision((value) => value + 1); }} onManageProviders={() => { setChatOpen(false); openConnectSettings(); }} memoryTitles={Object.fromEntries(memories.map((item) => [item.id, item.title || 'Untitled memory']))} onOpenMemory={(id) => { setChatOpen(false); setInsightsOpen(false); setSelectedId(id); setSidebarCollapsed(false); focusMemory(id); }} />}
       <aside className={`memory-panel${sidebarCollapsed ? ' is-collapsed' : ''}`} style={insightsOpen || chatOpen ? { display: 'none' } : undefined}>
-        <header className="sidebar-header"><strong>One Brain</strong><nav aria-label="Main views"><button title="Open Chat" type="button" onClick={() => { setInsightsOpen(false); setChatOpen(true); }}>Chat</button><button title="Open Insights" type="button" onClick={openInsights}>Insights</button><button title="Pending memories" type="button" onClick={() => { setPendingOpen(true); setConnectOpen(false); void refreshPendingMemories().catch(() => {}); }}>Pending ({pendingMemories.length})</button><button title="Quick context" type="button" onClick={() => void window.brain.openQuickContext()}>Quick context</button><button title="Settings" aria-label="Settings" type="button" onClick={openConnectSettings}>⚙</button></nav></header>
+        <header className="sidebar-header"><strong>One Brain</strong><nav aria-label="Main views"><button title="Open Chat" type="button" onClick={() => { setInsightsOpen(false); setChatOpen(true); }}>Chat</button><button title="Open Insights" type="button" onClick={openInsights}>Insights</button><button title="Pending memories" type="button" onClick={() => { setPendingOpen(true); setConnectOpen(false); void refreshPendingMemories().catch(() => {}); }}>Pending ({pendingMemories.length})</button><button title="Quick context" type="button" onClick={() => void window.brain.openQuickContext()}>Quick context</button><button title="Settings" aria-label="Settings" type="button" onClick={openConnectSettings}>⚙</button><button className="app-quit-button" type="button" onClick={() => void quitApp()} disabled={quitPending} aria-label="Quit One Brain" title="Quit One Brain">{quitPending ? 'Closing…' : 'Quit'}</button></nav></header>
         {pendingOpen ? <><header className="detail-header"><button className="back-button" type="button" onClick={() => setPendingOpen(false)}>‹</button><span>Pending memories</span></header><PendingMemoryInbox items={pendingMemories} onRefresh={refreshPendingMemories} loading={pendingLoading} loadError={pendingLoadError} /></> : connectOpen ? (
           <section className="connect-view">
             <header className="detail-header"><button className="back-button" type="button" onClick={() => setConnectOpen(false)}>‹</button><span>Connections</span>{suggestions.length > 0 && <button className="header-suggestions" type="button" onClick={() => { setConnectOpen(false); setSuggestionsOpen(true); }}>Suggestions ({suggestions.length})</button>}</header>
@@ -2327,6 +2342,9 @@ function App() {
         .sidebar-header > strong { font-size:16px!important;letter-spacing:-.025em;color:#f2f6fa!important; }
         .sidebar-header nav { gap:7px!important; }
         .sidebar-header button { min-height:34px!important;border:1px solid #293647!important;border-radius:8px!important;background:#171f2a!important;color:#b9c6d4!important;font-size:11px!important;transition:background .16s,border-color .16s,color .16s; }
+        .sidebar-header nav .app-quit-button { min-width:0;padding:6px 10px;border-color:#674346!important;color:#f4d5d5!important;background:#251b20!important;font-weight:600; }
+        .sidebar-header nav .app-quit-button:hover:not(:disabled) { border-color:#95575a!important;color:#fff!important;background:#392126!important; }
+        .sidebar-header nav .app-quit-button:disabled { opacity:.72;cursor:wait; }
         .sidebar-header button:hover,.connections-dashboard button:hover,.clients-settings button:hover,.detail-actions button:hover { border-color:#46615f!important;background:#1b2a31!important;color:#e6fffb!important; }
         .search-row { margin:12px 0 10px!important; }
         .search-row input,.picker input,.add-modal input,.add-modal select,.add-modal textarea { border:1px solid #2a3746!important;border-radius:9px!important;background:#0d131b!important;color:var(--text)!important; }
