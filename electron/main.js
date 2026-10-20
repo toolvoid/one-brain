@@ -2,6 +2,9 @@ process.umask(0o077);
 const { enforcePrivateTree, cleanupSensitiveTemps } = require('./private-files');
 const { app, powerMonitor } = require('electron');
 const path = require('path');
+const os = require('node:os');
+const { createPerformanceMetrics } = require('./performance-metrics');
+const { parseEvaluationCsv } = require('./evaluation-tool');
 const fs = require('node:fs');
 const { createLifecycleLog, instrumentAppExitCalls } = require('./lifecycle-log');
 const { createPasswordLockout } = require('./password-lockout');
@@ -79,7 +82,8 @@ function initializeReadyElectronApis() {
 }
 ipcMain.handle('lifecycle:tail', () => lifecycleLog.tail(50));
 const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
-const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getMcpClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, getMemoryEmbeddingVector, getMemory, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, listRecentImports, listClients, removeLegacyClient, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, addMemory, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
+const { initializeDatabase, getDatabaseStatus, getRuntimeDatabaseStats, setPerformanceRecorder, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, saveEvaluationDataset, listEvaluationDatasets, runEvaluationDataset, listEvaluationRunSummaries, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getMcpClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, getMemoryEmbeddingVector, getMemory, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, listRecentImports, listClients, removeLegacyClient, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, addMemory, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
+setPerformanceRecorder((name, duration) => performanceMetrics.record(name, duration));
 const { startMcpServer } = require('./mcp-server');
 const { createEmbedder } = require('./embedder');
 const connectors = require('./connectors');
@@ -103,10 +107,14 @@ const { deleteOldBackups: deleteOldBackupFiles, hasOldBackups } = require('./pri
 
 let mcpConnection;
 let memoryProxy;
+let proxyConnection;
 let extensionApi;
 let embedder;
 let embedderGeneration = 0;
 let embeddingStatus = { state: 'loading' };
+const performanceMetrics = createPerformanceMetrics({ limit: 100 });
+const appStartedAt = Date.now();
+const runtimeMilestones = {};
 const chatControllers = new Map();
 let quickContextWindow = null;
 let quickContextTray = null;
@@ -580,6 +588,8 @@ registerUnlockIpc(ipcMain, {
   passwordLockout,
   logEvent: (event) => lifecycleLog.append(event),
   notifyUnlocked: () => {
+    runtimeMilestones.startedToUnlockedMs ??= Date.now() - appStartedAt;
+    performanceMetrics.record('app_start_to_unlocked', runtimeMilestones.startedToUnlockedMs);
     for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:unlocked', lockController.getEpoch());
     quickContextRequestRouter.onUnlocked();
   },
@@ -603,6 +613,58 @@ ipcMain.handle('evaluation:history', () => getEvaluationHistory());
 ipcMain.handle('evaluation:update-note', (_event, id, note) => updateEvaluationNote(id, note));
 ipcMain.handle('evaluation:run', () => runRetrievalEvaluation());
 ipcMain.handle('evaluation:run-results', (_event, runId) => getEvaluationRunResults(runId));
+ipcMain.handle('evaluation:parse-import', (_event, text) => parseEvaluationCsv(String(text || '').slice(0, 1_000_000)));
+ipcMain.handle('evaluation:save-dataset', (_event, name, rows) => saveEvaluationDataset(String(name || 'Imported evaluation'), Array.isArray(rows) ? rows.slice(0, 500) : []));
+ipcMain.handle('evaluation:datasets', () => listEvaluationDatasets());
+ipcMain.handle('evaluation:run-dataset', (_event, id, options) => runEvaluationDataset(id, { ...(options || {}), appVersion: app.getVersion() }));
+ipcMain.handle('evaluation:runs', () => listEvaluationRunSummaries());
+ipcMain.handle('status:graph-ready', () => {
+  runtimeMilestones.startedToGraphReadyMs ??= Date.now() - appStartedAt;
+  performanceMetrics.record('app_start_to_graph_ready', runtimeMilestones.startedToGraphReadyMs);
+  return { ok: true };
+});
+ipcMain.on('status:graph-frame', (event, milliseconds) => {
+  const frame = Number(milliseconds?.frameMs), fps = Number(milliseconds?.fps);
+  if (!Number.isFinite(frame) || frame < 0 || frame > 10_000 || !Number.isFinite(fps) || fps < 0 || fps > 1000) return;
+  performanceMetrics.record('graph_frame_ms', frame);
+  performanceMetrics.record('graph_fps', fps, 'fps');
+});
+ipcMain.handle('status:runtime', () => {
+  const appMetrics = app.getAppMetrics().map((item) => ({
+    name: item.type === 'Browser' ? 'Main' : item.type === 'Tab' ? `Renderer ${item.id}` : item.type === 'GPU' ? 'GPU' : `${item.type || 'Process'} ${item.id}`,
+    type: item.type || 'unknown', pid: item.pid,
+    cpuPercent: Number(item.cpu?.percentCPUUsage) || 0,
+    workingSetMB: Number(item.memory?.workingSetSize) ? Number(item.memory.workingSetSize) / 1024 : null,
+    privateMB: Number(item.memory?.privateBytes) ? Number(item.memory.privateBytes) / 1024 : null,
+  }));
+  const own = process.memoryUsage();
+  const stats = getRuntimeDatabaseStats();
+  const security = securitySettings.read();
+  const tokenStates = listClientTokenStates();
+  const lockStatus = autoLockMonitor?.getStatus?.() || {};
+  const mainMetric = appMetrics.find((item) => item.type === 'Browser');
+  const processRows = [{ name: 'Main', type: 'main', pid: process.pid, cpuPercent: mainMetric?.cpuPercent ?? null,
+    workingSetMB: own.rss / 1024 / 1024, privateMB: own.heapUsed / 1024 / 1024 },
+    ...appMetrics.filter((item) => item.type !== 'Browser'),
+    { name: 'Embedding worker', type: 'thread', sharedWithPid: process.pid, cpuPercent: null, workingSetMB: null, privateMB: null },
+    { name: 'SQL worker', type: 'thread', sharedWithPid: process.pid, cpuPercent: null, workingSetMB: null, privateMB: null }];
+  return {
+    sampledAt: new Date().toISOString(), totalRamMB: os.totalmem() / 1024 / 1024,
+    processes: processRows,
+    memory: { rssMB: own.rss / 1024 / 1024, heapUsedMB: own.heapUsed / 1024 / 1024 },
+    stats: { ...stats, vaultState: lockController.isLocked() ? 'Locked' : (stats.databaseState || 'Unlocked'),
+      autoLock: { enabled: security.autoLockEnabled, minutes: security.autoLockMinutes, idleMs: lockStatus.idleMs ?? autoLockMonitor?.getIdleMs?.() ?? 0 },
+      embedderState: embeddingStatus.state || (stats.embeddingReady ? 'ready' : 'not-loaded'),
+      lastUnlockAt: security.lastUnlockAt || null },
+    timings: performanceMetrics.snapshot(),
+    health: { mcpPort: mcpConnection?.config?.port ?? null, proxyPort: proxyConnection?.port ?? proxyConnection?.config?.port ?? null,
+      extensionPairedCount: tokenStates.filter((item) => !item.revoked).length,
+      rateLimitHitsToday: stats.rateLimitHitsToday, lastErrorCode: stats.lastErrorCode },
+    startup: { startToWindowShownMs: runtimeMilestones.startedToWindowShownMs ?? null,
+      startToUnlockedMs: runtimeMilestones.startedToUnlockedMs ?? null, startToGraphReadyMs: runtimeMilestones.startedToGraphReadyMs ?? null },
+    graphics: { renderer: graphicsSettings.renderer || 'Not reported yet', mode: graphicsSettings.mode, performanceMode: graphicsSettings.performanceMode || null },
+  };
+});
 ipcMain.handle('memory-proxy:settings', () => memoryProxy.publicSettings());
 ipcMain.handle('extension:status', () => extensionApi.status());
 ipcMain.handle('extension:check', (_event, site) => extensionApi.requestCheck(site));
@@ -703,7 +765,7 @@ function createWindow() {
   mainWindow = win;
   attachWindowLifecycle(win, 'main');
   win.once('closed', () => { if (mainWindow === win) mainWindow = null; });
-  win.once('ready-to-show', () => { if (!win.isDestroyed()) { win.show(); win.focus(); } });
+  win.once('ready-to-show', () => { runtimeMilestones.startedToWindowShownMs ??= Date.now() - appStartedAt; performanceMetrics.record('app_start_to_window_shown', runtimeMilestones.startedToWindowShownMs); if (!win.isDestroyed()) { win.show(); win.focus(); } });
   win.webContents.on('console-message', (details) => {
     const location = rendererErrorLocation(details.level, details.lineNumber, details.sourceId);
     if (location) recordRendererError(new Error(details.message), location.source, location.line);
@@ -743,6 +805,7 @@ app.whenReady().then(async () => {
       ++embedderGeneration;
       const previous = embedder;
       embedder = null;
+      publishEmbeddingStatus({ state: 'idle-unloaded' });
       try { void previous?.close(); } catch {}
       lockDatabase();
       cleanupSensitiveTemps(userDataRoot);
@@ -758,6 +821,10 @@ app.whenReady().then(async () => {
   });
   const databaseStatus = await initializeDatabase(app.getPath('userData'), safeStorage);
   if (databaseStatus.state === 'password-required') lockController.lock('startup');
+  else {
+    runtimeMilestones.startedToUnlockedMs = Date.now() - appStartedAt;
+    performanceMetrics.record('app_start_to_unlocked', runtimeMilestones.startedToUnlockedMs);
+  }
   if (databaseStatus.message) console.error(databaseStatus.message);
 
   if (!lockController.isLocked()) startEmbedder();
@@ -816,6 +883,7 @@ app.whenReady().then(async () => {
   });
 
   memoryProxy = createMemoryProxy({ userDataPath, safeStorage, authenticateClientToken, extensionApi,
+    recordPerformance: (name, duration) => performanceMetrics.record(name, duration),
     authFailureLog: () => recordSecurityEvent('auth_failed'),
     onActivity: () => autoLockMonitor?.touchActivity(), beginActivity: () => autoLockMonitor?.beginActivity(),
     getClientProfile: getProxyClientProfile, searchMemoriesForClient, getMemoryForClient, recordProxyEvent: recordDashboardEvent,
@@ -825,13 +893,15 @@ app.whenReady().then(async () => {
       return result;
     } });
   try {
-    const connection = await memoryProxy.start();
+    proxyConnection = await memoryProxy.start();
+    const connection = proxyConnection;
     console.log(`One Brain memory proxy listening at ${connection.endpoint}`);
     // The proxy connection includes a Node HTTP server, which cannot cross
     // Electron's IPC serialization boundary. No renderer consumes this event.
   } catch (error) { console.error('Could not start One Brain memory proxy:', error?.name || 'Error'); }
 
   startMcpServer(app.getPath('userData'), connectorAppPath(), {
+    recordPerformance: (name, duration) => performanceMetrics.record(name, duration),
     onSpawn: logChildProcessSpawn,
     onAuthFailure: () => recordSecurityEvent('auth_failed'),
     onActivity: () => autoLockMonitor?.touchActivity(), beginActivity: () => autoLockMonitor?.beginActivity(),

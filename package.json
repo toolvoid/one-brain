@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
     "build": "vite build",
+    "bench": "node scripts/bench.js",
     "build:extension": "node scripts/build-extension.js",
     "pack": "npm run build && npm run build:extension && electron-builder --dir",
     "dist": "npm run build && npm run build:extension && electron-builder",

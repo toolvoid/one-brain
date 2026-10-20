@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const http = require('node:http');
+const { performance } = require('node:perf_hooks');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
 const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
@@ -119,7 +120,7 @@ function candidateSafe(item) {
 function createMemoryProxy(options) {
   const { userDataPath, safeStorage, authenticateClientToken, getClientProfile, searchMemoriesForClient,
     getMemoryForClient, recordProxyEvent, addPendingMemory, fetchImpl = globalThis.fetch,
-    providerUrls = PROVIDER_URLS, searchTimeoutMs = 800, titleTimeoutMs = 3000, listenPort = null, extensionApi = null, onActivity = () => {}, beginActivity = () => null, authFailureLog = () => {} } = options;
+    providerUrls = PROVIDER_URLS, searchTimeoutMs = 800, titleTimeoutMs = 3000, listenPort = null, extensionApi = null, onActivity = () => {}, beginActivity = () => null, authFailureLog = () => {}, recordPerformance = () => {} } = options;
   const settingsPath = path.join(userDataPath, 'memory-proxy-settings.json');
   const keysPath = path.join(userDataPath, 'provider-keys.enc');
   const inFlightUpstream = new Set();
@@ -206,6 +207,7 @@ function createMemoryProxy(options) {
   }
 
   async function selectMemories(query, profile, cfg) {
+    const started = performance.now();
     if (!query) return [];
     const search = Promise.resolve(searchMemoriesForClient(query, 'all', Math.max(10, cfg.count), profile));
     let timer;
@@ -223,6 +225,7 @@ function createMemoryProxy(options) {
       selections.push({ id: full.memory.id, source: full.memory.source, title: full.memory.title, content: full.memory.content, score: candidate.score });
       if (selections.length >= cfg.count) break;
     }
+    recordPerformance('proxy_added_latency', performance.now() - started);
     return selections;
   }
 

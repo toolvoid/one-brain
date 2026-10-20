@@ -80,12 +80,24 @@ function EvaluationPanel() {
   const [error, setError] = useState('');
   const [lastRun, setLastRun] = useState(null);
   const [notes, setNotes] = useState({});
+  const [importText, setImportText] = useState('id,question,type,expected\n');
+  const [importName, setImportName] = useState('Evaluation dataset');
+  const [importPreview, setImportPreview] = useState(null);
+  const [datasets, setDatasets] = useState([]);
+  const [savedRuns, setSavedRuns] = useState([]);
+  const [selectedCompareIds, setSelectedCompareIds] = useState([]);
+  const [latestImportedRun, setLatestImportedRun] = useState(null);
+  const [selectedDataset, setSelectedDataset] = useState('');
+  const [includePrivate, setIncludePrivate] = useState(false);
+  const [runConfig, setRunConfig] = useState({ ftsWeight: 1, vectorWeight: 1, rrfK: 60, minScore: 0.015, topN: 10, chunkSize: 1200, chunkOverlap: 0 });
 
   async function refresh() {
-    const [nextCases, nextRecent, nextHistory] = await Promise.all([
-      window.brain.listEvaluationCases(), window.brain.listRecentEvaluationQueries(30), window.brain.getEvaluationHistory()
+    const [nextCases, nextRecent, nextHistory, nextDatasets, nextRuns] = await Promise.all([
+      window.brain.listEvaluationCases(), window.brain.listRecentEvaluationQueries(30), window.brain.getEvaluationHistory(), window.brain.listEvaluationDatasets(), window.brain.listEvaluationRuns()
     ]);
     setCases(nextCases); setRecentQueries(nextRecent); setHistory(nextHistory);
+    setDatasets(nextDatasets); setSavedRuns(nextRuns);
+    if (!selectedDataset && nextDatasets[0]) setSelectedDataset(String(nextDatasets[0].id));
     setNotes(Object.fromEntries(nextHistory.map((run) => [run.id, run.note || ''])));
   }
   useEffect(() => { void refresh().catch((reason) => setError(reason.message || 'Could not load evaluation data.')); }, []);
@@ -129,6 +141,39 @@ function EvaluationPanel() {
     catch (reason) { setError(reason.message || 'Could not save the run note.'); }
   }
 
+  async function previewImport(text = importText) {
+    setImportText(text); setError('');
+    try { setImportPreview(await window.brain.parseEvaluationImport(text)); }
+    catch (reason) { setError(reason.message || 'Could not validate the import.'); }
+  }
+  async function importCsvFile(file) {
+    if (!file) return;
+    try { await previewImport(await file.text()); }
+    catch (reason) { setError(reason.message || 'Could not read that CSV file.'); }
+  }
+  async function saveImportedDataset() {
+    if (!importPreview?.rows?.length || importPreview.errors?.length) return;
+    try {
+      await window.brain.saveEvaluationDataset(importName, importPreview.rows);
+      setImportPreview(null); await refresh();
+    } catch (reason) { setError(reason.message || 'Could not save the dataset.'); }
+  }
+  async function runImportedDataset() {
+    if (!selectedDataset) return;
+    setRunning(true); setError('');
+    try { setLatestImportedRun(await window.brain.runEvaluationDataset(Number(selectedDataset), { config: runConfig, includePrivate })); await refresh(); }
+    catch (reason) { setError(reason.message || 'Evaluation run failed.'); }
+    finally { setRunning(false); }
+  }
+  function exportMetrics() {
+    const columns = ['id','ts','datasetId','appVersion','hit1','hit3','hit5','mrr','negativeFalsePositiveRate','medianLatencyMs'];
+    const csv = [columns.join(','), ...savedRuns.map((run) => {
+      const metrics = run.metrics || {};
+      return [run.id, run.ts, run.datasetId, run.appVersion, metrics.hit1, metrics.hit3, metrics.hit5, metrics.mrr, metrics.negativeFalsePositiveRate, metrics.medianLatencyMs].join(',');
+    })].join('\n');
+    const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' })); link.download = 'one-brain-evaluation-metrics.csv'; link.click(); URL.revokeObjectURL(link.href);
+  }
+
   const percent = (value) => `${(Number(value || 0) * 100).toFixed(1)}%`;
   const delta = (value) => value == null ? '—' : `${value > 0 ? '+' : ''}${(Number(value) * 100).toFixed(1)}%`;
   const modeName = (mode) => ({ hybrid: 'Hybrid', 'fts-only': 'FTS only', 'semantic-only': 'Semantic only', 'extension-search': 'Extension search' })[mode] || mode;
@@ -137,6 +182,20 @@ function EvaluationPanel() {
     <header><h2>Retrieval evaluation</h2><button className="run-sql-button" type="button" onClick={() => void run()} disabled={running || cases.every((item) => item.stale)}>{running ? 'Running…' : 'Run evaluation'}</button></header>
     <p className="evaluation-help">Cases save only query text and expected memory IDs. Deleted expected memories are stale and skipped.</p>
     {error && <p className="sql-error" role="alert">{error}</p>}
+    <section className="evaluation-import"><h3>Import questions</h3><p className="evaluation-help">CSV columns: id, question, type, expected. Paste CSV or choose a file; validate and preview before saving. Negative rows leave expected empty.</p>
+      <label>Dataset name<input value={importName} onChange={(event) => setImportName(event.target.value)} /></label>
+      <label>Paste CSV<textarea rows="5" value={importText} onChange={(event) => setImportText(event.target.value)} /></label>
+      <div className="evaluation-add"><input aria-label="Choose evaluation CSV" type="file" accept=".csv,text/csv" onChange={(event) => void importCsvFile(event.target.files?.[0])} /><button type="button" onClick={() => void previewImport()} disabled={!importText.trim()}>Preview import</button></div>
+      {importPreview && <><p>{importPreview.rows.length} valid rows · {importPreview.errors.length} errors (invalid rows are skipped)</p>{importPreview.errors.map((item) => <p className="sql-error" key={`${item.row}-${item.message}`}>Row {item.row}: {item.message}</p>)}<div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>ID</th><th>Question preview</th><th>Type</th><th>Expected</th></tr></thead><tbody>{importPreview.rows.slice(0, 20).map((row, index) => <tr key={`${row.id}-${index}`}><td>{row.id}</td><td>{row.question}</td><td>{row.type}</td><td>{row.expected}</td></tr>)}</tbody></table></div><button type="button" onClick={() => void saveImportedDataset()} disabled={!importPreview.rows.length}>Save valid rows</button></>}
+    </section>
+    <section className="evaluation-import"><header><h3>Run imported dataset</h3><button type="button" onClick={exportMetrics} disabled={!savedRuns.length}>Export metrics only</button></header>
+      <label>Dataset<select value={selectedDataset} onChange={(event) => setSelectedDataset(event.target.value)}><option value="">Choose dataset</option>{datasets.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.questions} questions</option>)}</select></label>
+      <label><input type="checkbox" checked={includePrivate} onChange={(event) => setIncludePrivate(event.target.checked)} /> Include private memories</label>
+      <details><summary>Temporary retrieval configuration</summary><p>These values apply only to this run. Chunk size and overlap are recorded for reproducibility; existing memories keep the chunk boundaries used when imported.</p><p>Embedding model: {latestImportedRun?.config?.model || 'Current configured model'}</p>{[['ftsWeight','FTS weight'],['vectorWeight','Vector weight'],['rrfK','RRF k'],['minScore','Minimum score'],['topN','Top N'],['chunkSize','Chunk size'],['chunkOverlap','Chunk overlap']].map(([key,label]) => <label key={key}>{label}<input type="number" min="0" step={key === 'minScore' || key.includes('Weight') ? '0.01' : '1'} value={runConfig[key]} onChange={(event) => setRunConfig((current) => ({ ...current, [key]: Number(event.target.value) }))} /></label>)}</details>
+      <button type="button" className="run-sql-button" onClick={() => void runImportedDataset()} disabled={running || !selectedDataset}>{running ? 'Running…' : 'Run dataset'}</button>
+    </section>
+    {savedRuns.length > 0 && <section className="evaluation-results"><h3>Imported dataset runs · newest first</h3><div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>Compare</th><th>Run</th><th>Dataset</th><th>Hit@1</th><th>Hit@3</th><th>Hit@5</th><th>MRR</th><th>Neg. false positives</th><th>Median ms</th><th>Δ MRR vs previous</th></tr></thead><tbody>{savedRuns.map((run) => <tr key={run.id}><td><input aria-label={`Select run ${run.id} for comparison`} type="checkbox" checked={selectedCompareIds.includes(run.id)} onChange={(event) => setSelectedCompareIds((current) => event.target.checked ? [...current, run.id].slice(-2) : current.filter((id) => id !== run.id))} /></td><td>{dateLabel(run.ts)}</td><td>{run.datasetName}</td><td>{percent(run.metrics.hit1)}</td><td>{percent(run.metrics.hit3)}</td><td>{percent(run.metrics.hit5)}</td><td>{Number(run.metrics.mrr).toFixed(3)}</td><td>{percent(run.metrics.negativeFalsePositiveRate)}</td><td>{Number(run.metrics.medianLatencyMs).toFixed(1)}</td><td>{run.delta ? delta(run.delta.mrr) : '—'}</td></tr>)}</tbody></table></div>{selectedCompareIds.length === 2 && (() => { const [older, newer] = [...selectedCompareIds].map((id) => savedRuns.find((run) => run.id === id)).filter(Boolean).sort((a,b) => a.id - b.id); if (!older || !newer) return null; return <section><h4>Compare runs: {older.datasetName} vs {newer.datasetName}</h4>{['hit1','hit3','hit5','mrr','negativeFalsePositiveRate','medianLatencyMs'].map((metric) => <p key={metric}>{metric}: {Number(older.metrics[metric] || 0).toFixed(3)} → {Number(newer.metrics[metric] || 0).toFixed(3)} · Δ {delta(Number(newer.metrics[metric] || 0) - Number(older.metrics[metric] || 0))}</p>)}</section>; })()}</section>}
+    {latestImportedRun && <section className="evaluation-results"><h3>Latest run · {latestImportedRun.datasetName}</h3><p>Hit@1 {percent(latestImportedRun.metrics.hit1)} · Hit@3 {percent(latestImportedRun.metrics.hit3)} · Hit@5 {percent(latestImportedRun.metrics.hit5)} · MRR {latestImportedRun.metrics.mrr.toFixed(3)} · Negative false-positive rate {percent(latestImportedRun.metrics.negativeFalsePositiveRate)} · median {latestImportedRun.metrics.medianLatencyMs.toFixed(1)} ms</p><h4>Per-type</h4><p>{Object.entries(latestImportedRun.byType).map(([type, metric]) => `${type}: ${type === 'negative' ? percent(metric.falsePositiveRate) : `hit@1 ${percent(metric.hit1)}, MRR ${metric.mrr.toFixed(3)}`}`).join(' · ')}</p><h4>Negative questions</h4>{latestImportedRun.records.filter((item) => item.type === 'negative').map((item) => <article key={item.id}><strong>{item.id} · top score {item.topScore.toFixed(4)} · crossed threshold {item.falsePositive ? 'yes' : 'no'}</strong><p>{item.question}</p></article>)}<h4>Failed questions · in-app only</h4>{latestImportedRun.failed.length ? latestImportedRun.failed.map((item) => <article key={item.id}><strong>{item.id} · {item.type} · rank {item.rank ?? '—'}</strong><p>{item.question}</p><small>Expected: {item.expectedTitle || 'None'} · returned: {item.returned.map((memory) => memory.title).join(' · ') || 'No results'}</small></article>) : <p className="empty-note">No failed questions.</p>}</section>}
     <div className="evaluation-add">
       <label>Query<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search query to evaluate" /></label>
       <button type="button" onClick={() => void searchForExpected(query, editingCase)} disabled={searching || !query.trim()}>{searching ? 'Searching…' : 'Search'}</button>
@@ -464,13 +523,68 @@ function PendingMemoryInbox({ items, onRefresh, loading = false, loadError = fal
   </section>;
 }
 
+function StatusPanel() {
+  const [status, setStatus] = useState(null);
+  const [error, setError] = useState('');
+  const [copyMessage, setCopyMessage] = useState('');
+  useEffect(() => {
+    let active = true;
+    let timer = null;
+    const refresh = async () => {
+      if (!active || document.visibilityState !== 'visible') return;
+      try { const value = await window.brain.getRuntimeStatus(); if (active) { setStatus(value); setError(''); } }
+      catch (reason) { if (active) setError(reason.message || 'Could not load resource status.'); }
+    };
+    const updatePolling = () => {
+      if (document.visibilityState === 'visible' && timer === null) { void refresh(); timer = setInterval(refresh, 2000); }
+      else if (document.visibilityState !== 'visible' && timer !== null) { clearInterval(timer); timer = null; }
+    };
+    updatePolling();
+    document.addEventListener('visibilitychange', updatePolling);
+    return () => { active = false; if (timer !== null) clearInterval(timer); document.removeEventListener('visibilitychange', updatePolling); };
+  }, []);
+  const memory = (value) => value == null ? 'In main process' : `${Number(value).toFixed(1)} MB`;
+  async function copyReport() {
+    if (!status) return;
+    const lines = [
+      'One Brain status report', `Sampled: ${status.sampledAt}`, `System RAM: ${(status.totalRamMB / 1024).toFixed(1)} GB`,
+      ...status.processes.map((item) => `${item.name}: CPU ${item.cpuPercent == null ? '—' : `${Number(item.cpuPercent).toFixed(1)}%`}, working set ${memory(item.workingSetMB)}, private ${memory(item.privateMB)}`),
+      `Memories: ${status.stats.memories}; chunks: ${status.stats.chunks}; links: ${status.stats.links}; pending: ${status.stats.pending}`,
+      `DB: ${status.stats.dbBytes} bytes; WAL: ${status.stats.walBytes} bytes; schema: ${status.stats.schemaVersion}`,
+      `Embedding model: ${status.stats.embeddingModel || 'none'}; coverage: ${Number(status.stats.embeddingCoveragePercent).toFixed(1)}%; state: ${status.stats.embeddingReady ? 'ready' : 'not loaded'}`,
+      `Vault: ${status.stats.vaultState}; auto-lock: ${status.stats.autoLock.enabled ? `${status.stats.autoLock.minutes} min` : 'off'}`,
+      `MCP port: ${status.health.mcpPort ?? 'off'}; proxy port: ${status.health.proxyPort ?? 'off'}; paired extensions: ${status.health.extensionPairedCount}; rate limits today: ${status.health.rateLimitHitsToday}; last error: ${status.health.lastErrorCode || 'none'}`,
+      `Graphics: ${status.graphics.mode}; renderer: ${status.graphics.renderer}`,
+      `Startup ms: window ${status.startup.startToWindowShownMs ?? '—'}, unlocked ${status.startup.startToUnlockedMs ?? '—'}, graph ${status.startup.startToGraphReadyMs ?? '—'}`,
+      ...Object.entries(status.timings).map(([name, value]) => value.unit === 'fps' ? `${name}: median ${value.median.toFixed(2)} fps, p95 ${value.p95.toFixed(2)} fps (${value.samples} samples)` : `${name}: median ${value.medianMs.toFixed(2)} ms, p95 ${value.p95Ms.toFixed(2)} ms (${value.samples} samples)`),
+    ];
+    try { const result = await window.brain.copyText(lines.join('\n')); setCopyMessage(result?.ok === false ? 'Copy failed.' : 'Copied'); }
+    catch (reason) { setCopyMessage(reason.message || 'Copy failed.'); }
+  }
+  return <section className="insight-card status-panel"><header><h2>Live resource status</h2><button type="button" onClick={() => void copyReport()} disabled={!status}>Copy report</button></header>
+    {error && <p className="sql-error" role="alert">{error}</p>}{copyMessage && <p role="status">{copyMessage}</p>}{status && <>
+      <small>Refreshes every 2 seconds while this tab is open. Worker thread memory is included in the main process.</small>
+      <h3>Processes</h3><div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>Process</th><th>CPU</th><th>Working set</th><th>Private / heap</th></tr></thead><tbody>{status.processes.map((item, index) => <tr key={`${item.name}-${item.pid || index}`}><td>{item.name}</td><td>{item.cpuPercent == null ? '—' : `${Number(item.cpuPercent).toFixed(1)}%`}</td><td>{memory(item.workingSetMB)}</td><td>{memory(item.privateMB)}</td></tr>)}</tbody></table></div>
+      <h3>App stats</h3><div className="evaluation-table-wrap"><table className="evaluation-table"><tbody>{[['Memories',status.stats.memories],['Chunks',status.stats.chunks],['Links',status.stats.links],['Pending',status.stats.pending],['DB size',`${status.stats.dbBytes} bytes`],['WAL size',`${status.stats.walBytes} bytes`],['Schema version',status.stats.schemaVersion],['Embedding model',status.stats.embeddingModel || 'Not configured'],['Embeddings coverage',`${Number(status.stats.embeddingCoveragePercent).toFixed(1)}%`],['Embedder state',status.stats.embedderState],['Vault',status.stats.vaultState],['Auto-lock',status.stats.autoLock.enabled ? `On · ${status.stats.autoLock.minutes} min` : 'Off'],['Last unlock',status.stats.lastUnlockAt || '—']].map(([name,value]) => <tr key={name}><th>{name}</th><td>{String(value)}</td></tr>)}</tbody></table></div>
+      <h3>Performance · rolling last 100 calls</h3><div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>Metric</th><th>Median</th><th>p95</th><th>Samples</th></tr></thead><tbody>{Object.entries(status.timings).map(([name,value]) => <tr key={name}><td>{name}</td><td>{value.unit === 'fps' ? `${value.median.toFixed(2)} fps` : `${value.medianMs.toFixed(2)} ms`}</td><td>{value.unit === 'fps' ? `${value.p95.toFixed(2)} fps` : `${value.p95Ms.toFixed(2)} ms`}</td><td>{value.samples}</td></tr>)}{!Object.keys(status.timings).length && <tr><td colSpan="4">No timing samples yet.</td></tr>}</tbody></table></div>
+      <h3>Health</h3><p>MCP {status.health.mcpPort ?? 'off'} · proxy {status.health.proxyPort ?? 'off'} · paired extensions {status.health.extensionPairedCount} · rate-limit hits today {status.health.rateLimitHitsToday} · last error {status.health.lastErrorCode || 'none'}</p>
+      <p>Graphics: {status.graphics.mode} · {status.graphics.renderer}{/software|llvmpipe/i.test(status.graphics.renderer) ? ' (software rendering)' : ''}</p>
+      <p>Startup: window shown {status.startup.startToWindowShownMs ?? '—'} ms · unlocked {status.startup.startToUnlockedMs ?? '—'} ms · graph ready {status.startup.startToGraphReadyMs ?? '—'} ms</p>
+    </>}</section>;
+}
+
 function InsightsView({ data, onBack, sql, setSql, runSql, sqlResult, sqlRunning, onResetRetrievalCounts }) {
+  const [activeTab, setActiveTab] = useState('data');
   const view = (key) => data?.[key] || { rows: [], sql: '' };
   const table = (rows, keys, empty = 'No data yet') => rows.length ? <div className="insight-table-wrap"><table className="insight-table"><thead><tr>{keys.map(([key, label]) => <th key={key}>{label}</th>)}</tr></thead><tbody>{rows.map((row, index) => <tr key={row.id ?? row.ts ?? `${index}`} >{keys.map(([key]) => <td key={key}>{row[key] == null ? '—' : String(row[key])}</td>)}</tr>)}</tbody></table></div> : <p className="empty-note">{empty}</p>;
   const memories = view('memoriesByDay'), links = view('linksAndSuggestions'), calls = view('mcpCallsByDay'), latency = view('searchLatency');
   const retrievals = view('retrievals'), viewed = view('mostViewed'), never = view('neverRetrieved'), embedding = view('embeddingStatus'), clients = view('connectedClients'), proxyCalls = view('proxyCalls');
   const linkRows = links.rows;
   return <section className="insights-view"><header className="insights-header"><button className="back-button" type="button" onClick={onBack}>‹</button><div><h1>Insights</h1><p>Local SQLite activity and retrieval analytics</p></div></header>
+    <nav className="insights-tabs" aria-label="Insights sections">{[['data','Activity'],['evaluation','Evaluation'],['status','Status']].map(([id,label]) => <button key={id} type="button" aria-pressed={activeTab === id} onClick={() => setActiveTab(id)}>{label}</button>)}</nav>
+    {activeTab === 'evaluation' && <EvaluationPanel />}
+    {activeTab === 'status' && <StatusPanel />}
+    {activeTab === 'data' && <>
     <div className="insights-grid">
       <SqlPanel title="Memories added per day, per source" sql={memories.sql}><InsightBars rows={memories.rows.slice(0, 60)} valueKey="memories" labelKey="day" groupKey="source" colors={SOURCE_COLORS} /></SqlPanel>
       <SqlPanel title="Links and suggestions" sql={links.sql}>{table(linkRows, [['category','Type'],['label','Kind or status'],['total','Count']])}</SqlPanel>
@@ -483,8 +597,8 @@ function InsightsView({ data, onBack, sql, setSql, runSql, sqlResult, sqlRunning
       <SqlPanel title="Connected MCP clients" sql={clients.sql}>{table(clients.rows, [['client','Client'],['identity','Identity'],['first_seen','First seen'],['last_seen','Last seen'],['total_calls','Total calls'],['calls_last_7_days','Last 7 days']])}</SqlPanel>
       <SqlPanel title="Proxy" sql={proxyCalls.sql}>{table(proxyCalls.rows, [['client','Client'],['provider','Provider'],['calls','Calls'],['average_memories_injected','Average memories injected']])}</SqlPanel>
     </div>
-    <EvaluationPanel />
     <section className="insight-card run-sql-card"><header><h2>Run SQL</h2><small>Read only · SELECT only · 200 rows · 3 second timeout</small></header><textarea aria-label="SQL query" spellCheck="false" value={sql} onChange={(event) => setSql(event.target.value)} /><button className="run-sql-button" type="button" onClick={runSql} disabled={sqlRunning}>{sqlRunning ? 'Running…' : 'Run SQL'}</button>{sqlResult?.error && <p className="sql-error" role="alert">{sqlResult.error}</p>}{sqlResult?.rows && table(sqlResult.rows, sqlResult.columns.map((column) => [column, column]), 'Query returned no rows')}</section>
+    </>}
   </section>;
 }
 

@@ -11,13 +11,14 @@ const INVOKE_CHANNELS = new Set([
   'extension:check', 'embeddings:status', 'embeddings:retry', 'database:status', 'security:set-master-password', 'security:has-master-password', 'security:export-recovery', 'security:change-master-password', 'security:restore-recovery', 'security:status', 'security:set-auto-lock', 'security:stay-unlocked', 'security:keep-unlocked-status', 'security:cancel-keep-unlocked', 'security:lock-now', 'security:delete-old-backups', 'security:copy-provider-key', 'security:startup-state', 'security:unlock-lockout-status', 'security:unlock', 'app:quit',
   'clients:list', 'clients:approve', 'clients:grant', 'clients:update', 'clients:remove-legacy', 'analytics:insights', 'analytics:run-sql', 'analytics:reset-retrieval-counts',
   'evaluation:cases', 'evaluation:add-case', 'evaluation:update-case', 'evaluation:delete-case', 'evaluation:recent-queries', 'evaluation:history', 'evaluation:update-note', 'evaluation:run', 'evaluation:run-results',
+  'status:runtime', 'evaluation:parse-import', 'evaluation:save-dataset', 'evaluation:datasets', 'evaluation:run-dataset', 'evaluation:runs', 'status:graph-ready',
   'memory-proxy:settings', 'memory-proxy:update-settings', 'memory-proxy:save-key', 'memory-proxy:delete-key', 'memory-proxy:test-key', 'extension:status', 'extension:pair-code', 'extension:revoke', 'extension:rotate',
   'quick-context:settings', 'quick-context:open', 'quick-context:update-settings', 'quick-context:search', 'quick-context:copy', 'quick-context:close',
   'chat:models', 'chat:generate-title', 'chat:grant', 'chat:grant-save', 'chat:list', 'chat:create', 'chat:update', 'chat:delete', 'chat:send', 'chat:stop', 'chat:save-memory', 'chat:preview-memory',
   'pending-memories:list', 'pending-memories:approve', 'pending-memories:set-source', 'pending-memories:reject'
 ]);
 const EVENT_CHANNELS = new Set(['brain:locked', 'brain:unlocked', 'brain:auto-lock-warning', 'brain:keep-unlocked-status', 'graphics:safe-mode-enabled', 'chat:chunk', 'brain:embedding-status', 'brain:retrieved', 'brain:changed', 'brain:client-pending', 'brain:pending-memories-changed']);
-const SEND_CHANNELS = new Set(['security:activity']);
+const SEND_CHANNELS = new Set(['security:activity', 'status:graph-frame']);
 
 const lockedListeners = new Set();
 const unlockedListeners = new Set();
@@ -151,6 +152,14 @@ contextBridge.exposeInMainWorld('brain', {
   updateEvaluationNote: (id, note) => invoke('evaluation:update-note', id, note),
   runRetrievalEvaluation: () => invoke('evaluation:run'),
   getEvaluationRunResults: (runId) => invoke('evaluation:run-results', runId),
+  getRuntimeStatus: () => invoke('status:runtime'),
+  parseEvaluationImport: (text) => invoke('evaluation:parse-import', text),
+  saveEvaluationDataset: (name, rows) => invoke('evaluation:save-dataset', name, rows),
+  listEvaluationDatasets: () => invoke('evaluation:datasets'),
+  runEvaluationDataset: (id, options) => invoke('evaluation:run-dataset', id, options),
+  listEvaluationRuns: () => invoke('evaluation:runs'),
+  reportGraphReady: () => invoke('status:graph-ready'),
+  reportGraphFrame: (metrics) => { if (metrics && Number.isFinite(metrics.frameMs) && metrics.frameMs >= 0 && metrics.frameMs < 10_000 && Number.isFinite(metrics.fps) && metrics.fps >= 0 && metrics.fps < 1000) ipcRenderer.send('status:graph-frame', { frameMs: metrics.frameMs, fps: metrics.fps }); },
   getMemoryProxySettings: () => invoke('memory-proxy:settings'),
   getExtensionStatus: () => invoke('extension:status'),
   createExtensionPairCode: () => invoke('extension:pair-code'),

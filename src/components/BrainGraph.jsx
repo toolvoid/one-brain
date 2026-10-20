@@ -758,11 +758,17 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     }
     let lastFrameAt = -Infinity;
     let lastLabelRenderAt = 0;
+    let graphReadyReported = false;
+    let frameSampleStartedAt = performance.now();
+    let frameSampleDuration = 0;
+    let frameSampleCount = 0;
     function animate(frameTime) {
+      const renderStartedAt = performance.now();
       rafPending = false;
       raf = 0;
       if (document.visibilityState === 'hidden') return;
       const now = Number.isFinite(frameTime) ? frameTime : performance.now();
+      if (!graphReadyReported) { graphReadyReported = true; void window.brain?.reportGraphReady?.(); }
       const focusWasMoving = Boolean(focusMove);
       const controlsMoving = focusWasMoving ? false : Boolean(controls.update());
       const cameraMoving = controlsMoving || focusWasMoving;
@@ -941,6 +947,12 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
         lastLabelRenderAt = now;
       }
       const keepAnimating = shouldKeepGraphAnimating(controlsMoving, Boolean(focusMove), events.length, edgeDraws.size, hubFlash.until >= now || hubFlash.strength > 0.01);
+      frameSampleDuration += performance.now() - renderStartedAt;
+      frameSampleCount++;
+      if (performance.now() - frameSampleStartedAt >= 1000) {
+        if (frameSampleCount) window.brain?.reportGraphFrame?.({ frameMs: frameSampleDuration / frameSampleCount, fps: frameSampleCount / Math.max(0.001, (performance.now() - frameSampleStartedAt) / 1000) });
+        frameSampleStartedAt = performance.now(); frameSampleDuration = 0; frameSampleCount = 0;
+      }
       if (keepAnimating || focusControlsMoving) scheduleFrame(frameInterval);
     }
     animateFrame = animate;

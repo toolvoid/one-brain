@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
+const { performance } = require('node:perf_hooks');
 const { execFileSync } = require('node:child_process');
 const { randomBytes, randomUUID, timingSafeEqual } = require('node:crypto');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
@@ -35,6 +36,7 @@ function createMcpServer(identity, dependencies = {}) {
   const registerTrackedTool = (name, definition, handler) => server.registerTool(name, definition, async (args) => {
     lockController.assertUnlocked();
     const startedAt = Date.now();
+    const startedPerformance = performance.now();
     const client = identity.eventClient;
     const eventIdentity = { verified: identity.verified, reported_name: identity.reportedName };
     try {
@@ -50,6 +52,7 @@ function createMcpServer(identity, dependencies = {}) {
       recordEvent({ ...mcpActivityMetadata({ tool: name, client, identity: eventIdentity, source: outcome.source || args.source || null,
         resultCount: outcome.count ?? 0, latencyMs: Date.now() - startedAt, ok: !outcome.result?.isError,
         error: outcome.result?.isError ? 'Tool returned an error.' : null }), top_score: outcome.topScore ?? null }, outcome.ids || []);
+      dependencies.recordPerformance?.('mcp_tool', performance.now() - startedPerformance);
       const labels = { codex: 'Codex', vscode: 'VS Code Copilot', gemini: 'Gemini CLI', 'claude-code': 'Claude Code', 'claude-desktop': 'Claude Desktop' };
       const normalized = String(client || '').toLowerCase().replace(/[^a-z0-9]/g, '');
       const activityClient = Object.entries(labels).find(([id]) => normalized.includes(id.replace(/[^a-z0-9]/g, '')))?.[1] || 'One Brain';
@@ -60,6 +63,7 @@ function createMcpServer(identity, dependencies = {}) {
       if (!isConnectionTest && identity.verified && identity.profileClient) dependencies.onClientCall?.(identity.profileClient, !outcome.result?.isError, outcome.result?.isError ? 'request_failed' : '');
       return outcome.result;
     } catch (error) {
+      dependencies.recordPerformance?.('mcp_tool', performance.now() - startedPerformance);
       if (lockController.isLocked()) {
         dependencies.connectionActivity?.add({ client: identity.reportedName || 'One Brain', action: 'search', ok: false, reason: 'locked' });
         throw error;

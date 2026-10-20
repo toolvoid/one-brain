@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const { createHash, randomBytes, timingSafeEqual } = require('crypto');
 const { Worker } = require('node:worker_threads');
+const { performance } = require('node:perf_hooks');
 const { INSIGHT_QUERIES } = require('./analytics-queries');
 const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
 const { JOIN_ALL_MIN } = require('../src/lib/link-constants.json');
@@ -11,6 +12,7 @@ const { rankExtensionResults } = require('./ext-search');
 const lockController = require('./lock-controller');
 const { secureRemovePath } = require('./private-files');
 const { writeVault, readVault, atomicPrivateWrite, unwrapDatabaseKey, passwordCharacterCount } = require('./security-vault');
+const { normalizeEvaluationConfig, runEvaluationQuestions } = require('./evaluation-tool');
 const MEMORY_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 
 let database;
@@ -34,6 +36,8 @@ let databaseStatus = { state: 'initializing', writable: false, message: '' };
 let databasePath = null;
 let legacyCleanupStatus = { count: 0, backupPath: null, error: '' };
 const cancelledEmbeddingIds = new Set();
+let performanceRecorder = () => {};
+function setPerformanceRecorder(recorder) { performanceRecorder = typeof recorder === 'function' ? recorder : () => {}; }
 
 function setDatabaseStatus(state, writable, message = '') {
   databaseWritable = writable;
@@ -41,6 +45,27 @@ function setDatabaseStatus(state, writable, message = '') {
 }
 
 function getDatabaseStatus() { return { ...databaseStatus }; }
+
+function getRuntimeDatabaseStats() {
+  lockController.assertUnlocked();
+  const db = getDatabase();
+  const counts = {
+    memories: db.prepare('SELECT count(*) AS count FROM memories').get().count,
+    chunks: db.prepare('SELECT count(*) AS count FROM memories WHERE import_id IS NOT NULL').get().count,
+    links: db.prepare('SELECT count(*) AS count FROM links').get().count,
+    pending: db.prepare('SELECT count(*) AS count FROM pending_memories').get().count,
+    embedded: db.prepare('SELECT count(*) AS count FROM embeddings').get().count,
+    schemaVersion: db.prepare('SELECT count(*) AS count FROM schema_migrations').get().count,
+    rateLimitHitsToday: db.prepare("SELECT count(*) AS count FROM events WHERE error = 'rate_limited' AND date(ts) = date('now')").get().count,
+    lastErrorCode: (db.prepare("SELECT error FROM events WHERE ok = 0 AND error IS NOT NULL ORDER BY id DESC LIMIT 1").get()?.error || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64) || null,
+  };
+  let dbBytes = 0, walBytes = 0;
+  try { dbBytes = require('node:fs').statSync(databasePath).size; } catch {}
+  try { walBytes = require('node:fs').statSync(`${databasePath}-wal`).size; } catch {}
+  return { ...counts, dbBytes, walBytes, embeddingModel, embeddingReady,
+    embeddingCoveragePercent: counts.memories ? counts.embedded / counts.memories * 100 : 100,
+    databaseState: databaseStatus.state };
+}
 
 function openAnalyticsDatabase() {
   if (!databasePath || !fs.existsSync(databasePath)) throw new Error('Database is unavailable.');
@@ -366,6 +391,68 @@ function updateEvaluationNote(id, note) {
   if (!changed) throw new Error('Evaluation run was not found.');
 }
 
+function saveEvaluationDataset(name, rows) {
+  ensureWritable();
+  if (!Array.isArray(rows) || !rows.length || rows.length > 500) throw new Error('A dataset must contain 1 to 500 valid questions.');
+  const db = getDatabase();
+  const prepared = rows.map((row, index) => {
+    const type = String(row?.type || '');
+    const question = String(row?.question || '').trim().slice(0, 1000);
+    if (!question || !['direct', 'paraphrase', 'multi', 'negative'].includes(type)) throw new Error(`Invalid evaluation question at row ${index + 1}.`);
+    const expectedText = String(row?.expected || '').trim();
+    if (type === 'negative' && expectedText) throw new Error(`Negative question at row ${index + 1} must have no expected value.`);
+    if (type !== 'negative' && !expectedText) throw new Error(`Question at row ${index + 1} needs an expected memory.`);
+    const expectedIds = new Set(), expectedTitles = new Set();
+    if (type !== 'negative') for (const token of expectedText.split(';').map((value) => value.trim())) {
+      if (/^\d+$/.test(token)) {
+        const memory = db.prepare('SELECT id, title FROM memories WHERE id = ?').get(Number(token));
+        if (memory) { expectedIds.add(Number(memory.id)); expectedTitles.add(memory.title || 'Untitled'); continue; }
+      }
+      const matches = db.prepare('SELECT id, title FROM memories WHERE title = ? ORDER BY id').all(token);
+      if (!matches.length) throw new Error(`Expected memory "${token.slice(0, 80)}" was not found at row ${index + 1}.`);
+      for (const memory of matches) { expectedIds.add(Number(memory.id)); expectedTitles.add(memory.title || 'Untitled'); }
+    }
+    return { externalId: String(row.id || `row-${index + 1}`).slice(0, 100), question, type,
+      expectedIds: [...expectedIds], expectedTitles: [...expectedTitles] };
+  });
+  const create = db.transaction(() => {
+    const datasetId = Number(db.prepare('INSERT INTO eval_question_sets(name) VALUES (?)').run(String(name || 'Imported evaluation').slice(0, 100)).lastInsertRowid);
+    const add = db.prepare('INSERT INTO eval_questions(dataset_id, external_id, question, type, expected_ids, expected_titles) VALUES (?, ?, ?, ?, ?, ?)');
+    for (const row of prepared) add.run(datasetId, row.externalId, row.question, row.type, JSON.stringify(row.expectedIds), JSON.stringify(row.expectedTitles));
+    return datasetId;
+  });
+  return { id: create(), count: prepared.length };
+}
+
+function listEvaluationDatasets() {
+  return getDatabase().prepare(`SELECT d.id, d.name, d.created_at, count(q.id) AS questions
+    FROM eval_question_sets d LEFT JOIN eval_questions q ON q.dataset_id = d.id GROUP BY d.id ORDER BY d.id DESC`).all();
+}
+
+async function runEvaluationDataset(datasetId, { config: rawConfig = {}, includePrivate = false, appVersion = 'unknown' } = {}) {
+  ensureWritable();
+  const db = getDatabase();
+  const dataset = db.prepare('SELECT id, name FROM eval_question_sets WHERE id = ?').get(Number(datasetId));
+  if (!dataset) throw new Error('Evaluation dataset was not found.');
+  const questions = db.prepare('SELECT id, external_id, question, type, expected_ids, expected_titles FROM eval_questions WHERE dataset_id = ? ORDER BY id').all(dataset.id)
+    .map((row) => ({ id: row.external_id || row.id, question: row.question, type: row.type,
+      expectedIds: JSON.parse(row.expected_ids || '[]'), expectedTitles: JSON.parse(row.expected_titles || '[]') }));
+  const config = { ...normalizeEvaluationConfig(rawConfig), model: embeddingModel || 'none', includePrivate: Boolean(includePrivate) };
+  const result = await runEvaluationQuestions(questions,
+    (query, options) => searchMemories(query, 'all', options.limit, 0, null, { ...options.config, includePrivate: options.includePrivate }),
+    { config, includePrivate });
+  const storedMetrics = { ...result.metrics, byType: result.byType };
+  const inserted = db.prepare('INSERT INTO eval_run_summaries(dataset_id, app_version, config_json, metrics_json) VALUES (?, ?, ?, ?)')
+    .run(dataset.id, String(appVersion || 'unknown').slice(0, 40), JSON.stringify(config), JSON.stringify(storedMetrics));
+  return { id: Number(inserted.lastInsertRowid), datasetId: dataset.id, datasetName: dataset.name, ts: new Date().toISOString(),
+    appVersion, config, metrics: storedMetrics, byType: result.byType, failed: result.failed, records: result.records };
+}
+
+function listEvaluationRunSummaries() {
+  return getDatabase().prepare('SELECT r.id, r.ts, r.dataset_id AS datasetId, d.name AS datasetName, r.app_version AS appVersion, r.config_json AS configJson, r.metrics_json AS metricsJson FROM eval_run_summaries r JOIN eval_question_sets d ON d.id = r.dataset_id ORDER BY r.id ASC LIMIT 100').all()
+    .map((row) => ({ ...row, config: JSON.parse(row.configJson), metrics: JSON.parse(row.metricsJson) }));
+}
+
 const evaluationYield = () => new Promise((resolve) => setImmediate(resolve));
 function evaluationMetrics(ranks) {
   const count = ranks.length || 1;
@@ -381,12 +468,12 @@ async function runRetrievalEvaluation() {
   ensureWritable();
   const db = getDatabase();
   const cases = db.prepare(`SELECT c.id, c.query, c.expected_memory_id, m.title AS expected_title
-    FROM eval_cases c JOIN memories m ON m.id = c.expected_memory_id ORDER BY c.id`).all();
+    FROM eval_cases c JOIN memories m ON m.id = c.expected_memory_id WHERE m.private = 0 ORDER BY c.id`).all();
   const modes = [
-    ['hybrid', (query) => searchMemories(query, 'all', 10, 0)],
-    ['fts-only', (query) => searchFts(query, 'all', 10, 0)],
-    ['semantic-only', (query) => semanticSearch(query, 'all', 10)],
-    ['extension-search', async (query) => rankExtensionResults({ query, memories: await searchMemories(query, 'all', 50, 0), limit: 10, minScore: 0.015, getVector: getMemoryEmbeddingVector })]
+    ['hybrid', (query) => searchMemories(query, 'all', 10, 0, null, { includePrivate: false })],
+    ['fts-only', (query) => searchFts(query, 'all', 10, 0).filter((memory) => !memory.private)],
+    ['semantic-only', (query) => semanticSearch(query, 'all', 10).then((rows) => rows.filter((memory) => !memory.private))],
+    ['extension-search', async (query) => rankExtensionResults({ query, memories: (await searchMemories(query, 'all', 50, 0, null, { includePrivate: false })).filter((memory) => !memory.private), limit: 10, minScore: 0.015, getVector: getMemoryEmbeddingVector })]
   ];
   const outputs = [];
   for (const [mode, search] of modes) {
@@ -1246,6 +1333,30 @@ function getDatabase() {
       fn();
       database.prepare('INSERT INTO schema_migrations(id) VALUES (?)').run(id);
     })();
+    migrate('retrieval-evaluation-v2', () => database.exec(`
+      CREATE TABLE IF NOT EXISTS eval_question_sets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS eval_questions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dataset_id INTEGER NOT NULL REFERENCES eval_question_sets(id) ON DELETE CASCADE,
+        external_id TEXT NOT NULL,
+        question TEXT NOT NULL,
+        type TEXT NOT NULL CHECK(type IN ('direct','paraphrase','multi','negative')),
+        expected_ids TEXT NOT NULL DEFAULT '[]',
+        expected_titles TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE TABLE IF NOT EXISTS eval_run_summaries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        dataset_id INTEGER NOT NULL REFERENCES eval_question_sets(id),
+        app_version TEXT NOT NULL,
+        config_json TEXT NOT NULL,
+        metrics_json TEXT NOT NULL
+      );
+    `));
     migrate('chat-save-source-v1', () => {
       const chatColumns = new Set(database.prepare('PRAGMA table_info(chats)').all().map((column) => column.name));
       if (!chatColumns.has('memory_source')) database.exec('ALTER TABLE chats ADD COLUMN memory_source TEXT');
@@ -1489,7 +1600,10 @@ async function embedMemory(memoryId) {
   if (cancelledEmbeddingIds.has(Number(memoryId))) return false;
   const memory = db.prepare('SELECT id, source, title, content, private, no_suggest, import_id FROM memories WHERE id = ?').get(memoryId);
   if (!memory || !embeddingProvider) return false;
-  const vector = await embeddingProvider(memory.content);
+  const embeddingStarted = performance.now();
+  let vector;
+  try { vector = await embeddingProvider(memory.content); }
+  finally { performanceRecorder('embedding_chunk', performance.now() - embeddingStarted); }
   lockController.assertUnlocked();
   if (cancelledEmbeddingIds.has(Number(memoryId)) || !db.prepare('SELECT 1 FROM memories WHERE id = ?').get(memoryId)) return false;
   if (!(vector instanceof Float32Array) || vector.length === 0) throw new Error('The local embedding model returned an invalid vector.');
@@ -1972,40 +2086,56 @@ async function semanticSearch(query, source, limit = 50) {
   return results.slice(0, safeLimit);
 }
 
-async function searchMemories(query, source, limit = 50, offset = 0, event = null) {
+async function searchMemories(query, source, limit = 50, offset = 0, event = null, rankingConfig = {}) {
+  const startedPerf = performance.now();
   const startedAt = Date.now();
+  const rrfK = Math.max(1, Math.min(500, Number(rankingConfig.rrfK) || 60));
+  const ftsWeight = Math.max(0, Math.min(10, Number(rankingConfig.ftsWeight ?? 1)));
+  const vectorWeight = Math.max(0, Math.min(10, Number(rankingConfig.vectorWeight ?? 1)));
   const safeLimit = Math.max(1, Math.min(50, Math.floor(Number(limit) || 50)));
   const safeOffset = Math.max(0, Math.floor(Number(offset) || 0));
   const terms = String(query || '').replace(/"/g, '').match(/[\p{L}\p{N}_]+/gu) || [];
   const poolSize = Math.min(500, Math.max(100, safeLimit + safeOffset));
   let fts;
-  try { fts = searchFts(query, source, terms.length ? poolSize : safeLimit, terms.length ? 0 : safeOffset); }
+  const ftsStarted = performance.now();
+  try { fts = searchFts(query, source, terms.length ? poolSize : safeLimit, terms.length ? 0 : safeOffset); performanceRecorder('search_fts', performance.now() - ftsStarted); }
   catch (error) {
+    performanceRecorder('search_fts', performance.now() - ftsStarted);
+    performanceRecorder('search_hybrid', performance.now() - startedPerf);
     if (event) recordEvent({ ...event, source: source === 'all' ? null : source, query, result_count: 0, latency_ms: Date.now() - startedAt, ok: false, error: error?.name || 'Search failed' });
     throw error;
   }
   if (!terms.length || !embeddingReady || !embeddingProvider) {
-    const results = fts.slice(0, safeLimit);
+    const ftsResults = rankingConfig.includePrivate === false ? fts.filter((row) => !row.private) : fts;
+    const results = ftsResults.slice(0, safeLimit).map((row, index) => ({ ...row, score: ftsWeight / (rrfK + index + 1) }));
+    performanceRecorder('search_hybrid', performance.now() - startedPerf);
     if (event) recordEvent({ ...event, source: source === 'all' ? null : source, query, result_count: results.length, top_score: results[0]?.score ?? null, latency_ms: Date.now() - startedAt }, results.map((row) => row.id));
     return results;
   }
 
   let semantic = [];
-  try { semantic = await semanticSearch(query, source, poolSize); }
+  const vectorStarted = performance.now();
+  try { semantic = await semanticSearch(query, source, poolSize); performanceRecorder('search_vector', performance.now() - vectorStarted); }
   catch (error) {
-    const results = fts.slice(0, safeLimit).map((row, index) => ({ ...row, score: 1 / (60 + index + 1) }));
+    performanceRecorder('search_vector', performance.now() - vectorStarted);
+    const ftsResults = rankingConfig.includePrivate === false ? fts.filter((row) => !row.private) : fts;
+    const results = ftsResults.slice(0, safeLimit).map((row, index) => ({ ...row, score: ftsWeight / (rrfK + index + 1) }));
+    performanceRecorder('search_hybrid', performance.now() - startedPerf);
     if (event) recordEvent({ ...event, source: source === 'all' ? null : source, query, result_count: results.length, top_score: results[0]?.score ?? null, latency_ms: Date.now() - startedAt, ok: false, error: error?.name || 'Search failed' }, results.map((row) => row.id));
     return results;
   }
 
   const combined = new Map();
-  fts.forEach((row, index) => combined.set(row.id, { ...row, matchedFts: true, matchedSemantic: false, score: 1 / (60 + index + 1) }));
+  fts.forEach((row, index) => combined.set(row.id, { ...row, matchedFts: true, matchedSemantic: false, score: ftsWeight / (rrfK + index + 1) }));
   semantic.forEach((row, index) => {
     const existing = combined.get(row.id);
-    if (existing) { existing.score += 1 / (60 + index + 1); existing.matchedSemantic = true; }
-    else combined.set(row.id, { ...row, matchedFts: false, matchedSemantic: true, score: 1 / (60 + index + 1) });
+    if (existing) { existing.score += vectorWeight / (rrfK + index + 1); existing.matchedSemantic = true; }
+    else combined.set(row.id, { ...row, matchedFts: false, matchedSemantic: true, score: vectorWeight / (rrfK + index + 1) });
   });
-  const results = [...combined.values()].sort((a, b) => b.score - a.score).slice(safeOffset, safeOffset + safeLimit);
+  const allResults = [...combined.values()].sort((a, b) => b.score - a.score);
+  const visibleResults = rankingConfig.includePrivate === false ? allResults.filter((row) => !row.private) : allResults;
+  const results = visibleResults.slice(safeOffset, safeOffset + safeLimit);
+  performanceRecorder('search_hybrid', performance.now() - startedPerf);
   if (event) recordEvent({ ...event, source: source === 'all' ? null : source, query, result_count: results.length, top_score: results[0]?.score ?? null, latency_ms: Date.now() - startedAt }, results.map((row) => row.id));
   return results;
 }
@@ -2238,7 +2368,7 @@ function countBySource() {
     }, {});
 }
 
-module.exports = { initializeDatabase, closeDatabaseForTest, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, removeLegacyClient, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, searchMemoriesForClient, getMemoryEmbeddingVector, getMemoryForClient, countBySourceForClient, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, JOIN_ALL_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
+module.exports = { initializeDatabase, closeDatabaseForTest, getDatabaseStatus, getRuntimeDatabaseStats, setPerformanceRecorder, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, saveEvaluationDataset, listEvaluationDatasets, runEvaluationDataset, listEvaluationRunSummaries, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, removeLegacyClient, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, searchMemoriesForClient, getMemoryEmbeddingVector, getMemoryForClient, countBySourceForClient, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, JOIN_ALL_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
 module.exports.lockDatabase = lockDatabase;
 module.exports.migrateDatabaseToPassword = migrateDatabaseToPassword;
 module.exports.verifyMasterPassword = verifyMasterPassword;
