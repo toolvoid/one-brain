@@ -25,7 +25,7 @@ if (graphicsStartupConfig.useAngle) app.commandLine.appendSwitch('use-angle', gr
 if (graphicsStartupConfig.disable3dApiDomainBlocking) app.disableDomainBlockingFor3DAPIs();
 if (graphicsStartupConfig.disableHardwareAcceleration) app.disableHardwareAcceleration();
 
-const { BrowserWindow, ipcMain, Menu, safeStorage, globalShortcut, clipboard, Tray, nativeImage } = require('electron');
+const { BrowserWindow, ipcMain, Menu, safeStorage, globalShortcut, clipboard, Tray, nativeImage, dialog } = require('electron');
 ipcMain.handle('lifecycle:tail', () => lifecycleLog.tail(50));
 const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
 const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getMcpClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, getMemoryEmbeddingVector, getMemory, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, listRecentImports, listClients, removeLegacyClient, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, addMemory, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
@@ -40,6 +40,7 @@ const { createConnectionActivity } = require('./connection-activity');
 const { initialHealth, reduceHealth, getHealthStatus } = require('./connection-health');
 const lockController = require('./lock-controller');
 const { lockDatabase } = require('./db');
+const { migrateDatabaseToPassword, verifyMasterPassword, unlockDatabaseWithPassword, exportEncryptedRecoveryFile } = require('./db');
 
 let mcpConnection;
 let memoryProxy;
@@ -379,6 +380,12 @@ ipcMain.handle('embeddings:retry', async () => {
   return true;
 });
 ipcMain.handle('database:status', () => getDatabaseStatus());
+ipcMain.handle('security:set-master-password', (_event, password) => migrateDatabaseToPassword(app.getPath('userData'), password));
+ipcMain.handle('security:export-recovery', async (_event, password) => {
+  const result = await dialog.showSaveDialog(mainWindow, { title: 'Export encrypted recovery file', defaultPath: path.join(app.getPath('home'), 'one-brain-recovery.obr'), filters: [{ name: 'One Brain recovery', extensions: ['obr'] }] });
+  if (result.canceled || !result.filePath) return { canceled: true };
+  return exportEncryptedRecoveryFile(app.getPath('userData'), result.filePath, password);
+});
 ipcMain.handle('clients:list', () => listClients());
 ipcMain.handle('clients:approve', (_event, client, readSources, writeSource) => approveClient(client, readSources, writeSource));
 ipcMain.handle('clients:grant', (_event, client, source, status) => updateClientGrant(client, source, status));
@@ -517,15 +524,20 @@ function createWindow() {
 app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return;
   createQuickContextTray();
+  const userDataPath = app.getPath('userData');
+  lockController.configure({
+    verifyPassword: async (password) => { try { return verifyMasterPassword(userDataPath, password); } catch { return false; } },
+    onLock: lockDatabase,
+    onUnlock: (password) => unlockDatabaseWithPassword(userDataPath, password)
+  });
   const databaseStatus = await initializeDatabase(app.getPath('userData'), safeStorage);
-  lockController.configure({ verifyPassword: async () => false, onLock: lockDatabase });
+  if (databaseStatus.state === 'password-required') lockController.lock();
   if (databaseStatus.message) console.error(databaseStatus.message);
 
-  startEmbedder();
+  if (!lockController.isLocked()) startEmbedder();
   try { applyQuickContextSettings(readQuickContextSettings()); } catch { /* Keep the app usable if the OS reserves the selected shortcut. */ }
   createWindow();
 
-  const userDataPath = app.getPath('userData');
   connectionActivity = createConnectionActivity(userDataPath);
   const recordDashboardEvent = (event, memoryIds) => {
     recordProxyEvent(event, memoryIds);

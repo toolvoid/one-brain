@@ -26,9 +26,9 @@ async function unlock(password) {
   let valid = false;
   try { valid = await verifyPassword(password); } catch { valid = false; }
   if (!valid) return false;
-  try { await onUnlock(password); }
-  catch { return false; }
   locked = false;
+  try { await onUnlock(password); }
+  catch { locked = true; try { onLock(); } catch {} return false; }
   return true;
 }
 
