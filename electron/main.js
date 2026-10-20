@@ -12,7 +12,7 @@ if (!hasSingleInstanceLock) {
 }
 const { getGraphicsStartupConfig, recordGpuCrash, registerShortcutWithFallback } = require('./platform');
 const { createCrashLoopLimiter } = require('./window-lifecycle');
-const { rendererErrorLocation } = require('./renderer-errors');
+const { rendererErrorLocation, rendererErrorMessage } = require('./renderer-errors');
 const { readGraphicsSettings, writeGraphicsSettings } = require('./graphics-settings');
 const graphicsUserDataPath = app.getPath('userData');
 let graphicsSettings = readGraphicsSettings(graphicsUserDataPath);
@@ -33,6 +33,7 @@ const { startMcpServer } = require('./mcp-server');
 const { createEmbedder } = require('./embedder');
 const connectors = require('./connectors');
 const { createClientToken, ensureClientToken, revokeClientTokenFile, tokenPath } = require('./client-tokens');
+const { registerSecurityIpc } = require('./security-ipc');
 const { createMemoryProxy } = require('./memory-proxy');
 const { createExtApi } = require('./ext-api');
 const { prepareQuickContext, buildQuickContextBlock } = require('./quick-context');
@@ -380,11 +381,14 @@ ipcMain.handle('embeddings:retry', async () => {
   return true;
 });
 ipcMain.handle('database:status', () => getDatabaseStatus());
-ipcMain.handle('security:set-master-password', (_event, password) => migrateDatabaseToPassword(app.getPath('userData'), password));
-ipcMain.handle('security:export-recovery', async (_event, password) => {
-  const result = await dialog.showSaveDialog(mainWindow, { title: 'Export encrypted recovery file', defaultPath: path.join(app.getPath('home'), 'one-brain-recovery.obr'), filters: [{ name: 'One Brain recovery', extensions: ['obr'] }] });
-  if (result.canceled || !result.filePath) return { canceled: true };
-  return exportEncryptedRecoveryFile(app.getPath('userData'), result.filePath, password);
+registerSecurityIpc(ipcMain, {
+  getUserDataPath: () => app.getPath('userData'),
+  getHomePath: () => app.getPath('home'),
+  getMainWindow: () => mainWindow,
+  dialog,
+  migrateDatabaseToPassword,
+  exportEncryptedRecoveryFile,
+  logFailure: (details) => lifecycleLog.append('vault_operation_failed', details),
 });
 ipcMain.handle('clients:list', () => listClients());
 ipcMain.handle('clients:approve', (_event, client, readSources, writeSource) => approveClient(client, readSources, writeSource));
@@ -495,7 +499,10 @@ function createWindow() {
   win.once('ready-to-show', () => { if (!win.isDestroyed()) { win.show(); win.focus(); } });
   win.webContents.on('console-message', (details) => {
     const location = rendererErrorLocation(details.level, details.lineNumber, details.sourceId);
-    if (location) console.error(`One Brain renderer error at ${location.source}${location.line ? `:${location.line}` : ''} (message omitted).`);
+    if (location) {
+      const error = rendererErrorMessage(details.message);
+      console.error(`One Brain renderer ${error.name} at ${location.source}${location.line ? `:${location.line}` : ''}: ${error.message}`);
+    }
   });
 
   if (!app.isPackaged) {

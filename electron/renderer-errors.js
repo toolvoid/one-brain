@@ -15,4 +15,18 @@ function rendererErrorLocation(level, line, sourceId) {
   return { source, line: Number.isInteger(lineNumber) && lineNumber > 0 ? lineNumber : null };
 }
 
-module.exports = { rendererErrorLocation };
+function rendererErrorMessage(message) {
+  let value = String(message || 'Renderer error')
+    .replace(/\b(password|passphrase|token|key|api[_ -]?key|secret|private[_ -]?key)\b\s*[:=]\s*[^\s,;&]+/gi, '$1=[REDACTED]')
+    .replace(/\b(password|passphrase|token|key|api[_ -]?key|secret|private[_ -]?key)\b\s+(?:is\s+)?[^\s,;&]+/gi, '$1 [REDACTED]')
+    .replace(/\bBearer\s+[^\s,;&]+/gi, 'Bearer [REDACTED]')
+    .replace(/\b(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b/g, '[REDACTED]')
+    .replace(/\b[A-Fa-f0-9]{40,}\b/g, '[REDACTED]')
+    .trim();
+  const match = value.match(/^([A-Za-z_$][\w.$]*Error)\s*:\s*/);
+  const name = match ? match[1].slice(0, 60) : 'RendererError';
+  const detail = (match ? value.slice(match[0].length) : value).slice(0, 200);
+  return { name, message: detail || 'Renderer error' };
+}
+
+module.exports = { rendererErrorLocation, rendererErrorMessage };

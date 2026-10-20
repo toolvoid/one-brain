@@ -32,6 +32,17 @@ function safeDetails(event, details = {}) {
     if (Number.isFinite(Number(details.errorCode))) safe.errorCode = Number(details.errorCode);
     safe.isMainFrame = Boolean(details.isMainFrame);
   }
+  if (event === 'vault_operation_failed') {
+    if (['set_password', 'export_recovery'].includes(details.operation)) safe.operation = details.operation;
+    if (/^[\w.-]{1,40}$/.test(String(details.name || ''))) safe.name = String(details.name);
+    if (typeof details.message === 'string') {
+      safe.message = details.message
+        .replace(/\b(password|passphrase|token|key|api[_ -]?key|secret|private[_ -]?key)\b\s*[:=]\s*[^\s,;]+/gi, '$1=[REDACTED]')
+        .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [REDACTED]')
+        .replace(/\b(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b/g, '[REDACTED]')
+        .slice(0, 200);
+    }
+  }
   if (['window_created', 'window_closed', 'window_unresponsive', 'window_shown', 'window_hidden', 'window_minimized', 'window_restored'].includes(event)) {
     safe.window = String(details.window || 'main').slice(0, 32);
   }

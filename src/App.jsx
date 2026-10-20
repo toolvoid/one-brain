@@ -271,6 +271,11 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
   const [statusFilter, setStatusFilter] = useState('all');
   const [securityBusy, setSecurityBusy] = useState(false);
   const [securityNotice, setSecurityNotice] = useState('');
+  const [securityModal, setSecurityModal] = useState(null);
+  const [securityPassword, setSecurityPassword] = useState('');
+  const [securityPasswordConfirm, setSecurityPasswordConfirm] = useState('');
+  const [securityPasswordVisible, setSecurityPasswordVisible] = useState(false);
+  const [securityModalError, setSecurityModalError] = useState('');
   const rows = buildConnectionRows({ mcp, clients, extensions, providers, quickContext, activity, counts });
   const health = summarizeConnectionHealth(rows);
   const connectedCount = rows.filter((row) => row.healthy && row.status !== 'Degraded').length;
@@ -282,6 +287,51 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
     if (statusFilter === 'setup') return ['not_set_up', 'not_installed', 'manual_only', 'not_checked'].includes(row.healthStatus);
     return true;
   });
+  function openSecurityModal(mode) {
+    setSecurityModal(mode);
+    setSecurityPassword('');
+    setSecurityPasswordConfirm('');
+    setSecurityPasswordVisible(false);
+    setSecurityModalError('');
+    setSecurityNotice('');
+  }
+  function closeSecurityModal() {
+    if (securityBusy) return;
+    setSecurityModal(null);
+    setSecurityPassword('');
+    setSecurityPasswordConfirm('');
+    setSecurityModalError('');
+  }
+  async function submitSecurityModal(event) {
+    event.preventDefault();
+    if (securityPassword.length < 12) { setSecurityModalError('Use at least 12 characters.'); return; }
+    if (securityModal === 'set' && securityPassword !== securityPasswordConfirm) { setSecurityModalError('The passwords do not match.'); return; }
+    setSecurityBusy(true);
+    setSecurityModalError('');
+    try {
+      const result = securityModal === 'set'
+        ? await window.brain.setMasterPassword(securityPassword)
+        : await window.brain.exportRecoveryFile(securityPassword);
+      if (!result?.ok) {
+        const message = result?.error || 'The operation failed. Please try again.';
+        if (result?.canceled) {
+          setSecurityNotice(message);
+          setSecurityModal(null);
+          setSecurityPassword('');
+          setSecurityPasswordConfirm('');
+        } else setSecurityModalError(message);
+        return;
+      }
+      setSecurityNotice(securityModal === 'set'
+        ? `Master password set. Backup saved in ${result.backupPath}. Export an encrypted recovery file now.`
+        : `Encrypted recovery file saved to ${result.path}.`);
+      setSecurityModal(null);
+      setSecurityPassword('');
+      setSecurityPasswordConfirm('');
+    } catch (error) {
+      setSecurityModalError(error?.message || 'The operation failed. Please try again.');
+    } finally { setSecurityBusy(false); }
+  }
   const filteredActivity = activity.filter((event) => !filter || event.client === filter);
   const seenSuccessfulChecks = new Set();
   const visibleActivity = filteredActivity.filter((event) => {
@@ -404,8 +454,9 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
         <div className="connection-compact-meta"><span>{row.lastActivity ? `${row.lastActivity.action} ${relative(row.lastActivity.time)}` : 'No activity'}</span><span>{row.counts.searches} searches · {row.counts.saves} saves today</span></div>
         <button type="button" className="connection-details-button" onClick={() => setSelectedConnection(row)}>View details</button>
       </article>)}</div>{visibleRows.length === 0 && <p className="empty-note">No connections match this filter.</p>}
-      <section className="connection-security"><h3>Security</h3><p>Stdio bridge: loopback listener at <code>127.0.0.1:{mcpConfig?.port || '—'}</code>. Preferred port <code>{mcpConfig?.preferredPort || 3737}</code>{mcpConfig?.preferredPortInUseBy ? ` is held by ${mcpConfig.preferredPortInUseBy}` : ''}. Every request requires a valid client token.</p><p role="note">If you forget the master password and have no encrypted recovery file, your memories cannot be recovered and the data will be lost.</p>{securityNotice && <p role="status">{securityNotice}</p>}<div><button type="button" disabled={securityBusy} onClick={async () => { if (!window.confirm('Setting a master password will re-key the local database. A timestamped encrypted backup will be made first. Continue?')) return; const password = window.prompt('Choose a master password (at least 12 characters).'); if (!password) return; const confirmation = window.prompt('Confirm the master password.'); if (password !== confirmation) { setSecurityNotice('The passwords did not match; nothing changed.'); return; } setSecurityBusy(true); setSecurityNotice(''); try { const result = await window.brain.setMasterPassword(password); setSecurityNotice(`Master password set. Backup saved in ${result.backupPath}. Export an encrypted recovery file now.`); } catch (error) { setSecurityNotice(error.message || 'Could not set the master password.'); } finally { setSecurityBusy(false); } }}>Set password</button><button type="button" disabled={securityBusy} onClick={async () => { const password = window.prompt('Enter your master password to encrypt the recovery file.'); if (!password) return; setSecurityBusy(true); try { const result = await window.brain.exportRecoveryFile(password); setSecurityNotice(result.canceled ? 'Recovery export canceled.' : `Encrypted recovery file saved to ${result.path}.`); } catch (error) { setSecurityNotice(error.message || 'Could not export the recovery file.'); } finally { setSecurityBusy(false); } }}>Export recovery file</button><button type="button" onClick={onRotateAll}>Rotate token</button></div></section>
+      <section className="connection-security"><h3>Security</h3><p>Stdio bridge: loopback listener at <code>127.0.0.1:{mcpConfig?.port || '—'}</code>. Preferred port <code>{mcpConfig?.preferredPort || 3737}</code>{mcpConfig?.preferredPortInUseBy ? ` is held by ${mcpConfig.preferredPortInUseBy}` : ''}. Every request requires a valid client token.</p><p role="note">If you forget the master password and have no encrypted recovery file, your memories cannot be recovered and the data will be lost.</p>{securityNotice && <p role="status">{securityNotice}</p>}<div><button type="button" disabled={securityBusy} onClick={() => openSecurityModal('set')}>Set password</button><button type="button" disabled={securityBusy} onClick={() => openSecurityModal('export')}>Export recovery file</button><button type="button" onClick={onRotateAll}>Rotate token</button></div></section>
     </> : <section className="connection-activity"><header><div><h3>Recent activity</h3><small>Repeated successful checks are grouped by service.</small></div><label>Filter by client<select value={filter} onChange={(event) => setFilter(event.target.value)}><option value="">All clients</option>{[...new Set(activity.map((event) => event.client))].sort().map((client) => <option key={client}>{client}</option>)}</select></label><button type="button" onClick={async () => { await window.brain.clearConnectionActivity(); await onRefresh(); }}>Clear log</button></header>{visibleActivity.map((event) => <article key={`${event.time}-${event.client}-${event.action}`}><time>{new Date(event.time).toLocaleString()}</time><strong>{event.client}</strong><span>{event.action}</span><span>{event.ok ? 'OK' : 'Fail'}</span><small>{event.reason || '—'}{event.probe ? ` · probe ${event.duration} ms` : ''}</small></article>)}{visibleActivity.length === 0 && <p className="empty-note">No connection activity yet.</p>}</section>}
+    {securityModal && createPortal(<div className="connection-window-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) closeSecurityModal(); }}><form className="security-password-modal" role="dialog" aria-modal="true" aria-labelledby="security-password-title" noValidate onSubmit={(event) => void submitSecurityModal(event)}><header><div><h2 id="security-password-title">{securityModal === 'set' ? 'Set master password' : 'Export recovery file'}</h2><small>{securityModal === 'set' ? 'This re-keys your local database after creating a timestamped backup.' : 'Your recovery file will be encrypted with this password.'}</small></div><button type="button" aria-label="Close password dialog" disabled={securityBusy} onClick={closeSecurityModal}>×</button></header><label>Password<input autoFocus type={securityPasswordVisible ? 'text' : 'password'} minLength={12} autoComplete="new-password" required value={securityPassword} onChange={(event) => setSecurityPassword(event.target.value)} /></label>{securityModal === 'set' && <label>Confirm password<input type={securityPasswordVisible ? 'text' : 'password'} minLength={12} autoComplete="new-password" required value={securityPasswordConfirm} onChange={(event) => setSecurityPasswordConfirm(event.target.value)} /></label>}<button type="button" className="security-password-toggle" aria-pressed={securityPasswordVisible} onClick={() => setSecurityPasswordVisible((visible) => !visible)}>{securityPasswordVisible ? 'Hide passwords' : 'Show passwords'}</button>{securityModalError && <p className="security-password-error" role="alert">{securityModalError}</p>}<footer><button type="button" disabled={securityBusy} onClick={closeSecurityModal}>Cancel</button><button type="submit" disabled={securityBusy}>{securityBusy ? 'Working…' : securityModal === 'set' ? 'Set password' : 'Choose save location'}</button></footer></form></div>, document.body)}
     {selectedConnection && createPortal(<div className="connection-window-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedConnection(null); }}><section className="connection-detail-window" role="dialog" aria-modal="true" aria-labelledby="connection-detail-title"><header><div><h2 id="connection-detail-title">{selectedConnection.name}</h2><small>{selectedConnection.type}</small></div><button type="button" aria-label="Close connection details" onClick={() => setSelectedConnection(null)}>×</button></header><div className="connection-detail-status"><span className={`connection-status ${selectedConnection.status.toLowerCase().replaceAll(' ', '-')}`}>{selectedConnection.status}</span><p>{selectedConnection.reason || 'No issues reported.'}</p></div><section className="connection-detail-works"><h3>Works</h3>{['Search', 'Save', 'Auto-insert'].map((feature) => <div key={feature}><strong>{selectedConnection.work[feature].supported ? '✓' : '—'} {feature}</strong>{!selectedConnection.work[feature].supported && <small>{selectedConnection.work[feature].reason || 'Not supported'}</small>}</div>)}</section><div className="connection-detail-activity"><strong>Last activity</strong><span>{selectedConnection.lastActivity ? `${selectedConnection.lastActivity.action} ${relative(selectedConnection.lastActivity.time)}` : 'No activity yet'}</span><strong>Today</strong><span>{selectedConnection.counts.searches} searches · {selectedConnection.counts.saves} saves</span></div><footer><button type="button" onClick={() => void connect(selectedConnection)}>Reconnect</button><button type="button" onClick={() => void onDisconnect(selectedConnection)}>Disconnect</button><button type="button" onClick={() => void testOne(selectedConnection)}>Test connection</button>{selectedConnection.type.includes('MCP') && <><button type="button" onClick={async () => { if (window.confirm(`Rotate ${selectedConnection.name}'s token? Its current token will stop working.`)) { await window.brain.rotateConnectorToken(selectedConnection.id); await onRefresh(); } }}>Rotate token</button><button type="button" onClick={async () => { if (window.confirm(`Revoke ${selectedConnection.name}'s token?`)) { await window.brain.revokeConnectorToken(selectedConnection.id); await onRefresh(); } }}>Revoke</button></>}{selectedConnection.site && <button type="button" onClick={() => void openSite(selectedConnection)}>Open site</button>}</footer></section></div>, document.body)}
   </section>;
 }
@@ -1931,6 +1982,7 @@ function App() {
         .connection-works { display:grid;gap:4px;min-width:180px; }.connection-works span { color:#b9c9dc; }.connection-works span:first-letter { color:#9ce0b9; }.connection-works small { display:block;padding-left:14px;color:#8393a7;font-size:8px; }
         .connection-security,.connection-activity { display:grid;gap:7px;padding:9px;border:1px solid rgba(175,195,224,.14);border-radius:7px;background:rgba(15,24,37,.7); }.connection-security p { margin:0;color:#aab9cb;font-size:10px;line-height:1.5; }.connection-security code { color:#cde3ff; }
         .connection-window-backdrop { position:fixed;z-index:1200;inset:0;display:grid;place-items:center;padding:16px;background:rgba(3,7,13,.68); }.connection-detail-window { display:grid;gap:13px;width:min(620px,100%);max-height:min(84vh,780px);overflow:auto;padding:18px;border:1px solid rgba(143,196,255,.3);border-radius:12px;background:#111a28;box-shadow:0 20px 70px rgba(0,0,0,.5);color:#dce6f2; }.connection-detail-window > header { display:flex;justify-content:space-between;align-items:flex-start;gap:12px; }.connection-detail-window h2 { margin:0;color:#eef5ff;font-size:17px; }.connection-detail-window header small { display:block;margin-top:4px;color:#91a4bb;font-size:10px; }.connection-detail-window header button { font-size:16px; }.connection-detail-status p { margin:7px 0 0;color:#aab9cb;font-size:11px;line-height:1.5; }.connection-detail-works { display:grid;gap:7px; }.connection-detail-works h3 { margin:0;color:#e2eaf5;font-size:12px; }.connection-detail-works > div { display:grid;gap:3px;padding:8px;border:1px solid rgba(175,195,224,.12);border-radius:6px;background:rgba(255,255,255,.025);font-size:11px; }.connection-detail-works small { color:#91a0b4;font-size:9px; }.connection-detail-activity { display:grid;grid-template-columns:auto 1fr;gap:7px 12px;color:#aab9cb;font-size:10px; }.connection-detail-activity strong { color:#e2eaf5; }.connection-detail-window footer { display:flex;gap:6px;flex-wrap:wrap; }
+        .security-password-modal { display:grid;gap:12px;width:min(440px,100%);padding:18px;border:1px solid rgba(143,196,255,.3);border-radius:12px;background:#111a28;box-shadow:0 20px 70px rgba(0,0,0,.5);color:#dce6f2; }.security-password-modal header { display:flex;justify-content:space-between;align-items:flex-start;gap:12px; }.security-password-modal h2 { margin:0;color:#eef5ff;font-size:16px; }.security-password-modal header small { display:block;margin-top:5px;color:#91a4bb;font-size:10px;line-height:1.5; }.security-password-modal label { display:grid;gap:5px;color:#c6d2e2;font-size:11px; }.security-password-modal input { width:100%;min-height:36px;padding:8px;border:1px solid #3d5068;border-radius:6px;background:#0b111a;color:#eff6ff;font:inherit; }.security-password-modal footer { display:flex;justify-content:flex-end;gap:7px; }.security-password-toggle { justify-self:start; }.security-password-error { margin:0;padding:8px;border:1px solid #6c3539;border-radius:6px;background:#351b21;color:#ffc3bd;font-size:11px; }
         .connection-activity header { flex-wrap:wrap; }.connection-activity header label { display:flex;align-items:center;gap:5px;color:#aab9cb;font-size:9px; }.connection-activity article { display:grid;grid-template-columns:1fr 1fr 1fr 35px 1fr;gap:6px;padding:6px 0;border-top:1px solid rgba(175,195,224,.1);color:#c6d2e2;font-size:9px; }.connection-activity article small,.connection-activity time { color:#8697ad;font-size:8px; }
         .client-card { display:grid;gap:8px;margin-top:10px;padding:10px;border:1px solid rgba(175,195,224,.14);border-radius:8px;background:rgba(20,29,43,.45); }
         .client-heading { display:flex;justify-content:space-between;gap:8px;color:#e1eaf6;font-size:11px; }
