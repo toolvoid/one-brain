@@ -117,3 +117,29 @@ test('old migration backups are not deleted for a wrong master password', async 
   assert.equal(result.failedCount, 1);
   assert.equal(calls.some(([kind]) => kind === 'delete-old-backups'), false);
 });
+
+test('copying a saved provider key requires the master password and never returns the key', async () => {
+  const copied = [];
+  const { handlers, failures } = setup({
+    verifyMasterPassword: async (_userData, password) => password === 'right password',
+    copyProviderKey: (provider) => { copied.push(provider); return { ok: true }; },
+  });
+  const handler = handlers.get('security:copy-provider-key');
+  const wrong = await handler({}, 'openai', 'wrong password');
+  assert.equal(wrong.ok, false);
+  assert.equal(wrong.error, 'Wrong password');
+  assert.deepEqual(copied, []);
+  assert.equal(failures.at(-1)?.operation, 'copy_provider_key');
+  const right = await handler({}, 'openai', 'right password');
+  assert.deepEqual(right, { ok: true, error: null });
+  assert.deepEqual(copied, ['openai']);
+  assert.doesNotMatch(JSON.stringify([wrong, right, failures]), /right password|wrong password/);
+});
+
+test('copying a provider key is refused until a master password is set', async () => {
+  const { handlers, calls, userData } = setup();
+  fs.rmSync(path.join(userData, 'db.vault.json'));
+  const result = await handlers.get('security:copy-provider-key')({}, 'openai', 'anything');
+  assert.deepEqual(result, { ok: false, error: 'Set a master password first.' });
+  assert.equal(calls.some(([kind]) => kind === 'verify'), false);
+});

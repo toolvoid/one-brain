@@ -183,7 +183,7 @@ function getClientTokenState(token) {
 function getProxyClientProfile(client) {
   const name = String(client || '').trim();
   if (!/^[a-z0-9][a-z0-9:-]{0,63}$/.test(name)) return null;
-  const profile = getDatabase().prepare('SELECT client, write_source, status, verified FROM client_profiles WHERE client = ?').get(name);
+  const profile = getDatabase().prepare('SELECT client, write_source, status, verified, auto_memory_injection FROM client_profiles WHERE client = ?').get(name);
   if (!profile) return null;
   profile.allowedSources = getDatabase().prepare("SELECT read_source FROM client_grants WHERE client = ? AND status = 'allow'").all(name).map((row) => row.read_source);
   return profile;
@@ -1265,6 +1265,10 @@ function getDatabase() {
       if (!profileColumns.has('verified')) database.exec('ALTER TABLE client_profiles ADD COLUMN verified INTEGER NOT NULL DEFAULT 0');
       if (!profileColumns.has('reported_name')) database.exec('ALTER TABLE client_profiles ADD COLUMN reported_name TEXT');
     });
+    migrate('client-auto-memory-injection-v1', () => {
+      const profileColumns = new Set(database.prepare('PRAGMA table_info(client_profiles)').all().map((column) => column.name));
+      if (!profileColumns.has('auto_memory_injection')) database.exec('ALTER TABLE client_profiles ADD COLUMN auto_memory_injection INTEGER NOT NULL DEFAULT 0 CHECK(auto_memory_injection IN (0, 1))');
+    });
 
     const linkColumns = new Set(database.prepare('PRAGMA table_info(links)').all().map((column) => column.name));
     const linkSql = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'links'").get()?.sql || '';
@@ -1624,7 +1628,7 @@ function getMcpClientProfile(clientName, identity = {}) {
     VALUES (?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`).run(client, defaultSource).changes > 0;
   db.prepare('UPDATE client_profiles SET last_seen = CURRENT_TIMESTAMP, verified = ?, reported_name = ? WHERE client = ?')
     .run(identity.verified ? 1 : 0, identity.reported_name || null, client);
-  const profile = db.prepare('SELECT client, write_source, status, first_seen, last_seen, verified, reported_name FROM client_profiles WHERE client = ?').get(client);
+  const profile = db.prepare('SELECT client, write_source, status, first_seen, last_seen, verified, reported_name, auto_memory_injection FROM client_profiles WHERE client = ?').get(client);
   if (created) recordEvent({ kind: 'client_pending', tool: 'client_profile', client: identity.eventClient || client,
     verified: identity.verified, reported_name: identity.reported_name, ok: 1 });
   const allowedSources = db.prepare("SELECT read_source FROM client_grants WHERE client = ? AND status = 'allow'").all(client).map((row) => row.read_source);
@@ -1633,7 +1637,7 @@ function getMcpClientProfile(clientName, identity = {}) {
 
 function listClients() {
   const db = getDatabase();
-  return db.prepare('SELECT client, write_source, status, first_seen, last_seen, verified, reported_name FROM client_profiles ORDER BY last_seen DESC, client').all().map((profile) => ({
+  return db.prepare('SELECT client, write_source, status, first_seen, last_seen, verified, reported_name, auto_memory_injection FROM client_profiles ORDER BY last_seen DESC, client').all().map((profile) => ({
     ...profile,
     grants: Object.fromEntries(MEMORY_SOURCES.map((source) => [source, db.prepare('SELECT status FROM client_grants WHERE client = ? AND read_source = ?').get(profile.client, source)?.status || 'deny']))
   }));
@@ -1684,13 +1688,15 @@ function updateClientProfile(clientName, changes = {}) {
   ensureWritable();
   const db = getDatabase();
   const client = normalizeClientName(clientName);
-  const current = db.prepare('SELECT client, write_source, status FROM client_profiles WHERE client = ?').get(client);
+  const current = db.prepare('SELECT client, write_source, status, auto_memory_injection FROM client_profiles WHERE client = ?').get(client);
   if (!current) throw new Error('Client profile was not found.');
   const writeSource = changes.write_source === undefined ? current.write_source : changes.write_source;
   if (writeSource !== null && !MEMORY_SOURCES.includes(writeSource)) throw new Error('Choose a valid write source.');
   const status = changes.status === undefined ? current.status : changes.status;
   if (!['pending', 'approved', 'blocked'].includes(status)) throw new Error('Invalid client status.');
-  db.prepare('UPDATE client_profiles SET write_source = ?, status = ? WHERE client = ?').run(writeSource, status, client);
+  const autoMemoryInjection = changes.auto_memory_injection === undefined ? current.auto_memory_injection : (changes.auto_memory_injection ? 1 : 0);
+  if (![0, 1].includes(Number(autoMemoryInjection))) throw new Error('Invalid automatic memory injection setting.');
+  db.prepare('UPDATE client_profiles SET write_source = ?, status = ?, auto_memory_injection = ? WHERE client = ?').run(writeSource, status, autoMemoryInjection, client);
   if (writeSource !== current.write_source) recordEvent({ kind: 'grant_change', tool: 'client_write_source', client, source: writeSource, ok: 1 });
   if (status !== current.status) recordEvent({ kind: status === 'approved' ? 'client_approved' : (status === 'blocked' ? 'client_blocked' : 'client_profile_change'), tool: 'client_profile', client, source: writeSource, ok: 1 });
   return listClients().find((profile) => profile.client === client);

@@ -29,3 +29,21 @@ test('Groq and DeepSeek key test makes a one-token request and returns only safe
   assert.match(failure.reason, /HTTP 401/);
   assert.doesNotMatch(failure.reason, /synthetic-rejected-key/);
 });
+
+test('saved provider key copy writes only to the explicit clipboard callback and never returns key material', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'one-brain-provider-copy-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const proxy = createMemoryProxy({ userDataPath: directory, safeStorage: {
+    isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'test',
+    encryptString: (value) => Buffer.from(`encrypted:${value}`),
+    decryptString: (value) => value.toString().replace(/^encrypted:/, '')
+  } });
+  const key = 'synthetic-provider-copy-key';
+  proxy.saveKey('openai', key);
+  let clipboard = '';
+  const result = proxy.copySavedKey('openai', { writeText(value) { clipboard = value; } });
+  assert.deepEqual(result, { ok: true, error: null });
+  assert.equal(clipboard, key);
+  assert.doesNotMatch(JSON.stringify(result), /synthetic-provider-copy-key/);
+  assert.notEqual(fs.readFileSync(path.join(directory, 'provider-keys.enc'), 'utf8').includes(key), true);
+});

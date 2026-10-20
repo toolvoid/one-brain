@@ -84,6 +84,18 @@ test('renderer error lifecycle event keeps a redacted error and source location'
   assert.doesNotMatch(fs.readFileSync(log.filePath, 'utf8'), /TOPSECRET|ghp_/);
 });
 
+test('diagnostic logs redact provider keys, bearer tokens, access tokens, and pair codes', (t) => {
+  const directory = temporaryDirectory(t);
+  const log = createLifecycleLog(directory);
+  log.append('renderer_error', { name: 'Error', source: 'App.jsx', message: 'api_key=synthetic-provider-key token=synthetic-token Bearer synthetic-bearer pair code=123456' });
+  const text = fs.readFileSync(log.filePath, 'utf8');
+  assert.match(text, /api_key=\[REDACTED\]/);
+  assert.match(text, /token=\[REDACTED\]/);
+  assert.match(text, /Bearer \[REDACTED\]/);
+  assert.match(text, /pair code=\[REDACTED\]/i);
+  assert.doesNotMatch(text, /synthetic-provider-key|synthetic-token|synthetic-bearer|123456/);
+});
+
 test('lifecycle log trims oversized files already present at startup', (t) => {
   const directory = temporaryDirectory(t);
   fs.writeFileSync(path.join(directory, 'lifecycle.log'), 'x'.repeat(900));

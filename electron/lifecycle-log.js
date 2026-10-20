@@ -16,6 +16,12 @@ function shortCaller(stack) {
 
 function safeDetails(event, details = {}) {
   const safe = {};
+  if (['navigation_denied', 'ipc_denied', 'permission_denied', 'auth_failed', 'rate_limited', 'vault_unlock_failed'].includes(event)) {
+    if (Number.isFinite(Number(details.count))) safe.count = Math.max(1, Math.min(1_000_000, Math.floor(Number(details.count))));
+    if (event === 'ipc_denied' && /^[a-z0-9:_-]{1,80}$/i.test(String(details.channel || ''))) safe.channel = String(details.channel);
+    if (event === 'permission_denied' && /^[a-z0-9_-]{1,40}$/i.test(String(details.permission || ''))) safe.permission = String(details.permission);
+    if (event === 'rate_limited' && /^[a-z0-9:_-]{1,80}$/i.test(String(details.client || ''))) safe.client = String(details.client);
+  }
   if (event === 'child_process_spawn') safe.command = commandBasename(details.command);
   if (['render_process_gone', 'child_process_gone'].includes(event)) {
     if (details.window) safe.window = String(details.window).slice(0, 32);
@@ -57,6 +63,8 @@ function safeDetails(event, details = {}) {
     if (/^[\w.-]{1,100}$/.test(String(details.source || ''))) safe.source = String(details.source);
     if (Number.isFinite(Number(details.line)) && Number(details.line) > 0) safe.line = Math.floor(Number(details.line));
     if (typeof details.message === 'string') safe.message = details.message
+      .replace(/\b(pair(?:ing)?[\s_-]*code)\b\s*[:=]\s*[^\s,;&]+/gi, '$1=[REDACTED]')
+      .replace(/\b(pair(?:ing)?[\s_-]*code)\b\s+[^\s,;&]+/gi, '$1 [REDACTED]')
       .replace(/\b(password|passphrase|token|key|api[_ -]?key|secret|private[_ -]?key)\b\s*[:=]\s*[^\s,;&]+/gi, '$1=[REDACTED]')
       .replace(/\bBearer\s+[^\s,;&]+/gi, 'Bearer [REDACTED]')
       .replace(/\b(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b/g, '[REDACTED]')

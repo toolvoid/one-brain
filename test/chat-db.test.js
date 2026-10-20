@@ -52,6 +52,11 @@ test('chat grants, stored memory ids, memory source, and chat deletion use the l
     const savedPendingId = db.approvePendingMemory(candidate.id, 'Gemini fact', 'Synthetic Gemini durable fact.');
     assert.equal(db.listMemories().find((item) => item.id === savedPendingId).source, 'gemini');
     const memory = db.addMemory({ source: 'chatgpt', title: 'Saved from Chat', content: 'Synthetic saved answer.' }, { event: false });
+    const proxyProfile = db.getMcpClientProfile('test-proxy-client', { verified: false });
+    assert.equal(proxyProfile.auto_memory_injection, 0, 'new API clients default to no automatic memory injection');
+    db.updateClientProfile(proxyProfile.client, { auto_memory_injection: true });
+    assert.equal(db.getProxyClientProfile(proxyProfile.client).auto_memory_injection, 1);
+    db.updateClientProfile(proxyProfile.client, { auto_memory_injection: false });
     db.getMcpClientProfile('Visual Studio Code', { verified: false });
     db.updateClientGrant('Visual Studio Code', 'codex', 'allow');
     const legacyMemory = db.addMemory({ source: 'codex', title: 'Retained memory', content: 'Synthetic durable memory remains after profile cleanup.' }, { event: false });

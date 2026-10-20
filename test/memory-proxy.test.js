@@ -31,7 +31,7 @@ function assertStrictRequest(actual, original) {
   visit(actual);
 }
 
-async function exerciseProxy({ dryRun }) {
+async function exerciseProxy({ dryRun, autoMemoryInjection = false, privateMemory = false }) {
   const userDataPath = fs.mkdtempSync(path.join(os.tmpdir(), 'one-brain-proxy-test-'));
   let sentBody;
   let event;
@@ -50,9 +50,9 @@ async function exerciseProxy({ dryRun }) {
       decryptString: (value) => value.toString()
     },
     authenticateClientToken: () => ({ client: 'test-client' }),
-    getClientProfile: () => ({ client: 'test-client', status: 'approved', allowedSources: ['codex'] }),
+    getClientProfile: () => ({ client: 'test-client', status: 'approved', allowedSources: ['codex'], auto_memory_injection: autoMemoryInjection }),
     searchMemoriesForClient: async () => ({ memories: [{ id: 42, score: 1 }] }),
-    getMemoryForClient: () => ({ memory: { id: 42, source: 'codex', title: 'Preference', content: 'Prefers concise answers.' } }),
+    getMemoryForClient: () => ({ memory: { id: 42, source: 'codex', title: 'Preference', content: privateMemory ? 'OB_PRIVATE_MARKER_PROXY must never leave One Brain.' : 'Prefers concise answers.', private: privateMemory } }),
     recordProxyEvent: (value) => { event = value; },
     addPendingMemory: async () => {},
     listenPort: 0,
@@ -88,6 +88,10 @@ async function exerciseProxy({ dryRun }) {
     if (dryRun) {
       assert.deepEqual(sentBody, original, 'dry run must send the original request unchanged');
       assert.equal(event?.estimated_tokens_added > 0, true, 'dry-run metrics stay in the local event');
+    } else if (!autoMemoryInjection || privateMemory) {
+      assert.deepEqual(sentBody, original, 'memory injection remains disabled until the client explicitly allows it');
+      assert.equal(event?.memories_injected, 0);
+      assert.doesNotMatch(JSON.stringify(sentBody), /OB_PRIVATE_MARKER_PROXY/);
     } else {
       assert.deepEqual(Object.keys(sentBody.messages[0]), ['role', 'content']);
       assert.equal(sentBody.messages[0].role, 'system');
@@ -99,8 +103,11 @@ async function exerciseProxy({ dryRun }) {
   }
 }
 
-test('injected request uses only provider-supported message fields', async () => exerciseProxy({ dryRun: false }));
-test('dry run keeps injection metadata local and sends the request unchanged', async () => exerciseProxy({ dryRun: true }));
+test('injected request uses only provider-supported message fields after client opt-in', async () => exerciseProxy({ dryRun: false, autoMemoryInjection: true }));
+test('dry run keeps injection metadata local and sends the request unchanged', async () => exerciseProxy({ dryRun: true, autoMemoryInjection: true }));
+
+test('API client memory injection is off by default and records a zero-injection audit event', async () => exerciseProxy({ dryRun: false, autoMemoryInjection: false }));
+test('private memory marker is never sent through the API proxy even after client opt-in', async () => exerciseProxy({ dryRun: false, autoMemoryInjection: true, privateMemory: true }));
 
 test('locking during an upstream request aborts it and returns 423 without crashing', async () => {
   lockController.resetForTest();

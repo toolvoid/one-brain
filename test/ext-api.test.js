@@ -254,11 +254,12 @@ test('save forces the source from the paired site and search excludes private re
   const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
   const token = await h.pair();
   h.profiles.get('ext:chatgpt').allowedSources = ['chatgpt'];
-  h.memories.push({ id: 1, source: 'chatgpt', title: 'Synthetic public', content: 'Synthetic fixture body with enough words to pass the minimum content length filter.', private: false, score: 0.9 }, { id: 2, source: 'chatgpt', title: 'Synthetic private', content: 'Synthetic private fixture body with enough content for filtering.', private: true, score: 0.88 }, { id: 3, source: 'claude', title: 'Synthetic ungranted', content: 'Synthetic ungranted fixture body with enough content for filtering.', private: false, score: 0.85 });
+  h.memories.push({ id: 1, source: 'chatgpt', title: 'Synthetic public', content: 'Synthetic fixture body with enough words to pass the minimum content length filter.', private: false, score: 0.9 }, { id: 2, source: 'chatgpt', title: 'Synthetic private', content: 'OB_PRIVATE_MARKER_EXTENSION must never reach the extension search or insert path.', private: true, score: 0.88 }, { id: 3, source: 'claude', title: 'Synthetic ungranted', content: 'Synthetic ungranted fixture body with enough content for filtering.', private: false, score: 0.85 });
   let response = await h.request('/ext/search', { method: 'POST', token, body: { query: 'synthetic' } });
   let result = await response.json();
   assert.equal(response.status, 200);
   assert.deepEqual(result.memories.map((item) => item.id), [1]);
+  assert.doesNotMatch(JSON.stringify(result), /OB_PRIVATE_MARKER_EXTENSION/);
   assert.equal(typeof result.memories[0].score, 'number');
   assert.deepEqual(h.retrieved, [1]);
   response = await h.request('/ext/save', { method: 'POST', token, body: { site: 'chatgpt', source: 'gemini', title: 'Synthetic save', text: 'Synthetic fixture saved body longer than forty characters.', kind: 'message' } });

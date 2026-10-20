@@ -18,7 +18,7 @@ function makeHandlers(memories, saved = []) {
 test('search excludes private, no_suggest, logs, junk, and weak results', async () => {
   const memories = [
     { id: 1, source: 'claude', title: 'Project setup', content, score: 0.9 },
-    { id: 2, source: 'claude', title: 'Private project', content, score: 0.99, private: 1 },
+    { id: 2, source: 'claude', title: 'Private project', content: 'OB_PRIVATE_MARKER_MCP must never be returned to a non-owner MCP client.', score: 0.99, private: 1 },
     { id: 3, source: 'claude', title: 'Do not suggest', content, score: 0.99, no_suggest: 1 },
     { id: 4, source: 'claude', title: 'Recent output', content: 'POST /ext/search returned 200 with a long response body and diagnostics.', score: 0.99 },
     { id: 5, source: 'claude', title: 'Short', content: 'tiny', score: 0.99 },
@@ -28,6 +28,7 @@ test('search excludes private, no_suggest, logs, junk, and weak results', async 
   const result = JSON.parse(outcome.result.content[0].text);
   assert.deepEqual(result.map((item) => item.id), [1]);
   assert.match(result[0].snippet, /Electron and SQLite/);
+  assert.doesNotMatch(JSON.stringify(result), /OB_PRIVATE_MARKER_MCP/);
 });
 
 test('save strips inserted context blocks and redacts secrets before storing', async () => {

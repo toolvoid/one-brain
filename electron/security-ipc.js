@@ -43,6 +43,7 @@ function registerSecurityIpc(ipcMain, {
   exportEncryptedRecoveryFile,
   restoreEncryptedRecoveryFile,
   deleteOldBackups,
+  copyProviderKey = () => ({ ok: false, error: 'Copying saved provider keys is unavailable.' }),
   logFailure = () => {},
   logEvent = () => {},
   passwordLockout = createPasswordLockout(),
@@ -158,6 +159,28 @@ function registerSecurityIpc(ipcMain, {
     } catch (error) {
       const safe = safeError(error);
       try { logFailure({ operation: 'delete_old_backups', ...safe }); } catch {}
+      return { ok: false, error: safe.message };
+    }
+  });
+
+  ipcMain.handle('security:copy-provider-key', async (_event, provider, password) => {
+    const blocked = passwordCheckBlocked(passwordLockout);
+    if (blocked) return blocked;
+    try {
+      if (!fs.existsSync(path.join(getUserDataPath(), 'db.vault.json'))) return { ok: false, error: 'Set a master password first.' };
+      let valid = false;
+      try { valid = await verifyMasterPassword(getUserDataPath(), password); } catch {}
+      if (!valid) {
+        try { logFailure({ operation: 'copy_provider_key', name: 'WrongPasswordError', message: 'Wrong password' }); } catch {}
+        return failedPasswordCheck(passwordLockout, 'Wrong password');
+      }
+      const result = copyProviderKey(provider);
+      if (!result?.ok) return { ok: false, error: result?.error || 'Could not copy the saved provider key.' };
+      passwordLockout?.recordSuccess?.();
+      return { ok: true, error: null };
+    } catch (error) {
+      const safe = safeError(error);
+      try { logFailure({ operation: 'copy_provider_key', ...safe }); } catch {}
       return { ok: false, error: safe.message };
     }
   });

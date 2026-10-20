@@ -8,12 +8,12 @@ const INVOKE_CHANNELS = new Set([
   'memories:delete', 'memories:set-private', 'memories:set-no-suggest', 'memories:move-source', 'memories:conversation-parts:count', 'memories:conversation-parts:delete',
   'memories:list', 'memories:search', 'memories:count-by-source', 'mcp:config', 'connectors:list', 'connections:activity', 'connections:counts', 'connections:clear-activity', 'connections:log', 'connections:rotate-all', 'connections:rotate-preview',
   'connectors:preview', 'connectors:connect', 'connectors:test', 'connectors:disconnect-preview', 'connectors:disconnect', 'connectors:snippet', 'connectors:revoke-token', 'connectors:rotate-token',
-  'extension:check', 'embeddings:status', 'embeddings:retry', 'database:status', 'security:set-master-password', 'security:has-master-password', 'security:export-recovery', 'security:change-master-password', 'security:restore-recovery', 'security:status', 'security:set-auto-lock', 'security:stay-unlocked', 'security:keep-unlocked-status', 'security:cancel-keep-unlocked', 'security:lock-now', 'security:delete-old-backups', 'security:startup-state', 'security:unlock-lockout-status', 'security:unlock', 'app:quit',
+  'extension:check', 'embeddings:status', 'embeddings:retry', 'database:status', 'security:set-master-password', 'security:has-master-password', 'security:export-recovery', 'security:change-master-password', 'security:restore-recovery', 'security:status', 'security:set-auto-lock', 'security:stay-unlocked', 'security:keep-unlocked-status', 'security:cancel-keep-unlocked', 'security:lock-now', 'security:delete-old-backups', 'security:copy-provider-key', 'security:startup-state', 'security:unlock-lockout-status', 'security:unlock', 'app:quit',
   'clients:list', 'clients:approve', 'clients:grant', 'clients:update', 'clients:remove-legacy', 'analytics:insights', 'analytics:run-sql', 'analytics:reset-retrieval-counts',
   'evaluation:cases', 'evaluation:add-case', 'evaluation:update-case', 'evaluation:delete-case', 'evaluation:recent-queries', 'evaluation:history', 'evaluation:update-note', 'evaluation:run', 'evaluation:run-results',
   'memory-proxy:settings', 'memory-proxy:update-settings', 'memory-proxy:save-key', 'memory-proxy:delete-key', 'memory-proxy:test-key', 'extension:status', 'extension:pair-code', 'extension:revoke', 'extension:rotate',
   'quick-context:settings', 'quick-context:open', 'quick-context:update-settings', 'quick-context:search', 'quick-context:copy', 'quick-context:close',
-  'chat:models', 'chat:generate-title', 'chat:grant', 'chat:grant-save', 'chat:list', 'chat:create', 'chat:update', 'chat:delete', 'chat:send', 'chat:stop', 'chat:save-memory',
+  'chat:models', 'chat:generate-title', 'chat:grant', 'chat:grant-save', 'chat:list', 'chat:create', 'chat:update', 'chat:delete', 'chat:send', 'chat:stop', 'chat:save-memory', 'chat:preview-memory',
   'pending-memories:list', 'pending-memories:approve', 'pending-memories:set-source', 'pending-memories:reject'
 ]);
 const EVENT_CHANNELS = new Set(['brain:locked', 'brain:unlocked', 'brain:auto-lock-warning', 'brain:keep-unlocked-status', 'graphics:safe-mode-enabled', 'chat:chunk', 'brain:embedding-status', 'brain:retrieved', 'brain:changed', 'brain:client-pending', 'brain:pending-memories-changed']);
@@ -123,6 +123,7 @@ contextBridge.exposeInMainWorld('brain', {
   cancelKeepUnlocked: () => invoke('security:cancel-keep-unlocked'),
   lockNow: () => invoke('security:lock-now'),
   deleteOldBackups: (password, confirmation) => invoke('security:delete-old-backups', password, confirmation),
+  copySavedProviderKey: (provider, password) => invoke('security:copy-provider-key', provider, password),
   getSecurityStartupState: () => invoke('security:startup-state'),
   getUnlockLockoutStatus: () => invoke('security:unlock-lockout-status'),
   unlock: (password) => invoke('security:unlock', password),
@@ -172,6 +173,7 @@ contextBridge.exposeInMainWorld('brain', {
   updateChat: (id, patch) => invoke('chat:update', id, patch),
   deleteChat: (id) => invoke('chat:delete', id),
   sendChat: (payload) => invoke('chat:send', payload),
+  previewChatMemories: (chatId, text) => invoke('chat:preview-memory', chatId, text),
   stopChat: (requestId) => invoke('chat:stop', requestId),
   saveChatMemory: (source, title, content) => invoke('chat:save-memory', source, title, content),
   onChatChunk: (callback) => {

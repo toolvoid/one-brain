@@ -81,7 +81,7 @@ async function withMock(run, { failModels = false, echoKey = false, titleFailure
     getMemoryForClient: (id, profile) => {
       const rows = {
         1: { id: 1, source: 'codex', title: 'Public allowed', content: 'synthetic allowed memory', private: false },
-        2: { id: 2, source: 'codex', title: 'Private excluded', content: 'synthetic private memory', private: true },
+        2: { id: 2, source: 'codex', title: 'Private excluded', content: 'OB_PRIVATE_MARKER_CHAT must never be sent to a cloud provider.', private: true },
         3: { id: 3, source: 'claude', title: 'Denied source', content: 'synthetic denied memory', private: false }
       };
       const memory = rows[id];
@@ -124,9 +124,11 @@ test('failed model listing returns provider text with the key redacted for text-
 test('chat injects only allowed public synthetic memories and streams mock output', async () => {
   await withMock(async ({ proxy, calls }) => {
     const chunks = [];
+    const profile = { client: 'chat:openai', status: 'approved', allowedSources: ['codex'] };
+    const messages = [{ role: 'user', content: 'What setup do I have?' }];
+    const approvedMemories = await proxy.previewChatMemories('openai', messages, profile);
     const result = await proxy.chatCompletion({ provider: 'openai', model: 'chat-model-mini',
-      messages: [{ role: 'user', content: 'What setup do I have?' }],
-      profile: { client: 'chat:openai', status: 'approved', allowedSources: ['codex'] },
+      messages, profile, approvedMemories,
       onChunk: (chunk) => chunks.push(chunk) });
     assert.equal(result.answer, 'mock answer');
     assert.equal(chunks.join(''), 'mock answer');
@@ -134,26 +136,42 @@ test('chat injects only allowed public synthetic memories and streams mock outpu
     assert.deepEqual(result.memoryIds, [1]);
     const sent = calls.find((call) => call.method === 'POST').body;
     assert.match(sent.messages[0].content, /synthetic allowed memory/);
-    assert.doesNotMatch(sent.messages[0].content, /synthetic private memory|synthetic denied memory/);
+    assert.doesNotMatch(sent.messages[0].content, /OB_PRIVATE_MARKER_CHAT|synthetic denied memory/);
     assert.equal(JSON.stringify(result).includes(localKey), false);
+  });
+});
+
+test('chat review preview contains exact public snippets and approvals restrict what is sent', async () => {
+  await withMock(async ({ proxy, calls }) => {
+    const profile = { client: 'chat:openai', status: 'approved', allowedSources: ['codex'] };
+    const messages = [{ role: 'user', content: 'What setup do I have?' }];
+    const preview = await proxy.previewChatMemories('openai', messages, profile);
+    assert.deepEqual(preview.map((item) => item.id), [1]);
+    assert.match(preview[0].snippet, /synthetic allowed memory/);
+    assert.doesNotMatch(JSON.stringify(preview), /OB_PRIVATE_MARKER_CHAT|synthetic denied memory/);
+    await proxy.chatCompletion({ provider: 'openai', model: 'chat-model-mini', messages, profile, approvedMemories: [] });
+    const sent = calls.find((call) => call.method === 'POST' && call.body.stream === true).body;
+    assert.doesNotMatch(JSON.stringify(sent), /synthetic allowed memory|OB_PRIVATE_MARKER_CHAT/);
   });
 });
 
 test('Claude uses its native local mock API, keeps system injection out of messages, and streams text', async () => {
   await withMock(async ({ proxy, calls }) => {
     const chunks = [];
+    const profile = { client: 'chat:claude', status: 'approved', allowedSources: ['codex'] };
+    const messages = [{ role: 'user', content: 'What setup do I have?' }];
+    const approvedMemories = await proxy.previewChatMemories('claude', messages, profile);
     const models = await proxy.listModels('claude', true);
     assert.ok(models.ids.includes('chat-model-mini'));
     const result = await proxy.chatCompletion({ provider: 'claude', model: 'claude-sonnet-test',
-      messages: [{ role: 'user', content: 'What setup do I have?' }],
-      profile: { client: 'chat:claude', status: 'approved', allowedSources: ['codex'] }, onChunk: (chunk) => chunks.push(chunk) });
+      messages, profile, approvedMemories, onChunk: (chunk) => chunks.push(chunk) });
     assert.equal(result.answer, 'mock answer');
     assert.equal(chunks.join(''), 'mock answer');
     const request = calls.find((call) => call.url === '/v1/messages');
     assert.equal(request.apiKey, localKey);
     assert.equal(request.authorization, undefined);
     assert.match(request.body.system, /synthetic allowed memory/);
-    assert.doesNotMatch(request.body.system, /synthetic private memory|synthetic denied memory/);
+    assert.doesNotMatch(request.body.system, /OB_PRIVATE_MARKER_CHAT|synthetic denied memory/);
     assert.deepEqual(request.body.messages.map((item) => item.role), ['user']);
   });
 });

@@ -38,7 +38,18 @@ if (graphicsStartupConfig.useGl) app.commandLine.appendSwitch('use-gl', graphics
 if (graphicsStartupConfig.useAngle) app.commandLine.appendSwitch('use-angle', graphicsStartupConfig.useAngle);
 if (graphicsStartupConfig.disableHardwareAcceleration) app.disableHardwareAcceleration();
 
-const { BrowserWindow, ipcMain, Menu, safeStorage, globalShortcut, clipboard, Tray, nativeImage, dialog } = require('electron');
+const { BrowserWindow, ipcMain, Menu, safeStorage, globalShortcut, clipboard, Tray, nativeImage, dialog, session } = require('electron');
+const { createSecurityEventLogger, createTrustedAppUrl, installIpcSenderValidation, attachWebContentsSecurity, denySessionPermissions, applyCspToSession } = require('./electron-security');
+const trustedRendererUrl = createTrustedAppUrl({ appRoot: app.getAppPath(), devUrl: app.isPackaged ? null : 'http://localhost:5173' });
+const securityEventLogger = createSecurityEventLogger((event, details) => lifecycleLog.append(event, details));
+const securityEventFlushTimer = setInterval(() => securityEventLogger.flush(true), 60_000);
+securityEventFlushTimer.unref?.();
+const recordSecurityEvent = (event, details) => securityEventLogger.record(event, details);
+installIpcSenderValidation(ipcMain, { isTrustedUrl: trustedRendererUrl, recordDenied: recordSecurityEvent });
+app.on('web-contents-created', (_event, contents) => attachWebContentsSecurity(contents, { isTrustedUrl: trustedRendererUrl, recordDenied: recordSecurityEvent }));
+app.on('before-quit', () => { clearInterval(securityEventFlushTimer); securityEventLogger.flush(true); });
+denySessionPermissions(session.defaultSession, recordSecurityEvent);
+applyCspToSession(session.defaultSession, { dev: !app.isPackaged });
 ipcMain.handle('lifecycle:tail', () => lifecycleLog.tail(50));
 const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
 const { initializeDatabase, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getMcpClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, getMemoryEmbeddingVector, getMemory, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, listRecentImports, listClients, removeLegacyClient, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, addMemory, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
@@ -247,7 +258,7 @@ function createQuickContextWindow() {
   if (quickContextWindow && !quickContextWindow.isDestroyed()) { quickContextWindow.show(); quickContextWindow.focus(); return; }
   quickContextWindow = new BrowserWindow({ width: 470, height: 570, minWidth: 390, minHeight: 420, alwaysOnTop: true, skipTaskbar: true,
     title: 'Quick context', autoHideMenuBar: true,
-    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
   attachWindowLifecycle(quickContextWindow, 'quick-context');
   quickContextWindow.loadFile(path.join(__dirname, 'quick-context.html'));
   quickContextWindow.on('closed', () => { quickContextWindow = null; });
@@ -471,8 +482,9 @@ registerSecurityIpc(ipcMain, {
   exportEncryptedRecoveryFile,
   restoreEncryptedRecoveryFile,
   deleteOldBackups: deleteOldBackupFiles,
+  copyProviderKey: (provider) => memoryProxy.copySavedKey(provider, clipboard),
   logFailure: (details) => lifecycleLog.append('vault_operation_failed', details),
-  logEvent: (event) => lifecycleLog.append(event),
+  logEvent: (event) => event === 'vault_unlock_failed' ? recordSecurityEvent(event) : lifecycleLog.append(event),
   passwordLockout,
 });
 registerUnlockIpc(ipcMain, {
@@ -530,6 +542,14 @@ ipcMain.handle('chat:list', () => listChats());
 ipcMain.handle('chat:create', (_event, provider, model) => createChat(provider, model));
 ipcMain.handle('chat:update', (_event, id, patch) => updateChat(id, patch));
 ipcMain.handle('chat:delete', (_event, id) => deleteChat(id));
+ipcMain.handle('chat:preview-memory', async (_event, chatId, text) => {
+  const chat = listChats().find((item) => item.id === Number(chatId));
+  if (!chat) throw new Error('Chat not found.');
+  const profile = getChatGrant(chat.provider);
+  if (!profile || profile.status !== 'approved') return [];
+  const messages = [...chat.messages.filter((item) => item.role === 'user' || item.role === 'assistant').map(({ role, content }) => ({ role, content })), { role: 'user', content: String(text || '').slice(0, 20_000) }];
+  return memoryProxy.previewChatMemories(chat.provider, messages, profile);
+});
 ipcMain.handle('chat:save-memory', (_event, source, title, content) => {
   const memory = addMemory({ source, title, content }, { handAdded: true });
   for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:changed', { type: 'add', id: memory.id });
@@ -550,6 +570,7 @@ ipcMain.handle('chat:send', async (event, payload) => {
   try {
     const result = await memoryProxy.chatCompletion({ provider: chat.provider, model, messages, useMemory,
       profile, signal: controller.signal, suggestMemories, chatId: chat.id,
+      approvedMemories: Array.isArray(payload.approvedMemories) ? payload.approvedMemories.slice(0, 10) : [],
       saveBackSource: chat.memory_source || PROVIDER_SOURCES[chat.provider] || null,
       onChunk: (chunk) => { if (!event.sender.isDestroyed()) event.sender.send('chat:chunk', { requestId, chunk }); } });
     appendChatMessage({ chat_id: chatId, role: 'assistant', content: result.answer, model, memory_ids: result.memoryIds });
@@ -584,7 +605,8 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      webSecurity: true
     }
   });
   mainWindow = win;
@@ -680,6 +702,8 @@ app.whenReady().then(async () => {
     connectionActivity.add({ client: providerClient || labels[site] || 'One Brain', action, ok: Boolean(event.ok), reason: event.error === 'ONE_BRAIN_LOCKED' ? 'locked' : event.error === 'pending_approval' ? 'needs_approval' : event.error === 'unknown_token' ? 'not_paired' : event.error ? 'request_failed' : '' });
   };
   extensionApi = createExtApi({ userDataPath, authenticateClientToken, getClientTokenState, getClientProfile: getProxyClientProfile,
+    authFailureLog: () => recordSecurityEvent('auth_failed'),
+    rateLimitedLog: (event) => recordSecurityEvent('rate_limited', { client: event.client }),
     getMcpClientProfile: (client, identity) => {
       const profile = getMcpClientProfile(client, identity);
       if (profile.created) for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:client-pending', { client: profile.client, verified: true, reported_name: identity.reported_name });
@@ -698,6 +722,7 @@ app.whenReady().then(async () => {
   });
 
   memoryProxy = createMemoryProxy({ userDataPath, safeStorage, authenticateClientToken, extensionApi,
+    authFailureLog: () => recordSecurityEvent('auth_failed'),
     onActivity: () => autoLockMonitor?.touchActivity(), beginActivity: () => autoLockMonitor?.beginActivity(),
     getClientProfile: getProxyClientProfile, searchMemoriesForClient, getMemoryForClient, recordProxyEvent: recordDashboardEvent,
     addPendingMemory: async (item) => {
@@ -714,6 +739,7 @@ app.whenReady().then(async () => {
 
   startMcpServer(app.getPath('userData'), connectorAppPath(), {
     onSpawn: logChildProcessSpawn,
+    onAuthFailure: () => recordSecurityEvent('auth_failed'),
     onActivity: () => autoLockMonitor?.touchActivity(), beginActivity: () => autoLockMonitor?.beginActivity(),
     searchMemoriesForClient, getEmbeddingVector: getMemoryEmbeddingVector,
     embedText: (text) => embedder?.embed(text) || Promise.reject(new Error('Local embedder is unavailable.')),

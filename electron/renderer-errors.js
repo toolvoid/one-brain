@@ -17,6 +17,8 @@ function rendererErrorLocation(level, line, sourceId) {
 
 function rendererErrorMessage(message) {
   let value = String(message || 'Renderer error')
+    .replace(/\b(pair(?:ing)?[\s_-]*code)\b\s*[:=]\s*[^\s,;&]+/gi, '$1=[REDACTED]')
+    .replace(/\b(pair(?:ing)?[\s_-]*code)\b\s+[^\s,;&]+/gi, '$1 [REDACTED]')
     .replace(/\b(password|passphrase|token|key|api[_ -]?key|secret|private[_ -]?key)\b\s*[:=]\s*[^\s,;&]+/gi, '$1=[REDACTED]')
     .replace(/\b(password|passphrase|token|key|api[_ -]?key|secret|private[_ -]?key)\b\s+(?:is\s+)?[^\s,;&]+/gi, '$1 [REDACTED]')
     .replace(/\bBearer\s+[^\s,;&]+/gi, 'Bearer [REDACTED]')

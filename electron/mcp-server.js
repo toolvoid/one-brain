@@ -208,6 +208,7 @@ async function handleRequest(request, response, token, dependencies) {
   }
   const auth = authenticateRequest(request, token);
   if (!auth) {
+    try { dependencies.onAuthFailure?.(); } catch {}
     sendJson(response, 401, { error: 'A valid bearer token is required.' });
     return;
   }
