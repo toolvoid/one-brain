@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
+const lockController = require('./lock-controller');
 
 const PROVIDERS = ['openai', 'groq', 'deepseek', 'gemini', 'openrouter', 'claude'];
 const PROVIDER_URLS = {
@@ -113,7 +114,7 @@ function candidateSafe(item) {
 function createMemoryProxy(options) {
   const { userDataPath, safeStorage, authenticateClientToken, getClientProfile, searchMemoriesForClient,
     getMemoryForClient, recordProxyEvent, addPendingMemory, fetchImpl = globalThis.fetch,
-    providerUrls = PROVIDER_URLS, searchTimeoutMs = 800, titleTimeoutMs = 3000, listenPort = null, extensionApi = null, isLocked = () => false } = options;
+    providerUrls = PROVIDER_URLS, searchTimeoutMs = 800, titleTimeoutMs = 3000, listenPort = null, extensionApi = null } = options;
   const settingsPath = path.join(userDataPath, 'memory-proxy-settings.json');
   const keysPath = path.join(userDataPath, 'provider-keys.enc');
   const readSettings = () => ({ ...DEFAULT_SETTINGS, ...safeReadJson(settingsPath, {}) });
@@ -270,7 +271,7 @@ function createMemoryProxy(options) {
   }
 
   async function handle(req, res) {
-    if (isLocked()) return sendJson(res, 423, { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' });
+    if (lockController.isLocked()) return sendJson(res, 423, { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' });
     if (extensionApi && new URL(req.url, 'http://127.0.0.1').pathname.startsWith('/ext/')) {
       await extensionApi.handle(req, res);
       return;

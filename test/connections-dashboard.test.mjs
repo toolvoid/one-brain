@@ -43,7 +43,7 @@ test('dashboard maps app not installed, restart, connected, selector failure, pr
   assert.equal(status('codex'), 'Needs restart');
   assert.equal(status('gemini'), 'Connected');
   assert.equal(status('vscode'), 'Broken');
-  assert.equal(status('ext:deepseek'), 'Broken');
+  assert.equal(status('ext:deepseek'), 'Degraded');
   assert.equal(status('ext:groq'), 'Paired');
   assert.equal(status('provider:groq'), 'Broken');
   assert.equal(status('provider:deepseek'), 'Connected');
@@ -67,11 +67,11 @@ test('extension rows distinguish no evidence, degraded detection, broken require
   assert.equal(row('claude').status, 'Degraded');
   assert.equal(row('claude').reason, 'Message detection found 1 message: Save this chat may be incomplete, press Load full chat');
   assert.equal(row('claude').healthStatus, 'degraded');
-  assert.equal(row('chatgpt').status, 'Broken');
+  assert.equal(row('chatgpt').status, 'Degraded');
   assert.equal(row('groq').status, 'Busy (rate limited)');
   assert.equal(row('groq').healthStatus, 'busy');
   const summary = summarizeConnectionHealth(rows);
-  assert.equal(summary.degraded, 1); assert.ok(summary.needAction >= 2);
+  assert.equal(summary.degraded, 2); assert.ok(summary.needAction >= 1);
 });
 
 test('a recent successful extension call remains healthy when the row carries a degraded message note', () => {

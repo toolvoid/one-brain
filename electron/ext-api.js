@@ -6,6 +6,7 @@ const { createHash, randomInt } = require('node:crypto');
 const { rankExtensionResults } = require('./ext-search');
 const { prepareSearchMemories } = require('./ext-context');
 const contextBlocks = require('../extension/src/context-blocks');
+const lockController = require('./lock-controller');
 const smartSave = require('../extension/src/smart-save');
 const { splitChatMessages, contentHash, looksSecret } = require('./ext-chat');
 
@@ -53,7 +54,7 @@ function createExtApi(options) {
     embedText, appVersion = require('../package.json').version,
     authFailureLog = (entry) => console.info(JSON.stringify(entry)),
     rateLimitedLog = (entry) => console.info(JSON.stringify(entry)),
-    importText = async (...args) => (await import('../src/lib/importers.mjs')).parseImportText(...args), isLocked = () => false
+    importText = async (...args) => (await import('../src/lib/importers.mjs')).parseImportText(...args)
   } = options;
   const originsPath = path.join(userDataPath, 'extension-origins.json');
   const readOrigins = () => { try { return JSON.parse(fs.readFileSync(originsPath, 'utf8')); } catch { return {}; } };
@@ -211,7 +212,7 @@ function createExtApi(options) {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (!url.pathname.startsWith('/ext/')) return false;
     const origin = requestOrigin(req);
-    if (isLocked()) return sendJson(res, 423, { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' }, origin);
+    if (lockController.isLocked()) return sendJson(res, 423, { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' }, origin);
     if (!localHost(req.headers.host)) return sendJson(res, 403, { error: 'Only the 127.0.0.1 host is accepted.' });
     const origins = readOrigins();
     const allowedOrigin = Object.values(origins).some((entry) => entry.origin === origin);

@@ -9,6 +9,7 @@ const { INSIGHT_QUERIES } = require('./analytics-queries');
 const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
 const { JOIN_ALL_MIN } = require('../src/lib/link-constants.json');
 const { rankExtensionResults } = require('./ext-search');
+const lockController = require('./lock-controller');
 const MEMORY_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 
 let database;
@@ -72,6 +73,7 @@ function resetRetrievalCounts() {
 }
 
 function runAnalyticsSql(sql) {
+  lockController.assertUnlocked();
   if (!databasePath) return Promise.resolve({ error: 'Database is unavailable.' });
   return new Promise((resolve) => {
     const worker = new Worker(path.join(__dirname, 'sql-worker.js'), {
@@ -422,6 +424,7 @@ function getEvaluationRunResults(runId) {
 }
 
 function ensureWritable() {
+  lockController.assertUnlocked();
   if (!databaseWritable) throw new Error(databaseStatus.message || 'Database is read-only; memory writes are disabled.');
 }
 
@@ -688,6 +691,7 @@ function loadCaches(db) {
 }
 
 function getDatabase() {
+  lockController.assertUnlocked();
   if (!database && !databaseWritable) throw new Error(databaseStatus.message || 'Database is unavailable.');
   if (database && !databaseWritable) {
     if (!cachesLoaded) loadCaches(database);
@@ -1016,7 +1020,29 @@ function closeDatabaseForTest() {
   embeddingQueue = [];
   embeddingQueueRunning = false;
   embeddingJobs = new Map();
+  embeddingProvider = null;
+  embeddingReady = false;
   cancelledEmbeddingIds.clear();
+}
+
+function lockDatabase() {
+  if (database?.open) { try { database.close(); } catch {} }
+  database = null;
+  databaseSchemaReady = false;
+  databaseWritable = false;
+  databaseKey?.fill(0);
+  databaseKey = null;
+  cachesLoaded = false;
+  vectorCache = new Map();
+  memoryCache = new Map();
+  embeddingQueue = [];
+  embeddingQueueRunning = false;
+  for (const job of embeddingJobs.values()) { try { job.controller?.abort(); } catch {} try { job.resolve?.(false); } catch {} }
+  embeddingJobs = new Map();
+  embeddingProvider = null;
+  embeddingReady = false;
+  cancelledEmbeddingIds.clear();
+  databaseStatus = { state: 'locked', writable: false, message: 'One Brain is locked. Unlock it to access your data.' };
 }
 
 function normalizeTitle(title) {
@@ -1097,11 +1123,13 @@ function createSemanticLinks(memoryId, vector) {
 }
 
 async function embedMemory(memoryId) {
+  lockController.assertUnlocked();
   const db = getDatabase();
   if (cancelledEmbeddingIds.has(Number(memoryId))) return false;
   const memory = db.prepare('SELECT id, source, title, content, private, no_suggest, import_id FROM memories WHERE id = ?').get(memoryId);
   if (!memory || !embeddingProvider) return false;
   const vector = await embeddingProvider(memory.content);
+  lockController.assertUnlocked();
   if (cancelledEmbeddingIds.has(Number(memoryId)) || !db.prepare('SELECT 1 FROM memories WHERE id = ?').get(memoryId)) return false;
   if (!(vector instanceof Float32Array) || vector.length === 0) throw new Error('The local embedding model returned an invalid vector.');
   db.prepare('INSERT INTO embeddings (memory_id, model, dim, vector) VALUES (?, ?, ?, ?) ON CONFLICT(memory_id) DO UPDATE SET model = excluded.model, dim = excluded.dim, vector = excluded.vector')
@@ -1140,7 +1168,7 @@ function cancelEmbeddingJobs(memoryIds) {
 }
 
 async function drainEmbeddingQueue() {
-  if (embeddingQueueRunning || !embeddingProvider) return;
+  if (lockController.isLocked() || embeddingQueueRunning || !embeddingProvider) return;
   embeddingQueueRunning = true;
   while (embeddingQueue.length) {
     const { id, task } = embeddingQueue.shift();
@@ -1156,6 +1184,7 @@ async function drainEmbeddingQueue() {
 }
 
 function configureEmbeddingProvider(provider, model, { onProgress = () => {}, onLinksChanged = () => {}, onError = () => {} } = {}) {
+  lockController.assertUnlocked();
   embeddingProvider = provider;
   embeddingModel = model;
   embeddingReady = true;
@@ -1360,7 +1389,7 @@ async function searchMemoriesForClient(query, source, limit, profile) {
   return { memories: visibleCandidates.map((memory) => ({ ...memory, ...detailsById.get(Number(memory.id)), vector: vectorCache.get(Number(memory.id))?.vector || null })), denied: false };
 }
 
-function getMemoryEmbeddingVector(memoryId) { return vectorCache.get(Number(memoryId))?.vector || null; }
+function getMemoryEmbeddingVector(memoryId) { lockController.assertUnlocked(); return vectorCache.get(Number(memoryId))?.vector || null; }
 
 function setMemoryNoSuggest(memoryId, noSuggest) {
   ensureWritable();
@@ -1563,9 +1592,11 @@ function searchFts(query, source, limit, offset) {
 }
 
 async function semanticSearch(query, source, limit = 50) {
+  lockController.assertUnlocked();
   const safeLimit = Math.max(1, Math.min(500, Math.floor(Number(limit) || 50)));
   if (!embeddingReady || !embeddingProvider || !String(query || '').trim()) return [];
   const queryVector = await embeddingProvider(String(query));
+  lockController.assertUnlocked();
   const results = [];
   for (const [id, entry] of vectorCache) {
     if (entry.model !== embeddingModel) continue;
@@ -1845,3 +1876,4 @@ function countBySource() {
 }
 
 module.exports = { initializeDatabase, closeDatabaseForTest, getDatabaseStatus, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, removeLegacyClient, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, searchMemoriesForClient, getMemoryEmbeddingVector, getMemoryForClient, countBySourceForClient, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, SUGGEST_MIN, AUTO_MIN, JOIN_ALL_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
+module.exports.lockDatabase = lockDatabase;

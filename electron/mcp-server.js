@@ -10,6 +10,7 @@ const { addMemory, getMcpClientProfile, searchMemoriesForClient, getMemoryForCli
 const { INSTRUCTIONS } = require('./connectors');
 const { createMcpToolHandlers, mcpActivityMetadata } = require('./mcp-tools');
 const { listMemories } = require('./db');
+const lockController = require('./lock-controller');
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -32,6 +33,7 @@ function createMcpServer(identity, dependencies = {}) {
     notifyRetrieved: (ids) => notifyRenderer('brain:retrieved', ids),
     notifyAdded: (id) => notifyRenderer('brain:changed', { type: 'add', id }) });
   const registerTrackedTool = (name, definition, handler) => server.registerTool(name, definition, async (args) => {
+    lockController.assertUnlocked();
     const startedAt = Date.now();
     const client = identity.eventClient;
     const eventIdentity = { verified: identity.verified, reported_name: identity.reportedName };
@@ -190,7 +192,7 @@ function sameSessionIdentity(auth, session) {
 }
 
 async function handleRequest(request, response, token, dependencies) {
-  if (dependencies.isLocked?.()) { sendJson(response, 423, { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' }); return; }
+  if (lockController.isLocked()) { sendJson(response, 423, { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' }); return; }
   if (!isLocalHost(request.headers.host)) {
     sendJson(response, 403, { error: 'Host must be localhost.' });
     return;

@@ -38,6 +38,8 @@ const { createExtApi } = require('./ext-api');
 const { prepareQuickContext, buildQuickContextBlock } = require('./quick-context');
 const { createConnectionActivity } = require('./connection-activity');
 const { initialHealth, reduceHealth, getHealthStatus } = require('./connection-health');
+const lockController = require('./lock-controller');
+const { lockDatabase } = require('./db');
 
 let mcpConnection;
 let memoryProxy;
@@ -516,6 +518,7 @@ app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return;
   createQuickContextTray();
   const databaseStatus = await initializeDatabase(app.getPath('userData'), safeStorage);
+  lockController.configure({ verifyPassword: async () => false, onLock: lockDatabase });
   if (databaseStatus.message) console.error(databaseStatus.message);
 
   startEmbedder();
