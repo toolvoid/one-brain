@@ -21,6 +21,7 @@ test('lifecycle log stores only whitelisted metadata and returns the last 50 san
   log.append('app_start', { pageText: 'must never be stored', token: 'synthetic-secret' });
   log.append('child_process_spawn', { command: 'C:\\Program Files\\Electron\\electron.exe', args: ['synthetic-secret'] });
   log.append('render_process_gone', { window: 'main', reason: 'crashed', exitCode: 139, memoryText: 'must never be stored' });
+  log.append('window_hidden', { window: 'main', pageText: 'must never be stored', token: 'synthetic-secret' });
   for (let index = 0; index < 55; index++) log.append('window_unresponsive', { window: 'main', pageText: 'omit' });
 
   const lines = log.tail(50);
@@ -41,6 +42,15 @@ test('lifecycle log rotates while total active and archived bytes stay within th
   assert.ok(fs.existsSync(log.rotatedPath), 'rotation should preserve the previous segment');
   assert.ok(activeBytes + rotatedBytes <= 1024);
   assert.ok(log.tail(50).length <= 50);
+});
+
+test('window visibility lifecycle events preserve event and window name only', (t) => {
+  const directory = temporaryDirectory(t);
+  const log = createLifecycleLog(directory);
+  log.append('window_hidden', { window: 'main', pageText: 'private page text', token: 'synthetic-secret' });
+  const record = JSON.parse(log.tail(1)[0]);
+  assert.deepEqual(record, { timestamp: record.timestamp, event: 'window_hidden', window: 'main' });
+  assert.doesNotMatch(fs.readFileSync(log.filePath, 'utf8'), /private page text|synthetic-secret/);
 });
 
 test('lifecycle log trims oversized files already present at startup', (t) => {

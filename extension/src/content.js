@@ -213,7 +213,7 @@
   let manualButton = null;
   const layoutFallback = layoutFallbackModule.createLayoutFallback(() => {
       if (stopped) return;
-      toast("One Brain can't read this site's page layout (site changed)", true);
+      toast("One Brain couldn't detect this site's chat composer or send button. Saving chats may still work; context insertion may be unavailable.", true);
       manualButton = createButton('Manual context', () => { void openManualContext(); }, 'one-brain-manual-context');
       document.body.append(manualButton);
   });
@@ -428,8 +428,9 @@
     const progress = panel.querySelector('[data-load-progress]');
     const initial = adapter.getMessages();
     const scroller = adapter.findScrollContainer?.(initial) || null;
-    if (!scroller) { progress.textContent = `Loaded ${initial.length} messages. No scrollable message container found.`; status.textContent = ''; return; }
-    const result = await chatLoader.loadFullChat({ scroller, collect: readChatMessages, cancelled: () => cancelState.cancelled, wait: (ms) => new Promise((resolve) => scheduleTimeout(resolve, ms || 1)), progress: (count) => { progress.textContent = `${count} messages loaded`; } });
+    if (!scroller) { progress.textContent = `${initial.length} messages found. No scrollable history area detected; scroll up manually and try again.`; status.textContent = ''; return; }
+    progress.textContent = 'Scrolling through chat history…';
+    const result = await chatLoader.loadFullChat({ scroller, collect: readChatMessages, cancelled: () => cancelState.cancelled, wait: (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(1, ms))), progress: (count) => { progress.textContent = `${count} messages loaded`; } });
     loadedChatMessages = result.messages.map(({ element, ...message }) => message);
     progress.textContent = result.cancelled ? `${result.messages.length} messages loaded · cancelled` : `${result.messages.length} messages loaded`;
     status.textContent = '';
@@ -487,7 +488,7 @@
     panel.querySelector('[data-split]').addEventListener('change', (event) => { panel.querySelector('[data-one-warning]').hidden = event.target.value !== 'one'; });
     const loadStatus = panel.querySelector('[data-load-progress]');
     const cancelState = { cancelled: false };
-    panel.querySelector('[data-load]').addEventListener('click', () => { cancelState.cancelled = false; void loadFullChat(panel, loadStatus, cancelState).then(renderMessageSelectors); });
+    panel.querySelector('[data-load]').addEventListener('click', () => { cancelState.cancelled = false; void loadFullChat(panel, loadStatus, cancelState).then(renderMessageSelectors).catch(() => { if (panel.isConnected) loadStatus.textContent = 'Could not load chat history. Scroll up manually and try again.'; }); });
     panel.querySelector('[data-cancel-load]').addEventListener('click', () => { cancelState.cancelled = true; });
     panel.querySelector('[data-cancel]').addEventListener('click', () => { cancelState.cancelled = true; panel.remove(); if (modal === panel) modal = null; });
     const preview = panel.querySelector('[data-preview]');

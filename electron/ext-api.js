@@ -53,7 +53,7 @@ function createExtApi(options) {
     embedText, appVersion = require('../package.json').version,
     authFailureLog = (entry) => console.info(JSON.stringify(entry)),
     rateLimitedLog = (entry) => console.info(JSON.stringify(entry)),
-    importText = async (...args) => (await import('../src/lib/importers.mjs')).parseImportText(...args)
+    importText = async (...args) => (await import('../src/lib/importers.mjs')).parseImportText(...args), isLocked = () => false
   } = options;
   const originsPath = path.join(userDataPath, 'extension-origins.json');
   const readOrigins = () => { try { return JSON.parse(fs.readFileSync(originsPath, 'utf8')); } catch { return {}; } };
@@ -211,6 +211,7 @@ function createExtApi(options) {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (!url.pathname.startsWith('/ext/')) return false;
     const origin = requestOrigin(req);
+    if (isLocked()) return sendJson(res, 423, { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' }, origin);
     if (!localHost(req.headers.host)) return sendJson(res, 403, { error: 'Only the 127.0.0.1 host is accepted.' });
     const origins = readOrigins();
     const allowedOrigin = Object.values(origins).some((entry) => entry.origin === origin);
@@ -274,7 +275,6 @@ function createExtApi(options) {
       delete health.authFailure; delete health.authFailureAt;
       latest[site] = { ...entry, health };
       saveOrigins(latest);
-      log(identity.client, { ok: true, latency: now() - started });
       const approval = profile?.status === 'approved' ? 'approved' : profile?.status === 'blocked' ? 'blocked' : 'pending';
       res.setHeader('X-One-Brain-API-Version', API_VERSION);
       res.setHeader('X-One-Brain-Build-Id', health.buildId);

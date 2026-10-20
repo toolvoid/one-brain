@@ -37,6 +37,12 @@ Load `extension/dist/chrome` as an unpacked extension in Chrome or `extension/di
 
 The dev script starts Vite and Electron. The Electron main process opens the SQLite database and starts the local MCP server.
 
+## Security
+
+The SQLite database uses SQLCipher encryption. Its key is protected with Electron `safeStorage` on supported backends; the app disables database writes when storage is unavailable or reports the `basic_text` backend. Browser extension and MCP tokens are created with owner-only file permissions where the operating system supports them. Local HTTP services bind to loopback and require authentication.
+
+The security vault module provides password-derived scrypt key wrapping and AES-256-GCM authenticated encryption for vault records. This primitive is not yet wired into first-run setup, database re-keying, recovery export, or the application's lock/unlock lifecycle. Until that flow is integrated, protect the device with full-disk encryption (LUKS on Linux) and use an OS account password; copied user-data files may still be exposed on systems without strong `safeStorage`.
+
 ## Project structure
 
 ```text

@@ -9,6 +9,7 @@ import { fitCameraToPoints, straightLinkPoints } from '../lib/graph-math.mjs';
 import { linksJustEnabled } from '../lib/graph-links.mjs';
 import { clearSavedView, saveViewBeforeFocus } from '../lib/graph-focus.mjs';
 import { safeCreateWebGLRenderer } from '../lib/graph-renderer.mjs';
+import { graphFrameIntervalMs, shouldKeepGraphAnimating, shouldRenderGraphLabels, shouldUpdateLineBuffers, shouldUpdateNodeBuffers } from '../lib/graph-animation.mjs';
 import { isSoftwareRenderer, PERFORMANCE_MODE_EVENT, PERFORMANCE_NODE_LIMIT, readManualPerformanceMode, selectPerformanceNodes } from '../lib/graph-performance.mjs';
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
@@ -148,6 +149,32 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     controls.dampingFactor = 0.06;
     controls.minDistance = 20;
     controls.maxDistance = 2000;
+    let raf = 0;
+    let rafPending = false;
+    let frameTimer = 0;
+    let animateFrame = null;
+    function scheduleFrame(delay = 0) {
+      if (rafPending) return;
+      if (frameTimer) {
+        if (delay > 0) return;
+        clearTimeout(frameTimer);
+        frameTimer = 0;
+      }
+      if (!animateFrame) return;
+      if (delay > 0) {
+        frameTimer = setTimeout(() => {
+          frameTimer = 0;
+          if (!rafPending) { rafPending = true; raf = requestAnimationFrame(animateFrame); }
+        }, delay);
+      } else {
+        rafPending = true;
+        raf = requestAnimationFrame(animateFrame);
+      }
+    }
+    controls.addEventListener('start', () => scheduleFrame());
+    controls.addEventListener('change', () => scheduleFrame());
+    const onVisibilityChange = () => { if (document.visibilityState !== 'hidden') scheduleFrame(); };
+    document.addEventListener('visibilitychange', onVisibilityChange);
     const composer = new EffectComposer(renderer);
     composer.addPass(new RenderPass(scene, camera));
     const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.18, 0.25, 0.86);
@@ -189,6 +216,8 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     const tooltip = document.createElement('div');
     tooltip.className = 'brain-memory-tooltip';
     tooltip.hidden = true;
+    tooltip.style.left = '0px';
+    tooltip.style.top = '0px';
     host.appendChild(tooltip);
     const performanceCount = document.createElement('small');
     performanceCount.className = 'brain-performance-count';
@@ -222,6 +251,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     let hoveredMemoryId = null;
     let hoveredMemorySource = null;
     let hoveredLinkIndex = -1;
+    let lineVisualDirty = true;
     let orbitPointerStart = null;
 
     function fitView(smooth = true, explicit = false) {
@@ -242,6 +272,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
         cameraFrom: camera.position.clone(), targetFrom: controls.target.clone(),
         cameraTo, targetTo: center, startedAt: performance.now(), duration: 700
       };
+      scheduleFrame();
     }
 
     const fitButton = document.createElement('button');
@@ -315,6 +346,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
         });
         sequence += 1;
       }
+      scheduleFrame();
     };
     const legend = document.createElement('details');
     legend.className = 'brain-legend';
@@ -463,6 +495,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
       lineGeometry.computeBoundingSphere();
       points.geometry = pointGeometry;
       lines.geometry = lineGeometry;
+      lineVisualDirty = true;
       oldMem.dispose(); oldLine.dispose();
 
       if (animateChanges) {
@@ -489,7 +522,9 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
       previousMemoryIds = new Set(displayMemories.map((m) => String(m.id)));
       previousMemoryLayout = memoryLayout;
       previousLinkIds = new Set(knownLinks.map((link) => String(link.id ?? `${link.a_id}-${link.b_id}`)));
+      for (const key of edgeDraws.keys()) if (!edgeIndex.has(key)) edgeDraws.delete(key);
       if (shouldFit && !manualOrbitPaused) fitView(true);
+      scheduleFrame();
     }
 
     function retrieve(memoryId) {
@@ -515,6 +550,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
         startedAt: performance.now(), duration: 700
       };
       retrieve(memoryId);
+      scheduleFrame();
       return true;
     }
     function restore() {
@@ -526,6 +562,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
         startedAt: performance.now(), duration: 700
       };
       restoringView = true;
+      scheduleFrame();
       return true;
     }
     apiRef.current = { retrieve, focus, restore };
@@ -547,6 +584,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
       composer.setPixelRatio(renderer.getPixelRatio());
       resize(true);
       if (lastSnapshot) rebuild(lastSnapshot.nextMemories, lastSnapshot.nextLinks, lastSnapshot.nextCounts, false, lastSnapshot.knownLinks);
+      scheduleFrame();
     }
     window.addEventListener(PERFORMANCE_MODE_EVENT, onPerformanceModeChange);
 
@@ -577,17 +615,24 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
       const edge = edgeMeta[segmentToEdge[Math.floor((edgeHit.index || 0) / 2)]];
       if (!currentLinks.some((link) => String(link.id ?? `${link.a_id}-${link.b_id}`) === edge.key.slice(5))) return;
       events.push({ kind: 'link', aId: edge.linkMemoryIds[0], bId: edge.linkMemoryIds[1], linkId: edge.key.slice(5), linkKind: edge.linkKind, startedAt: performance.now() });
+      scheduleFrame();
       onMemoryClickRef.current?.(edge.linkMemoryIds[1]);
     }
     function onPointerMove(event) {
       const now = performance.now();
+      const rect = renderer.domElement.getBoundingClientRect();
+      if (!tooltip.hidden) {
+        tooltip.style.transform = `translate3d(${event.clientX - rect.left + 12}px, ${event.clientY - rect.top + 12}px, 0)`;
+      }
       if (now - lastHoverCheckAt < 100) return;
       lastHoverCheckAt = now;
-      const rect = renderer.domElement.getBoundingClientRect();
       pointer.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
       raycaster.setFromCamera(pointer, camera);
       const hits = raycaster.intersectObject(points, false);
       const hit = hits.find((item) => nodeMeta[item.index]?.kind === 'memory');
+      const previousHoveredMemoryId = hoveredMemoryId;
+      const previousHoveredMemorySource = hoveredMemorySource;
+      const previousHoveredLinkIndex = hoveredLinkIndex;
       hoveredMemoryId = hit ? String(nodeMeta[hit.index].id) : null;
       hoveredMemorySource = hit ? nodeMeta[hit.index].source : null;
       hoveredLinkIndex = -1;
@@ -601,10 +646,15 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
       } else if (hoveredLinkIndex >= 0) {
         const edge = edgeMeta[hoveredLinkIndex];
         tooltip.textContent = `${edge.linkKind || 'Memory'} link${edge.linkScore !== null && edge.linkScore !== undefined && Number.isFinite(Number(edge.linkScore)) ? ` · score ${Number(edge.linkScore).toFixed(2)}` : ''}`;
-      } else { tooltip.hidden = true; return; }
+      } else {
+        tooltip.hidden = true;
+        if (previousHoveredMemoryId !== null || previousHoveredMemorySource !== null || previousHoveredLinkIndex >= 0) lineVisualDirty = true;
+        scheduleFrame(); return;
+      }
       tooltip.hidden = false;
-      tooltip.style.left = `${event.clientX - rect.left + 12}px`;
-      tooltip.style.top = `${event.clientY - rect.top + 12}px`;
+      tooltip.style.transform = `translate3d(${event.clientX - rect.left + 12}px, ${event.clientY - rect.top + 12}px, 0)`;
+      if (previousHoveredMemoryId !== hoveredMemoryId || previousHoveredMemorySource !== hoveredMemorySource || previousHoveredLinkIndex !== hoveredLinkIndex) lineVisualDirty = true;
+      scheduleFrame();
     }
     renderer.domElement.addEventListener('pointermove', onPointerMove);
     renderer.domElement.addEventListener('click', onPointerClick);
@@ -621,7 +671,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     labels.domElement.addEventListener('pointermove', onOrbitPointerMove);
     labels.domElement.addEventListener('pointerup', onOrbitPointerUp);
     labels.domElement.addEventListener('pointercancel', onOrbitPointerUp);
-    const onPointerLeave = () => { tooltip.hidden = true; hoveredMemoryId = null; hoveredMemorySource = null; hoveredLinkIndex = -1; };
+    const onPointerLeave = () => { tooltip.hidden = true; hoveredMemoryId = null; hoveredMemorySource = null; hoveredLinkIndex = -1; lineVisualDirty = true; scheduleFrame(); };
     renderer.domElement.addEventListener('pointerleave', onPointerLeave);
 
     let previousWidth = 0;
@@ -644,12 +694,12 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
       bloomPass.setSize(Math.max(1, width * (performanceMode ? 0.5 : 1)), Math.max(1, height * (performanceMode ? 0.5 : 1)));
       pointMat.uniforms.pixelRatio.value = renderer.getPixelRatio();
       if (!manualOrbitPaused && initialized) fitView(true);
+      scheduleFrame();
     }
     const observer = new ResizeObserver(() => resize());
     observer.observe(host); resize(); fitView(false);
     host.__brainGraphResize = resize;
 
-    let raf = 0;
     const whiteColor = new THREE.Color('#ffffff');
     const scratchColor = new THREE.Color();
     const packetPosition = new THREE.Vector3();
@@ -697,144 +747,174 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
         }
       }
     }
-    let lastFrameAt = 0;
+    let lastFrameAt = -Infinity;
     let lastLabelRenderAt = 0;
     function animate(frameTime) {
-      raf = requestAnimationFrame(animate);
+      rafPending = false;
+      raf = 0;
+      if (document.visibilityState === 'hidden') return;
       const now = Number.isFinite(frameTime) ? frameTime : performance.now();
-      if (performanceMode && now - lastFrameAt < 1000 / 30) return;
+      const focusWasMoving = Boolean(focusMove);
+      const controlsMoving = focusWasMoving ? false : Boolean(controls.update());
+      const cameraMoving = controlsMoving || focusWasMoving;
+      const frameInterval = graphFrameIntervalMs(performanceMode, cameraMoving);
+      const sinceLastFrame = now - lastFrameAt;
+      if (sinceLastFrame < frameInterval) {
+        scheduleFrame(frameInterval - sinceLastFrame);
+        return;
+      }
       lastFrameAt = now;
       const attr = pointGeometry.attributes;
       const pos = attr.position.array;
       const scale = attr.nodeScale.array;
       const glow = attr.nodeGlow.array;
       const packetAlpha = attr.packetAlpha.array;
-      scale.fill(1); glow.fill(0); packetAlpha.fill(0);
-      for (let i = 0; i < nodeMeta.length; i++) nodeMeta[i].color.toArray(attr.baseColor.array, i * 3);
-      for (let eventIndex = 0; eventIndex < events.length; eventIndex++) {
-        const event = events[eventIndex];
-        const elapsed = (now - event.startedAt) / 1000;
-        const duration = event.kind === 'retrieve' ? 2 : event.kind === 'add' ? 1.7 : 1.6;
-        if (elapsed > duration) continue;
-        const strength = Math.max(0, 1 - elapsed / duration);
-        if (event.kind === 'link') {
-          animateMemoryEvent(event, event.aId, elapsed, strength, now, attr, pos, scale, glow, packetAlpha);
-          animateMemoryEvent(event, event.bId, elapsed, strength, now, attr, pos, scale, glow, packetAlpha);
-        } else animateMemoryEvent(event, event.memoryId, elapsed, strength, now, attr, pos, scale, glow, packetAlpha);
-        if (event.kind === 'retrieve') for (let linkedOffset = 0; linkedOffset < event.linkedIds.length; linkedOffset++) {
-          const id = event.linkedIds[linkedOffset];
-          const idx = memorySlot.get(id);
-          if (idx === undefined) continue;
-          glow[idx] = Math.max(glow[idx], 1.25 * strength);
-          scale[idx] = Math.max(scale[idx], 1 + 0.15 * strength);
-          scratchColor.copy(whiteColor).lerp(nodeMeta[idx].color, 1 - strength * 0.8).toArray(attr.baseColor.array, idx * 3);
-        }
-      }
-      let eventWrite = 0;
-      for (let eventIndex = 0; eventIndex < events.length; eventIndex++) {
-        const event = events[eventIndex];
-        if ((now - event.startedAt) < (event.kind === 'retrieve' ? 2000 : 1800)) events[eventWrite++] = event;
-      }
-      events.length = eventWrite;
-      if (hubFlash.until < now) hubFlash.strength *= 0.93;
-      scratchColor.copy(whiteColor);
-      if (hubFlash.strength > 0.01) scratchColor.lerp(hubFlash.color, Math.min(1, hubFlash.strength));
-      scratchColor.toArray(attr.baseColor.array, 0);
-      glow[0] = hubFlash.strength * 1.2;
-      attr.baseColor.needsUpdate = true;
-      const linePositions = lineGeometry.attributes.position.array;
-      for (let edgeNumber = 0; edgeNumber < edgeMeta.length; edgeNumber++) {
-        const edge = edgeMeta[edgeNumber];
-        const draw = edgeDraws.get(edge.key);
-        if (!draw) continue;
-        const segment = edge.segmentStart;
-        const elapsed = now - draw.startedAt;
-        const progress = edge.memoryLink
-          ? Math.min(1, Math.max(0, elapsed / Math.max(1, draw.duration))) ** 2 * (3 - 2 * Math.min(1, Math.max(0, elapsed / Math.max(1, draw.duration))))
-          : Math.max(0, Math.min(1, elapsed / draw.duration));
-        const start = draw.start, end = draw.end;
-        const offset = segment * 6;
-        linePositions[offset] = start.x;
-        linePositions[offset + 1] = start.y;
-        linePositions[offset + 2] = start.z;
-        linePositions[offset + 3] = start.x + (end.x - start.x) * progress;
-        linePositions[offset + 4] = start.y + (end.y - start.y) * progress;
-        linePositions[offset + 5] = start.z + (end.z - start.z) * progress;
-      }
-      const lineGlow = lineGeometry.attributes.lineGlow.array;
-      const lineColors = lineGeometry.attributes.baseColor.array;
-      const lineAlpha = lineGeometry.attributes.baseAlpha.array;
-      lineGlow.fill(0);
-      for (let edgeNumber = 0; edgeNumber < edgeMeta.length; edgeNumber++) {
-        const edge = edgeMeta[edgeNumber];
-        for (let localSegment = 0; localSegment < edge.segmentCount; localSegment++) {
-          const segment = edge.segmentStart + localSegment;
-          edge.color.toArray(lineColors, segment * 6);
-          edge.color.toArray(lineColors, segment * 6 + 3);
-          let alpha = edge.alpha;
-          let drawDone = false;
-          const activeDraw = edgeDraws.get(edge.key);
-          if (activeDraw && edge.memoryLink) {
-            const elapsed = now - activeDraw.startedAt;
-            const rawProgress = Math.min(1, Math.max(0, elapsed / Math.max(1, activeDraw.duration)));
-            if (elapsed < 0) alpha = 0;
-            else if (rawProgress < 1) alpha = 0.48;
-            else {
-              const settle = Math.min(1, Math.max(0, (elapsed - activeDraw.duration) / Math.max(1, activeDraw.settleDuration)));
-              const easedSettle = settle * settle * (3 - 2 * settle);
-              alpha = 0.48 + (edge.alpha - 0.48) * easedSettle;
-              drawDone = settle >= 1;
-            }
-          } else if (activeDraw) alpha = now < activeDraw.startedAt ? 0 : now < activeDraw.startedAt + activeDraw.duration ? 0.65 : edge.alpha;
-          if (hoveredMemoryId !== null && !(activeDraw && alpha === 0)) {
-            const ownMemoryEdge = edge.key === `memory:${hoveredMemoryId}` || edge.key === `anchor:${hoveredMemorySource}`;
-            const ownLinkEdge = edge.memoryLink && edge.linkMemoryIds.includes(hoveredMemoryId);
-            alpha = ownMemoryEdge ? 0.8 : ownLinkEdge ? 0.6 : edge.alpha * 0.4;
-          } else if (hoveredLinkIndex >= 0 && !(activeDraw && alpha === 0)) alpha = edgeNumber === hoveredLinkIndex ? 0.6 : edge.alpha * 0.4;
-          if (performanceMode) alpha *= 0.55;
-          lineAlpha[2 * segment] = lineAlpha[2 * segment + 1] = alpha;
-          if (drawDone) edgeDraws.delete(edge.key);
-        }
-      }
-      for (let eventIndex = 0; eventIndex < events.length; eventIndex++) {
-        const event = events[eventIndex];
-        const elapsed = (now - event.startedAt) / 1000;
-        const strength = Math.max(0, 1 - elapsed / (event.kind === 'retrieve' ? 2 : 1.5));
-        const edgeStrength = performanceMode ? 0.55 : 1;
-        let edgeNumber = edgeIndex.get(`memory:${event.kind === 'link' ? event.aId : event.memoryId}`);
-        if (edgeNumber !== undefined) brightenEdge(edgeMeta[edgeNumber], 0.35 * strength * edgeStrength, null, lineGlow, lineColors);
-        if (event.kind === 'link') {
-          edgeNumber = edgeIndex.get(`memory:${event.bId}`);
-          if (edgeNumber !== undefined) brightenEdge(edgeMeta[edgeNumber], 0.35 * strength * edgeStrength, null, lineGlow, lineColors);
-        }
-        edgeNumber = edgeIndex.get(`anchor:${event.source}`);
-        if (edgeNumber !== undefined) brightenEdge(edgeMeta[edgeNumber], 0.4 * strength * edgeStrength, null, lineGlow, lineColors);
-        if (event.kind === 'link') {
-          edgeNumber = edgeIndex.get(`link:${event.linkId}`);
-          if (edgeNumber !== undefined) brightenEdge(edgeMeta[edgeNumber], 0.35 * strength * edgeStrength, null, lineGlow, lineColors);
-        }
-        if (event.kind === 'retrieve') for (let linkedOffset = 0; linkedOffset < event.linkedIds.length; linkedOffset++) {
-          const id = event.linkedIds[linkedOffset];
-          edgeNumber = edgeIndex.get(`memory:${id}`);
-          if (edgeNumber !== undefined) {
-            scratchColor.copy(whiteColor).lerp(edgeMeta[edgeNumber].color, 1 - strength);
-            brightenEdge(edgeMeta[edgeNumber], 0.4 * strength * edgeStrength, scratchColor, lineGlow, lineColors);
-          }
-          const linkedIndex = memorySlot.get(id);
-          const anchorEdge = linkedIndex === undefined ? undefined : edgeIndex.get(`anchor:${nodeMeta[linkedIndex].source}`);
-          if (anchorEdge !== undefined) brightenEdge(edgeMeta[anchorEdge], 0.4 * strength * edgeStrength, null, lineGlow, lineColors);
-          for (let linkIndex = 0; linkIndex < currentLinks.length; linkIndex++) {
-            const link = currentLinks[linkIndex];
-            const a = String(link.a_id), b = String(link.b_id);
-            if ((a === event.memoryId && b === id) || (b === event.memoryId && a === id)) {
-              const linkEdge = edgeIndex.get(`link:${String(link.id ?? `${a}-${b}`)}`);
-              if (linkEdge !== undefined) brightenEdge(edgeMeta[linkEdge], 0.5 * strength * edgeStrength, whiteColor, lineGlow, lineColors);
-            }
+      const hadActiveEvents = events.length > 0;
+      const updateNodeBuffers = shouldUpdateNodeBuffers(events.length, hubFlash.until, hubFlash.strength, now);
+      if (updateNodeBuffers) {
+        scale.fill(1); glow.fill(0); packetAlpha.fill(0);
+        for (let i = 0; i < nodeMeta.length; i++) nodeMeta[i].color.toArray(attr.baseColor.array, i * 3);
+        for (let eventIndex = 0; eventIndex < events.length; eventIndex++) {
+          const event = events[eventIndex];
+          const elapsed = (now - event.startedAt) / 1000;
+          const duration = event.kind === 'retrieve' ? 2 : event.kind === 'add' ? 1.7 : 1.6;
+          if (elapsed > duration) continue;
+          const strength = Math.max(0, 1 - elapsed / duration);
+          if (event.kind === 'link') {
+            animateMemoryEvent(event, event.aId, elapsed, strength, now, attr, pos, scale, glow, packetAlpha);
+            animateMemoryEvent(event, event.bId, elapsed, strength, now, attr, pos, scale, glow, packetAlpha);
+          } else animateMemoryEvent(event, event.memoryId, elapsed, strength, now, attr, pos, scale, glow, packetAlpha);
+          if (event.kind === 'retrieve') for (let linkedOffset = 0; linkedOffset < event.linkedIds.length; linkedOffset++) {
+            const id = event.linkedIds[linkedOffset];
+            const idx = memorySlot.get(id);
+            if (idx === undefined) continue;
+            glow[idx] = Math.max(glow[idx], 1.25 * strength);
+            scale[idx] = Math.max(scale[idx], 1 + 0.15 * strength);
+            scratchColor.copy(whiteColor).lerp(nodeMeta[idx].color, 1 - strength * 0.8).toArray(attr.baseColor.array, idx * 3);
           }
         }
+        let eventWrite = 0;
+        for (let eventIndex = 0; eventIndex < events.length; eventIndex++) {
+          const event = events[eventIndex];
+          if ((now - event.startedAt) < (event.kind === 'retrieve' ? 2000 : 1800)) events[eventWrite++] = event;
+        }
+        events.length = eventWrite;
+        if (hubFlash.until < now) hubFlash.strength *= 0.93;
+        if (hubFlash.strength <= 0.01) hubFlash.strength = 0;
+        scratchColor.copy(whiteColor);
+        if (hubFlash.strength > 0) scratchColor.lerp(hubFlash.color, Math.min(1, hubFlash.strength));
+        scratchColor.toArray(attr.baseColor.array, 0);
+        glow[0] = hubFlash.strength * 1.2;
+        attr.baseColor.needsUpdate = true;
+        attr.nodeScale.needsUpdate = true;
+        attr.nodeGlow.needsUpdate = true;
+        attr.packetAlpha.needsUpdate = true;
+        if (hadActiveEvents && !performanceMode) attr.position.needsUpdate = true;
       }
-      attr.position.needsUpdate = true; attr.nodeScale.needsUpdate = true; attr.nodeGlow.needsUpdate = true; attr.packetAlpha.needsUpdate = true;
-      lineGeometry.attributes.position.needsUpdate = true; lineGeometry.attributes.lineGlow.needsUpdate = true; lineGeometry.attributes.baseColor.needsUpdate = true; lineGeometry.attributes.baseAlpha.needsUpdate = true;
+
+      const hadEdgeDraws = edgeDraws.size > 0;
+      if (hadEdgeDraws) {
+        const linePositions = lineGeometry.attributes.position.array;
+        for (const [edgeKey, draw] of edgeDraws) {
+          const edgeNumber = edgeIndex.get(edgeKey);
+          const edge = edgeNumber === undefined ? null : edgeMeta[edgeNumber];
+          if (!edge) { edgeDraws.delete(edgeKey); continue; }
+          const elapsed = now - draw.startedAt;
+          const rawProgress = Math.min(1, Math.max(0, elapsed / Math.max(1, draw.duration)));
+          const progress = edge.memoryLink ? rawProgress * rawProgress * (3 - 2 * rawProgress) : rawProgress;
+          const start = draw.start, end = draw.end;
+          const offset = edge.segmentStart * 6;
+          linePositions[offset] = start.x;
+          linePositions[offset + 1] = start.y;
+          linePositions[offset + 2] = start.z;
+          linePositions[offset + 3] = start.x + (end.x - start.x) * progress;
+          linePositions[offset + 4] = start.y + (end.y - start.y) * progress;
+          linePositions[offset + 5] = start.z + (end.z - start.z) * progress;
+        }
+        lineGeometry.attributes.position.needsUpdate = true;
+      }
+
+      if (shouldUpdateLineBuffers(hadActiveEvents, hadEdgeDraws, lineVisualDirty)) {
+        const lineGlow = lineGeometry.attributes.lineGlow.array;
+        const lineColors = lineGeometry.attributes.baseColor.array;
+        const lineAlpha = lineGeometry.attributes.baseAlpha.array;
+        lineGlow.fill(0);
+        for (let edgeNumber = 0; edgeNumber < edgeMeta.length; edgeNumber++) {
+          const edge = edgeMeta[edgeNumber];
+          for (let localSegment = 0; localSegment < edge.segmentCount; localSegment++) {
+            const segment = edge.segmentStart + localSegment;
+            edge.color.toArray(lineColors, segment * 6);
+            edge.color.toArray(lineColors, segment * 6 + 3);
+            let alpha = edge.alpha;
+            let drawDone = false;
+            const activeDraw = edgeDraws.get(edge.key);
+            if (activeDraw && edge.memoryLink) {
+              const elapsed = now - activeDraw.startedAt;
+              const rawProgress = Math.min(1, Math.max(0, elapsed / Math.max(1, activeDraw.duration)));
+              if (elapsed < 0) alpha = 0;
+              else if (rawProgress < 1) alpha = 0.48;
+              else {
+                const settle = Math.min(1, Math.max(0, (elapsed - activeDraw.duration) / Math.max(1, activeDraw.settleDuration)));
+                const easedSettle = settle * settle * (3 - 2 * settle);
+                alpha = 0.48 + (edge.alpha - 0.48) * easedSettle;
+                drawDone = settle >= 1;
+              }
+            } else if (activeDraw) {
+              alpha = now < activeDraw.startedAt ? 0 : now < activeDraw.startedAt + activeDraw.duration ? 0.65 : edge.alpha;
+              if (!edge.memoryLink && now >= activeDraw.startedAt + activeDraw.duration) edgeDraws.delete(edge.key);
+            }
+            if (hoveredMemoryId !== null && !(activeDraw && alpha === 0)) {
+              const ownMemoryEdge = edge.key === `memory:${hoveredMemoryId}` || edge.key === `anchor:${hoveredMemorySource}`;
+              const ownLinkEdge = edge.memoryLink && edge.linkMemoryIds.includes(hoveredMemoryId);
+              alpha = ownMemoryEdge ? 0.8 : ownLinkEdge ? 0.6 : edge.alpha * 0.4;
+            } else if (hoveredLinkIndex >= 0 && !(activeDraw && alpha === 0)) alpha = edgeNumber === hoveredLinkIndex ? 0.6 : edge.alpha * 0.4;
+            if (performanceMode) alpha *= 0.55;
+            lineAlpha[2 * segment] = lineAlpha[2 * segment + 1] = alpha;
+            if (drawDone) edgeDraws.delete(edge.key);
+          }
+        }
+        for (let eventIndex = 0; eventIndex < events.length; eventIndex++) {
+          const event = events[eventIndex];
+          const elapsed = (now - event.startedAt) / 1000;
+          const strength = Math.max(0, 1 - elapsed / (event.kind === 'retrieve' ? 2 : 1.5));
+          const edgeStrength = performanceMode ? 0.55 : 1;
+          let edgeNumber = edgeIndex.get(`memory:${event.kind === 'link' ? event.aId : event.memoryId}`);
+          if (edgeNumber !== undefined) brightenEdge(edgeMeta[edgeNumber], 0.35 * strength * edgeStrength, null, lineGlow, lineColors);
+          if (event.kind === 'link') {
+            edgeNumber = edgeIndex.get(`memory:${event.bId}`);
+            if (edgeNumber !== undefined) brightenEdge(edgeMeta[edgeNumber], 0.35 * strength * edgeStrength, null, lineGlow, lineColors);
+          }
+          edgeNumber = edgeIndex.get(`anchor:${event.source}`);
+          if (edgeNumber !== undefined) brightenEdge(edgeMeta[edgeNumber], 0.4 * strength * edgeStrength, null, lineGlow, lineColors);
+          if (event.kind === 'link') {
+            edgeNumber = edgeIndex.get(`link:${event.linkId}`);
+            if (edgeNumber !== undefined) brightenEdge(edgeMeta[edgeNumber], 0.35 * strength * edgeStrength, null, lineGlow, lineColors);
+          }
+          if (event.kind === 'retrieve') for (let linkedOffset = 0; linkedOffset < event.linkedIds.length; linkedOffset++) {
+            const id = event.linkedIds[linkedOffset];
+            edgeNumber = edgeIndex.get(`memory:${id}`);
+            if (edgeNumber !== undefined) {
+              scratchColor.copy(whiteColor).lerp(edgeMeta[edgeNumber].color, 1 - strength);
+              brightenEdge(edgeMeta[edgeNumber], 0.4 * strength * edgeStrength, scratchColor, lineGlow, lineColors);
+            }
+            const linkedIndex = memorySlot.get(id);
+            const anchorEdge = linkedIndex === undefined ? undefined : edgeIndex.get(`anchor:${nodeMeta[linkedIndex].source}`);
+            if (anchorEdge !== undefined) brightenEdge(edgeMeta[anchorEdge], 0.4 * strength * edgeStrength, null, lineGlow, lineColors);
+            for (let linkIndex = 0; linkIndex < currentLinks.length; linkIndex++) {
+              const link = currentLinks[linkIndex];
+              const a = String(link.a_id), b = String(link.b_id);
+              if ((a === event.memoryId && b === id) || (b === event.memoryId && a === id)) {
+                const linkEdge = edgeIndex.get(`link:${String(link.id ?? `${a}-${b}`)}`);
+                if (linkEdge !== undefined) brightenEdge(edgeMeta[linkEdge], 0.5 * strength * edgeStrength, whiteColor, lineGlow, lineColors);
+              }
+            }
+          }
+        }
+        lineGeometry.attributes.lineGlow.needsUpdate = true;
+        lineGeometry.attributes.baseColor.needsUpdate = true;
+        lineGeometry.attributes.baseAlpha.needsUpdate = true;
+        lineVisualDirty = false;
+      }
       if (focusMove) {
         const progress = Math.min(1, (now - focusMove.startedAt) / focusMove.duration);
         const eased = progress * progress * (3 - 2 * progress);
@@ -845,13 +925,17 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
           if (restoringView) { savedView = clearSavedView(); restoringView = false; }
         }
       }
-      controls.update(); composer.render();
-      if (!performanceMode || now - lastLabelRenderAt >= 100) {
+      const focusControlsMoving = focusWasMoving ? Boolean(controls.update()) : false;
+      composer.render();
+      if (shouldRenderGraphLabels(performanceMode, cameraMoving || focusControlsMoving, now, lastLabelRenderAt)) {
         labels.render(scene, camera);
         lastLabelRenderAt = now;
       }
+      const keepAnimating = shouldKeepGraphAnimating(controlsMoving, Boolean(focusMove), events.length, edgeDraws.size, hubFlash.until >= now || hubFlash.strength > 0.01);
+      if (keepAnimating || focusControlsMoving) scheduleFrame(frameInterval);
     }
-    animate();
+    animateFrame = animate;
+    scheduleFrame();
     const style = document.createElement('style');
     style.textContent = `
       .brain-webgl,.brain-label-layer { position:absolute; inset:0; width:100%; height:100%; }
@@ -882,7 +966,10 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     host.appendChild(style);
 
     return () => {
-      cancelAnimationFrame(raf); observer.disconnect(); controls.dispose();
+      if (rafPending) cancelAnimationFrame(raf);
+      if (frameTimer) clearTimeout(frameTimer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      observer.disconnect(); controls.dispose();
       window.removeEventListener(PERFORMANCE_MODE_EVENT, onPerformanceModeChange);
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
       renderer.domElement.removeEventListener('pointerdown', onGraphPointerDown);

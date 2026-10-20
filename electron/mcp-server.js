@@ -190,6 +190,7 @@ function sameSessionIdentity(auth, session) {
 }
 
 async function handleRequest(request, response, token, dependencies) {
+  if (dependencies.isLocked?.()) { sendJson(response, 423, { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' }); return; }
   if (!isLocalHost(request.headers.host)) {
     sendJson(response, 403, { error: 'Host must be localhost.' });
     return;

@@ -62,11 +62,19 @@
         input: required.composer || required.input || null, send: required.send || null, messages: Object.values(messageSelectors).find(Boolean) || null };
     }
     function findScrollContainer(messages = getMessages(), scope = document) {
-      const start = messages[0]?.element;
-      for (let node = start?.parentElement; node && node !== scope; node = node.parentElement) {
-        const style = root.getComputedStyle?.(node); if (style && /(auto|scroll)/.test(`${style.overflowY} ${style.overflow}`) && node.scrollHeight > node.clientHeight + 2) return node;
+      for (const message of messages) {
+        for (let node = message?.element?.parentElement; node && node !== scope; node = node.parentElement) {
+          let style = null;
+          try { style = root.getComputedStyle?.(node); } catch {}
+          if (style && /(auto|scroll)/.test(`${style.overflowY} ${style.overflow}`) && node.scrollHeight > node.clientHeight + 2) return node;
+        }
       }
-      return null;
+      // Some chat sites scroll the page itself instead of an element around the
+      // messages. Use the document scroller as a fallback so history loading
+      // still works on those layouts.
+      const doc = scope?.nodeType === 9 ? scope : scope?.ownerDocument || root.document;
+      const pageScroller = doc?.scrollingElement || doc?.documentElement || doc?.body;
+      return pageScroller && pageScroller.scrollHeight > pageScroller.clientHeight + 2 ? pageScroller : null;
     }
     function findSendButton(scope = document) { const picked = typeof selectors.pickSend === 'function' ? selectors.pickSend(scope) : null; return visible(picked) ? picked : find(selectors.sendButton || selectors.send, scope); }
     const api = { site, selectors, getMessages, readRecentMessages: getMessages, findInput: input, getInputElement: input, readDraft, writeDraft, findSendButton, getSendButton: findSendButton,

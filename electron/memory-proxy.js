@@ -113,7 +113,7 @@ function candidateSafe(item) {
 function createMemoryProxy(options) {
   const { userDataPath, safeStorage, authenticateClientToken, getClientProfile, searchMemoriesForClient,
     getMemoryForClient, recordProxyEvent, addPendingMemory, fetchImpl = globalThis.fetch,
-    providerUrls = PROVIDER_URLS, searchTimeoutMs = 800, titleTimeoutMs = 3000, listenPort = null, extensionApi = null } = options;
+    providerUrls = PROVIDER_URLS, searchTimeoutMs = 800, titleTimeoutMs = 3000, listenPort = null, extensionApi = null, isLocked = () => false } = options;
   const settingsPath = path.join(userDataPath, 'memory-proxy-settings.json');
   const keysPath = path.join(userDataPath, 'provider-keys.enc');
   const readSettings = () => ({ ...DEFAULT_SETTINGS, ...safeReadJson(settingsPath, {}) });
@@ -270,6 +270,7 @@ function createMemoryProxy(options) {
   }
 
   async function handle(req, res) {
+    if (isLocked()) return sendJson(res, 423, { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' });
     if (extensionApi && new URL(req.url, 'http://127.0.0.1').pathname.startsWith('/ext/')) {
       await extensionApi.handle(req, res);
       return;

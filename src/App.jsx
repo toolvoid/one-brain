@@ -268,9 +268,26 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
   const [testResults, setTestResults] = useState(null);
   const [selectedConnection, setSelectedConnection] = useState(null);
   const [dismissedRows, setDismissedRows] = useState(() => new Set());
+  const [statusFilter, setStatusFilter] = useState('all');
   const rows = buildConnectionRows({ mcp, clients, extensions, providers, quickContext, activity, counts });
   const health = summarizeConnectionHealth(rows);
+  const connectedCount = rows.filter((row) => row.healthy && row.status !== 'Degraded').length;
+  const limitedCount = rows.filter((row) => row.status === 'Degraded').length;
+  const visibleRows = rows.filter((row) => {
+    if (dismissedRows.has(row.id)) return false;
+    if (statusFilter === 'connected') return row.healthy && row.status !== 'Degraded';
+    if (statusFilter === 'attention') return row.status === 'Degraded' || ['degraded', 'failing', 'needs_restart', 'needs_approval', 'busy'].includes(row.healthStatus);
+    if (statusFilter === 'setup') return ['not_set_up', 'not_installed', 'manual_only', 'not_checked'].includes(row.healthStatus);
+    return true;
+  });
   const filteredActivity = activity.filter((event) => !filter || event.client === filter);
+  const seenSuccessfulChecks = new Set();
+  const visibleActivity = filteredActivity.filter((event) => {
+    if (event.action !== 'test' || !event.ok) return true;
+    if (seenSuccessfulChecks.has(event.client)) return false;
+    seenSuccessfulChecks.add(event.client);
+    return true;
+  });
   useEffect(() => {
     if (!selectedConnection) return undefined;
     const close = () => setSelectedConnection(null);
@@ -312,20 +329,24 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
   }
   async function testOne(row) {
     let result;
-    if (row.type.includes('MCP')) result = await onTest(row.id);
+    if (row.type.includes('MCP')) { result = await onTest(row.id); if (result.customCommand) result = { ...result, skipped: true }; }
     else if (row.site) {
       const item = extensions.find((entry) => entry.site === row.site);
-      result = { ok: Boolean(item?.paired && item.status === 'approved' && !item.layoutStatus?.broken), reason: item?.paired ? item.status === 'approved' ? item.layoutStatus?.broken ? 'Selectors broken; use Manual context.' : 'Extension pairing is active.' : 'Extension needs approval.' : 'Extension site is not paired.' };
-      await window.brain.logConnectionActivity({ client: row.name, action: 'test', ok: result.ok, reason: result.ok ? '' : item?.layoutStatus?.broken ? 'selectors_broken' : 'not_paired' });
+      const ready = Boolean(item?.paired && item.status === 'approved');
+      result = { ok: ready, skipped: !ready, reason: !item?.paired ? 'Pair this site first.' : item.status !== 'approved' ? 'Approve this extension in One Brain first.' : item.layoutStatus?.broken ? 'Connected, but the chat box was not detected; context insertion may be unavailable.' : 'Extension is paired and approved.' };
+      if (!ready) await window.brain.logConnectionActivity({ client: row.name, action: 'test', ok: false, reason: item?.paired ? 'needs_approval' : 'not_paired' });
     } else if (row.provider) {
-      try { result = await window.brain.testProviderKey(row.provider, ''); await window.brain.logConnectionActivity({ client: row.name, action: 'test', ok: result.ok, reason: result.ok ? '' : 'invalid_key' }); }
-      catch (error) { result = { ok: false, reason: error.message || 'Key test failed.' }; }
+      if (!providers.providerKeyStatus?.[row.provider]) result = { ok: false, skipped: true, reason: 'Add and save a provider key first.' };
+      else {
+        try { result = await window.brain.testProviderKey(row.provider, ''); await window.brain.logConnectionActivity({ client: row.name, action: 'test', ok: result.ok, reason: result.ok ? '' : 'invalid_key' }); }
+        catch (error) { result = { ok: false, reason: error.message || 'Key test failed.' }; }
+      }
     } else {
-      result = { ok: Boolean(quickContext.enabled && quickContext.registered), reason: quickContext.enabled && quickContext.registered ? `Quick context is active on ${quickContext.shortcut}.` : 'Quick context hotkey is disabled or unavailable.' };
-      await window.brain.logConnectionActivity({ client: row.name, action: 'test', ok: result.ok, reason: result.ok ? '' : 'needs_restart' });
+      const ready = Boolean(quickContext.enabled && quickContext.registered);
+      result = { ok: ready, skipped: !ready, reason: ready ? `Quick context is active on ${quickContext.shortcut}.` : 'Set up the Quick context shortcut in Settings.' };
     }
     await onRefresh();
-    setNotice(`${row.name}: ${result.ok ? 'Pass' : 'Fail'} · ${result.reason}`);
+    setNotice(`${row.name}: ${result.skipped ? 'Setup needed' : result.ok ? 'Pass' : 'Fail'} · ${result.reason}`);
     return result;
   }
   async function checkExtension(row) {
@@ -339,7 +360,9 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
         if (latest?.health?.selfCheck?.at && Date.parse(latest.health.selfCheck.at) >= started) {
           await onRefresh();
           const stale = latest.health.tabContentScriptVersion && latest.health.contentScriptVersion && latest.health.tabContentScriptVersion !== latest.health.contentScriptVersion;
-          setNotice(`${row.name}: ${stale ? 'Reload this page' : `self-check received · ${Object.values(latest.health.selfCheck.matched || {}).filter((count) => count > 0).length} selectors matched`}.`);
+          const matched = latest.health.selfCheck.matched || {};
+          const composerFound = Number(matched.composer ?? matched.input ?? 0) > 0;
+          setNotice(stale ? `${row.name}: extension updated. Reload this page once to use the new script.` : composerFound ? `${row.name}: connected; chat box detected.` : `${row.name}: connected, but the chat box was not detected. Saving can still work; context insertion is unavailable.`);
           return;
         }
       }
@@ -351,7 +374,7 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
     const results = [];
     for (const row of rows) results.push({ name: row.name, ...await testOne(row) });
     setTestResults(results);
-    setNotice(`Tested ${results.length} connections · ${results.filter((item) => item.ok).length} passed, ${results.filter((item) => !item.ok).length} failed.`);
+    setNotice(`Checked ${results.length} connections · ${results.filter((item) => item.ok).length} passed, ${results.filter((item) => item.skipped).length} need setup, ${results.filter((item) => !item.ok && !item.skipped).length} failed.`);
     await onRefresh();
   }
   async function openSite(row) {
@@ -360,25 +383,27 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
   }
   return <section className="connections-dashboard">
     <header className="connections-header"><div><h2>Connections</h2><p>Connection status, capabilities and recent usage.</p></div><button type="button" onClick={() => void onRefresh()}>Refresh</button></header>
-    <div className="connection-health"><strong>{health.healthy} healthy · {health.degraded} degraded · {health.needAction} need action · {health.notSetUp} not set up</strong></div>
+    <div className="connection-health"><strong>{connectedCount} connected · {limitedCount} limited · {health.needAction} need attention · {health.notSetUp} not set up</strong><small>Limited means the connection works, but a feature such as context insertion needs attention. Set up only the apps you use.</small></div>
     <nav className="connection-tabs"><button type="button" aria-pressed={tab === 'connections'} onClick={() => setTab('connections')}>Connections</button><button type="button" aria-pressed={tab === 'activity'} onClick={() => setTab('activity')}>Activity log</button><button type="button" onClick={() => void onConnectAll()}>Connect all detected</button><button type="button" onClick={() => void testAll()}>Test all</button></nav>
     {notice && <p className="connection-notice" role="status">{notice}</p>}
     {pairCode && <p className="extension-pair-code" role="status">Pairing code <strong>{pairCode.code}</strong> · expires in 2 minutes<br />API address <code>{pairCode.endpoint}</code></p>}
-    {testResults && <div className="connection-test-results">{testResults.map((result) => <small key={result.name}>{result.name}: {result.ok ? 'Pass' : 'Fail'} · {result.reason}</small>)}</div>}
+    {testResults && <div className="connection-test-results">{testResults.map((result) => <small key={result.name}>{result.name}: {result.skipped ? 'Setup needed' : result.ok ? 'Pass' : 'Fail'} · {result.reason}</small>)}</div>}
     {tab === 'connections' ? <>
-      <div className="connection-compact-list">{rows.filter((row) => !dismissedRows.has(row.id)).map((row) => <article className="connection-compact-row" key={row.id}>
-        <div className="connection-compact-heading"><div><strong>{row.name}</strong><small className="connection-type">{row.type}</small></div><span className={`connection-status ${row.status.toLowerCase().replaceAll(' ', '-')}`}>{row.status}</span></div>
+      <nav className="connection-filters" aria-label="Filter connections">{[['all', 'All', rows.length], ['connected', 'Connected', connectedCount], ['attention', 'Needs attention', limitedCount + health.needAction], ['setup', 'Not set up', health.notSetUp]].map(([value, label, count]) => <button type="button" key={value} aria-pressed={statusFilter === value} onClick={() => setStatusFilter(value)}>{label} <span>{count}</span></button>)}</nav>
+      <div className="connection-compact-list">{visibleRows.map((row) => <article className="connection-compact-row" key={row.id}>
+        <div className="connection-compact-heading"><div><strong>{row.name}</strong><small className="connection-type">{row.type}</small></div><span className={`connection-status ${row.status.toLowerCase().replaceAll(' ', '-')}`}>{row.status === 'Degraded' ? 'Limited' : row.status}</span></div>
         {row.reason && <small className="connection-compact-reason">{row.reason}</small>}
         {row.healthStatus === 'needs_restart' && row.mcpHealthDetails && <small className="connection-compact-meta">Why? Token generation {row.mcpHealthDetails.tokenGeneration}; last real call {row.mcpHealthDetails.lastRealCall ? `${relative(row.mcpHealthDetails.lastRealCall.time)} at generation ${row.mcpHealthDetails.lastRealCall.generation} (${row.mcpHealthDetails.lastRealCall.ok ? 'succeeded' : 'failed'})` : 'not recorded'}; last probe {row.mcpHealthDetails.lastProbe ? `${relative(row.mcpHealthDetails.lastProbe.time)} (${row.mcpHealthDetails.lastProbe.ok ? 'passed' : 'failed'})` : 'not recorded'}.</small>}
-        {row.healthDetails && <small className="connection-compact-meta">Ping {relative(row.healthDetails.pingAt)} · token {row.healthDetails.tokenValid ? 'valid' : 'invalid'} · approval {row.healthDetails.approval} · origin {row.healthDetails.receivedOrigin || '—'} / expected {row.healthDetails.expectedOrigin || '—'} · API {row.healthDetails.apiVersion || '—'} · build {row.healthDetails.buildId || '—'} · host permission {row.healthDetails.hostPermission === true ? 'granted' : row.healthDetails.hostPermission === false ? 'missing' : 'unknown'} · self-check {row.healthDetails.selfCheck ? `${Object.values(row.healthDetails.selfCheck.matched || {}).filter((count) => count > 0).length} selectors matched ${relative(row.healthDetails.selfCheck.at)}` : 'not run'} · last successful {row.healthDetails.lastSuccessfulUse ? `${row.healthDetails.lastSuccessfulUse.action} ${relative(row.healthDetails.lastSuccessfulUse.time)}` : 'search/save not recorded'}</small>}
+        {row.healthDetails && <details className="connection-tech-details"><summary>Technical details</summary><small>Last check {relative(row.healthDetails.pingAt)} · token {row.healthDetails.tokenValid ? 'valid' : 'invalid'} · approval {row.healthDetails.approval} · origin {row.healthDetails.receivedOrigin || '—'} / expected {row.healthDetails.expectedOrigin || '—'} · API {row.healthDetails.apiVersion || '—'} · build {row.healthDetails.buildId || '—'} · host permission {row.healthDetails.hostPermission === true ? 'granted' : row.healthDetails.hostPermission === false ? 'missing' : 'unknown'} · self-check {row.healthDetails.selfCheck ? `${Object.values(row.healthDetails.selfCheck.matched || {}).filter((count) => count > 0).length} selectors matched ${relative(row.healthDetails.selfCheck.at)}` : 'not run'} · last successful {row.healthDetails.lastSuccessfulUse ? `${row.healthDetails.lastSuccessfulUse.action} ${relative(row.healthDetails.lastSuccessfulUse.time)}` : 'search/save not recorded'}</small></details>}
         {row.site && <button type="button" className="connection-check-extension" onClick={() => void checkExtension(row)}>Check extension</button>}
         {['needs_restart', 'failing'].includes(row.healthStatus) && <div className="connection-row-actions">{row.healthStatus === 'needs_restart' && <button type="button" onClick={() => void connect(row)}>Reconnect</button>}<button type="button" onClick={() => void testOne(row)}>Test</button>{row.healthStatus === 'needs_restart' && <button type="button" onClick={() => void copyText(`Restart ${row.name} so it reloads the One Brain MCP bridge configuration.`, `restart-${row.id}`)}>Copy restart steps</button>}</div>}
+        {row.site && <button type="button" onClick={() => openSite(row)}>Open site</button>}
         {['not_set_up', 'not_installed', 'manual_only'].includes(row.healthStatus) && <button type="button" className="connection-dismiss" aria-label={`Dismiss ${row.name}`} onClick={() => setDismissedRows((current) => new Set([...current, row.id]))}>Dismiss</button>}
         <div className="connection-compact-meta"><span>{row.lastActivity ? `${row.lastActivity.action} ${relative(row.lastActivity.time)}` : 'No activity'}</span><span>{row.counts.searches} searches · {row.counts.saves} saves today</span></div>
         <button type="button" className="connection-details-button" onClick={() => setSelectedConnection(row)}>View details</button>
-      </article>)}</div>
+      </article>)}</div>{visibleRows.length === 0 && <p className="empty-note">No connections match this filter.</p>}
       <section className="connection-security"><h3>Security</h3><p>Stdio bridge: loopback listener at <code>127.0.0.1:{mcpConfig?.port || '—'}</code>. Preferred port <code>{mcpConfig?.preferredPort || 3737}</code>{mcpConfig?.preferredPortInUseBy ? ` is held by ${mcpConfig.preferredPortInUseBy}` : ''}. Every request requires a valid client token.</p><button type="button" onClick={onRotateAll}>Rotate token</button></section>
-    </> : <section className="connection-activity"><header><h3>Recent activity (up to 200 events)</h3><label>Filter by client<select value={filter} onChange={(event) => setFilter(event.target.value)}><option value="">All clients</option>{[...new Set(activity.map((event) => event.client))].sort().map((client) => <option key={client}>{client}</option>)}</select></label><button type="button" onClick={async () => { await window.brain.clearConnectionActivity(); await onRefresh(); }}>Clear log</button></header>{filteredActivity.map((event) => <article key={`${event.time}-${event.client}-${event.action}`}><time>{new Date(event.time).toLocaleString()}</time><strong>{event.client}</strong><span>{event.action}</span><span>{event.ok ? 'OK' : 'Fail'}</span><small>{event.reason || '—'}{event.probe ? ` · probe ${event.duration} ms` : ''}</small></article>)}{filteredActivity.length === 0 && <p className="empty-note">No connection activity yet.</p>}</section>}
+    </> : <section className="connection-activity"><header><div><h3>Recent activity</h3><small>Repeated successful checks are grouped by service.</small></div><label>Filter by client<select value={filter} onChange={(event) => setFilter(event.target.value)}><option value="">All clients</option>{[...new Set(activity.map((event) => event.client))].sort().map((client) => <option key={client}>{client}</option>)}</select></label><button type="button" onClick={async () => { await window.brain.clearConnectionActivity(); await onRefresh(); }}>Clear log</button></header>{visibleActivity.map((event) => <article key={`${event.time}-${event.client}-${event.action}`}><time>{new Date(event.time).toLocaleString()}</time><strong>{event.client}</strong><span>{event.action}</span><span>{event.ok ? 'OK' : 'Fail'}</span><small>{event.reason || '—'}{event.probe ? ` · probe ${event.duration} ms` : ''}</small></article>)}{visibleActivity.length === 0 && <p className="empty-note">No connection activity yet.</p>}</section>}
     {selectedConnection && createPortal(<div className="connection-window-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedConnection(null); }}><section className="connection-detail-window" role="dialog" aria-modal="true" aria-labelledby="connection-detail-title"><header><div><h2 id="connection-detail-title">{selectedConnection.name}</h2><small>{selectedConnection.type}</small></div><button type="button" aria-label="Close connection details" onClick={() => setSelectedConnection(null)}>×</button></header><div className="connection-detail-status"><span className={`connection-status ${selectedConnection.status.toLowerCase().replaceAll(' ', '-')}`}>{selectedConnection.status}</span><p>{selectedConnection.reason || 'No issues reported.'}</p></div><section className="connection-detail-works"><h3>Works</h3>{['Search', 'Save', 'Auto-insert'].map((feature) => <div key={feature}><strong>{selectedConnection.work[feature].supported ? '✓' : '—'} {feature}</strong>{!selectedConnection.work[feature].supported && <small>{selectedConnection.work[feature].reason || 'Not supported'}</small>}</div>)}</section><div className="connection-detail-activity"><strong>Last activity</strong><span>{selectedConnection.lastActivity ? `${selectedConnection.lastActivity.action} ${relative(selectedConnection.lastActivity.time)}` : 'No activity yet'}</span><strong>Today</strong><span>{selectedConnection.counts.searches} searches · {selectedConnection.counts.saves} saves</span></div><footer><button type="button" onClick={() => void connect(selectedConnection)}>Reconnect</button><button type="button" onClick={() => void onDisconnect(selectedConnection)}>Disconnect</button><button type="button" onClick={() => void testOne(selectedConnection)}>Test connection</button>{selectedConnection.type.includes('MCP') && <><button type="button" onClick={async () => { if (window.confirm(`Rotate ${selectedConnection.name}'s token? Its current token will stop working.`)) { await window.brain.rotateConnectorToken(selectedConnection.id); await onRefresh(); } }}>Rotate token</button><button type="button" onClick={async () => { if (window.confirm(`Revoke ${selectedConnection.name}'s token?`)) { await window.brain.revokeConnectorToken(selectedConnection.id); await onRefresh(); } }}>Revoke</button></>}{selectedConnection.site && <button type="button" onClick={() => void openSite(selectedConnection)}>Open site</button>}</footer></section></div>, document.body)}
   </section>;
 }
@@ -1895,6 +1920,9 @@ function App() {
         .connections-dashboard button { border:1px solid rgba(143,196,255,.22);border-radius:5px;padding:5px 7px;color:#c7e1ff;background:#182a40;font:9px system-ui,sans-serif;cursor:pointer; }
         .connection-health { display:grid;gap:4px;padding:9px;border:1px solid rgba(111,198,146,.26);border-radius:7px;background:rgba(34,91,58,.16);color:#b9efcc;font-size:11px; }.connection-health small { color:#f0b5ae;font-size:9px; }
         .connection-tabs { justify-content:flex-start;flex-wrap:wrap; }.connection-tabs button[aria-pressed=true] { color:#fff;background:#314d71; }
+        .connection-filters { display:flex;gap:6px;flex-wrap:wrap; }.connection-filters button { display:flex;align-items:center;gap:7px;min-height:34px;padding:7px 10px!important;font-size:10px!important; }.connection-filters button[aria-pressed=true] { border-color:#72b8f6!important;background:#263e59!important;color:#fff!important; }.connection-filters span { color:#9fb8d2; }
+        .connection-tech-details { color:#aab9cb;font-size:9px;line-height:1.5; }.connection-tech-details summary { width:max-content;color:#9fb8d2;cursor:pointer; }.connection-tech-details small { display:block;margin-top:4px;overflow-wrap:anywhere; }
+        .connections-dashboard button:focus-visible,.connection-tech-details summary:focus-visible { outline:2px solid #86c5ff;outline-offset:2px; }
         .connection-notice,.connection-test-results { margin:0;padding:7px;border:1px solid rgba(143,196,255,.18);border-radius:6px;color:#cad8eb;background:#121e30;font-size:10px; }.connection-test-results { display:grid;gap:4px; }
         .connection-compact-list { display:grid;gap:7px;min-width:0; }.connection-compact-row { display:grid;gap:6px;min-width:0;padding:9px;border:1px solid rgba(175,195,224,.14);border-radius:7px;background:rgba(15,24,37,.7); }.connection-compact-heading { display:flex;align-items:flex-start;justify-content:space-between;gap:7px; }.connection-compact-heading > div { display:grid;gap:3px;min-width:0; }.connection-compact-heading strong { color:#e2eaf5;font-size:11px;overflow-wrap:anywhere; }.connection-compact-reason { color:#f0b5ae;font-size:9px;line-height:1.4; }.connection-compact-meta { display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap;color:#91a0b4;font-size:9px; }.connection-details-button { justify-self:start; }
         .connection-type { color:#91a4bb!important; }.connection-status { display:inline-block;padding:3px 5px;border-radius:5px;color:#d7e4f4;background:#26364d;font-size:9px;white-space:nowrap; }.connection-status.connected,.connection-status.paired { color:#b7f0ca;background:#173b2c; }.connection-status.broken,.connection-status.selectors-broken,.connection-status.needs-reconnect,.connection-status.needs-restart,.connection-status.failing { color:#ffcbc3;background:#48272a; }.connection-status.not-installed,.connection-status.not-paired,.connection-status.not-connected,.connection-status.needs-approval { color:#d1d6df;background:#343b49; }.connection-status.degraded,.connection-status.not-checked,.connection-status[class*="busy-"] { color:#f3d18a;background:#493b1d; }

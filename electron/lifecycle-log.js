@@ -32,7 +32,7 @@ function safeDetails(event, details = {}) {
     if (Number.isFinite(Number(details.errorCode))) safe.errorCode = Number(details.errorCode);
     safe.isMainFrame = Boolean(details.isMainFrame);
   }
-  if (['window_created', 'window_closed', 'window_unresponsive'].includes(event)) {
+  if (['window_created', 'window_closed', 'window_unresponsive', 'window_shown', 'window_hidden', 'window_minimized', 'window_restored'].includes(event)) {
     safe.window = String(details.window || 'main').slice(0, 32);
   }
   if (['app_relaunch_called', 'app_exit_called', 'app_quit_called'].includes(event)) {

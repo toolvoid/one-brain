@@ -84,6 +84,10 @@ function attachWindowLifecycle(win, windowName) {
   lifecycleLog.append('window_created', { window: windowName });
   win.once('closed', () => lifecycleLog.append('window_closed', { window: windowName }));
   win.on('unresponsive', () => lifecycleLog.append('window_unresponsive', { window: windowName }));
+  win.on('show', () => lifecycleLog.append('window_shown', { window: windowName }));
+  win.on('hide', () => lifecycleLog.append('window_hidden', { window: windowName }));
+  win.on('minimize', () => lifecycleLog.append('window_minimized', { window: windowName }));
+  win.on('restore', () => lifecycleLog.append('window_restored', { window: windowName }));
   win.webContents.on('did-start-navigation', (navigationEvent, legacyUrl, _legacyIsInPlace, legacyIsMainFrame) => {
     const url = navigationEvent?.url || legacyUrl;
     const isMainFrame = typeof navigationEvent?.isMainFrame === 'boolean' ? navigationEvent.isMainFrame : legacyIsMainFrame !== false;

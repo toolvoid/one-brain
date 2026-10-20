@@ -25,18 +25,19 @@
     if (!scroller) return { messages: normalize(collect?.() || []), cancelled: false, scrollableFound: false };
     const originalTop = scroller.scrollTop, messages = [];
     try {
-      scroller.scrollTop = scroller.scrollHeight; await wait(0);
+      scroller.scrollTop = scroller.scrollHeight; await wait(350);
       let discovered = merge(messages, normalize(collect())); messages.splice(0, messages.length, ...discovered); progress(messages.length);
-      let stable = 0;
+      let stuck = 0;
       for (let step = 0; step < maxSteps && !cancelled(); step++) {
         const previous = scroller.scrollTop;
-        scroller.scrollTop = Math.max(0, previous - Math.max(200, Math.floor(scroller.clientHeight * 0.75)));
-        await wait(0);
+        const target = Math.max(0, previous - Math.max(200, Math.floor(scroller.clientHeight * 0.75)));
+        scroller.scrollTop = target;
+        await wait(350);
         const next = merge(messages, normalize(collect()));
-        const oldIds = new Set(messages.map((item) => item.id));
-        const added = next.filter((item) => !oldIds.has(item.id)).length;
-        messages.splice(0, messages.length, ...next); stable = added ? 0 : stable + 1; progress(messages.length);
-        if (scroller.scrollTop <= 0 || stable >= 3) break;
+        messages.splice(0, messages.length, ...next); progress(messages.length);
+        const current = scroller.scrollTop;
+        stuck = current >= previous ? stuck + 1 : 0;
+        if (current <= 0 || stuck >= 3) break;
       }
       return { messages, cancelled: cancelled(), scrollableFound: true };
     } finally { scroller.scrollTop = originalTop; }

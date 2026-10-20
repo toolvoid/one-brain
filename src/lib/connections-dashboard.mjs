@@ -25,6 +25,7 @@ const byId = (list, key, id) => list.find((item) => item[key] === id);
 export function buildConnectionRows({ mcp = [], clients = [], extensions = [], providers = {}, quickContext = {}, activity = [], counts: activityCounts = {}, selectors = {} } = {}) {
   const rows = CONNECTION_DEFINITIONS.map((definition) => {
     let status = 'Not connected', reason = 'Not connected yet.', last = null;
+    let composerUnavailable = false;
     if (definition.type.includes('MCP')) {
       const item = byId(mcp, 'id', definition.id);
       const profile = clients.find((row) => row.verified && String(row.client || '').toLowerCase().replace(/[^a-z0-9]/g, '').includes(({ codex: 'codex', vscode: 'vscode', gemini: 'geminicli', 'claude-code': 'claudecode', 'claude-desktop': 'claudedesktop' })[definition.id]));
@@ -48,6 +49,7 @@ export function buildConnectionRows({ mcp = [], clients = [], extensions = [], p
       const composerMatched = Number(matched.composer ?? matched.input ?? 0) > 0;
       const messageCount = Number(selfCheck.containersMatched ?? matched.messages ?? 0);
       const hasEvidence = Boolean(h.pingAt || selfCheck.at || h.authFailure || h.checkResultAt);
+        composerUnavailable = hasEvidence && !composerMatched && (matched.composer !== undefined || matched.input !== undefined);
       const latestUse = activity.filter((event) => event.client === definition.name && ['search', 'save'].includes(event.action)).sort((a, b) => Date.parse(b.time) - Date.parse(a.time));
       const newestSuccess = latestUse.find((event) => event.ok);
       const newestFailure = latestUse.find((event) => !event.ok);
@@ -56,7 +58,7 @@ export function buildConnectionRows({ mcp = [], clients = [], extensions = [], p
       else if (item.status !== 'approved') { status = 'Needs approval'; reason = 'Approve this extension client in One Brain.'; }
       else {
         const expectedBuild = String(item.buildId || h.buildId || '');
-        const requiredBroken = selector?.required?.composer === null || selector?.composer === null || (hasEvidence && !composerMatched && (matched.composer !== undefined || matched.input !== undefined));
+        const requiredBroken = selector?.required?.composer === null || selector?.composer === null;
         const reportedBuildBroken = Boolean(expectedBuild && !expectedBuild.toLowerCase().includes('loopguard'));
         const busy = h.rateLimited === true || h.reason === 'rate_limited' || item.status === 'rate-limited';
         const staleScript = Boolean(h.tabContentScriptVersion && h.contentScriptVersion && h.tabContentScriptVersion !== h.contentScriptVersion);
@@ -64,7 +66,7 @@ export function buildConnectionRows({ mcp = [], clients = [], extensions = [], p
         const effectiveRealFailure = !successfulUseIsCurrent && realFailure;
         const degraded = !requiredBroken && (composerMatched && (messageCount > 0 && messageCount < 2 || selfCheck.messageSelectors && Object.values(selfCheck.messageSelectors).every((value) => !value)) || selector?.messageBroken);
         if (busy) { status = 'Busy (rate limited)'; const retryAfter = h.retryAt ? Math.ceil((Number(h.retryAt) - Date.now()) / 1000) : Number(h.retryAfter) || 1; reason = `Busy: rate limited, retrying in ${Math.max(1, retryAfter)}s`; }
-        else if (requiredBroken) { status = 'Broken'; reason = 'Required composer selector matched 0.'; }
+        else if (requiredBroken || composerUnavailable) { status = 'Degraded'; reason = 'Extension is connected, but the chat box was not detected. Saving can still work; context insertion is unavailable.'; }
         else if (effectiveRealFailure) { status = 'Failing'; reason = h.authFailure === 'origin_mismatch' ? `Origin mismatch: expected ${h.expectedOrigin || 'unknown'}, received ${h.receivedOrigin || 'unknown'}.` : h.hostPermission === false ? 'Host permission is not granted.' : item.updateOneBrain || h.apiCompatible === false ? 'Extension and One Brain API versions are incompatible.' : reportedBuildBroken ? 'Extension reported a build without the loop guard.' : staleScript ? 'Reload this page.' : 'The last extension check failed.'; }
         else if (degraded) { status = 'Degraded'; reason = messageCount === 1 ? 'Message detection found 1 message: Save this chat may be incomplete, press Load full chat' : 'Message selectors need attention.'; }
         else if (successfulUseIsCurrent) { status = 'Paired'; reason = `Last ${newestSuccess.action} succeeded ${newestSuccess.time}.`; }
@@ -88,6 +90,7 @@ export function buildConnectionRows({ mcp = [], clients = [], extensions = [], p
     const counts = activityCounts[definition.name] || { searches: events.filter((event) => event.action === 'search' && event.time?.startsWith(new Date().toISOString().slice(0, 10))).length,
       saves: events.filter((event) => event.action === 'save' && event.time?.startsWith(new Date().toISOString().slice(0, 10))).length };
     const supported = new Set(definition.supports);
+    if (definition.site && composerUnavailable) supported.delete('Auto-insert');
     if (definition.provider) {
       const keyStatus = providers.providerKeyStatus || providers;
       if (!keyStatus[definition.provider] || providers.enabled === false) { supported.delete('Search'); supported.delete('Auto-insert'); }
@@ -95,7 +98,7 @@ export function buildConnectionRows({ mcp = [], clients = [], extensions = [], p
     }
     const work = Object.fromEntries(['Search', 'Save', 'Auto-insert'].map((feature) => [feature, supported.has(feature)
       ? { supported: true, reason: '' }
-      : { supported: false, reason: definition.manual ? 'Quick context copies text for manual paste.' : definition.type.includes('MCP') ? 'MCP tools return results but do not insert into the client prompt.' : definition.type === 'API provider' && !(providers.providerKeyStatus || providers)[definition.provider] ? 'Provider key is missing.' : definition.type === 'API provider' && providers.enabled === false ? 'Memory injection is disabled in the local API proxy.' : definition.type === 'API provider' && providers.dryRun && feature === 'Auto-insert' ? 'Dry run leaves provider requests unchanged.' : definition.type === 'API provider' ? 'The provider API connection has no save_memory tool.' : 'This connection does not provide this action.' }]));
+      : { supported: false, reason: definition.site && feature === 'Auto-insert' && composerUnavailable ? 'The chat box was not detected, so One Brain cannot insert context yet.' : definition.manual ? 'Quick context copies text for manual paste.' : definition.type.includes('MCP') ? 'MCP tools return results but do not insert into the client prompt.' : definition.type === 'API provider' && !(providers.providerKeyStatus || providers)[definition.provider] ? 'Provider key is missing.' : definition.type === 'API provider' && providers.enabled === false ? 'Memory injection is disabled in the local API proxy.' : definition.type === 'API provider' && providers.dryRun && feature === 'Auto-insert' ? 'Dry run leaves provider requests unchanged.' : definition.type === 'API provider' ? 'The provider API connection has no save_memory tool.' : 'This connection does not provide this action.' }]));
     const sourceHealth = itemHealthStatus(mcp, definition.id);
     const ext = definition.site ? byId(extensions, 'site', definition.site) : null;
     const mcpHealth = definition.type.includes('MCP') ? byId(mcp, 'id', definition.id)?.health || {} : null;
