@@ -23,6 +23,7 @@ function setup(overrides = {}) {
     migrateDatabaseToPassword: async (...args) => { calls.push(['migrate', ...args]); return { backupPath: '/private/backup' }; },
     verifyMasterPassword: async (...args) => { calls.push(['verify', ...args]); return true; },
     exportEncryptedRecoveryFile: async (...args) => { calls.push(['export', ...args]); return { path: '/home/test/recovery.obr' }; },
+    deleteOldBackups: (...args) => { calls.push(['delete-old-backups', ...args]); return true; },
     logFailure: (failure) => failures.push(failure),
     ...overrides,
   };
@@ -78,4 +79,19 @@ test('recovery export is refused when no master password is configured', async (
   const result = await handlers.get('security:export-recovery')({}, 'long-password');
   assert.deepEqual(result, { ok: false, error: 'Set a master password first.' });
   assert.equal(calls.some(([kind]) => kind === 'dialog' || kind === 'verify' || kind === 'export'), false);
+});
+
+test('old migration backups require the current password and typed confirmation', async () => {
+  const { handlers, calls, userData } = setup();
+  const handler = handlers.get('security:delete-old-backups');
+  assert.deepEqual(await handler({}, 'right password', 'no'), { ok: false, error: 'Type DELETE OLD BACKUPS to confirm.' });
+  assert.deepEqual(await handler({}, 'correct password', 'DELETE OLD BACKUPS'), { ok: true, error: null, deleted: true });
+  assert.deepEqual(calls.filter(([kind]) => kind === 'delete-old-backups'), [['delete-old-backups', userData]]);
+});
+
+test('old migration backups are not deleted for a wrong master password', async () => {
+  const { handlers, calls } = setup({ verifyMasterPassword: async () => false });
+  const result = await handlers.get('security:delete-old-backups')({}, 'wrong password', 'DELETE OLD BACKUPS');
+  assert.deepEqual(result, { ok: false, error: 'Wrong password' });
+  assert.equal(calls.some(([kind]) => kind === 'delete-old-backups'), false);
 });

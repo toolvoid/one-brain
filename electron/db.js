@@ -2,7 +2,6 @@ const { app } = require('electron');
 const Database = require('better-sqlite3-multiple-ciphers');
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
 const { createHash, randomBytes, timingSafeEqual } = require('crypto');
 const { Worker } = require('node:worker_threads');
 const { INSIGHT_QUERIES } = require('./analytics-queries');
@@ -10,6 +9,7 @@ const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
 const { JOIN_ALL_MIN } = require('../src/lib/link-constants.json');
 const { rankExtensionResults } = require('./ext-search');
 const lockController = require('./lock-controller');
+const { secureRemovePath } = require('./private-files');
 const { writeVault, readVault, atomicPrivateWrite, unwrapDatabaseKey } = require('./security-vault');
 const MEMORY_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 
@@ -470,12 +470,14 @@ function legacyJunkCount(db = getDatabase()) {
 async function createPreCleanupBackup() {
   ensureWritable();
   if (!databaseKey) throw new Error('The encrypted database key is unavailable.');
-  const folder = path.join(os.homedir(), 'onebrain-backup-pre-cleanup');
+  const folder = path.join(path.dirname(databasePath), '.precleanup-backups');
   fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
   fs.chmodSync(folder, 0o700);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const backupPath = path.join(folder, `onebrain-${stamp}-${randomBytes(4).toString('hex')}.db`);
-  const pendingPath = `${backupPath}.pending`;
+  // Keep the transient plaintext snapshot in userData so startup/lock cleanup
+  // can find it; the completed backup is SQLCipher-encrypted before it leaves.
+  const pendingPath = path.join(path.dirname(databasePath), `.precleanup-pending-${randomBytes(8).toString('hex')}.db`);
   const expected = databaseCounts(getDatabase());
   try {
     const serialized = getDatabase().serialize();
@@ -501,8 +503,35 @@ async function createPreCleanupBackup() {
     fs.chmodSync(backupPath, 0o600);
     return backupPath;
   } catch (error) {
-    try { fs.rmSync(pendingPath, { force: true }); } catch {}
-    try { fs.rmSync(backupPath, { force: true }); } catch {}
+    try { secureRemovePath(pendingPath); } catch {}
+    try { secureRemovePath(backupPath); } catch {}
+    throw error;
+  }
+}
+
+async function encryptPlainBackupFile(backupPath, key, expectedCounts) {
+  const temporaryPath = `${backupPath}.${randomBytes(6).toString('hex')}.encrypted.tmp`;
+  try {
+    const source = openPlain(backupPath, { readonly: true, fileMustExist: true });
+    try {
+      if (JSON.stringify(databaseCounts(source)) !== JSON.stringify(expectedCounts)) throw new Error('Legacy backup row counts do not match.');
+      await source.backup(temporaryPath);
+    } finally { source.close(); }
+    fs.chmodSync(temporaryPath, 0o600);
+    const copy = openPlain(temporaryPath);
+    try { copy.pragma("cipher = 'sqlcipher'"); copy.pragma('legacy = 4'); copy.rekey(key); }
+    finally { copy.close(); }
+    const verified = openEncrypted(temporaryPath, key, { readonly: true, fileMustExist: true });
+    try {
+      if (JSON.stringify(databaseCounts(verified)) !== JSON.stringify(expectedCounts) || !findFtsResult(verified)) throw new Error('Encrypted legacy backup verification failed.');
+    } finally { verified.close(); }
+    secureRemovePath(backupPath);
+    fs.renameSync(temporaryPath, backupPath);
+    fs.chmodSync(backupPath, 0o600);
+  } catch (error) {
+    try { secureRemovePath(temporaryPath); } catch {}
+    // A plaintext legacy backup must not remain if encryption or verification fails.
+    try { secureRemovePath(backupPath); } catch {}
     throw error;
   }
 }
@@ -579,9 +608,11 @@ async function encryptPlainDatabase(dbPath, key) {
     fs.renameSync(dbPath, backupPath);
     try { fs.renameSync(temporaryPath, dbPath); }
     catch (error) { fs.renameSync(backupPath, dbPath); throw error; }
+    for (const sidecar of [`${dbPath}-wal`, `${dbPath}-shm`]) { try { secureRemovePath(sidecar); } catch {} }
+    await encryptPlainBackupFile(backupPath, key, expected);
     return backupPath;
   } catch (error) {
-    try { fs.rmSync(temporaryPath, { force: true }); } catch {}
+    try { secureRemovePath(temporaryPath); } catch {}
     throw error;
   }
 }
@@ -630,7 +661,7 @@ async function initializeDatabase(userDataPath = app.getPath('userData'), safeSt
         try {
           openPlain(dbPath, { readonly: true, fileMustExist: true }).close();
           const backupPath = await encryptPlainDatabase(dbPath, key);
-          console.log(`Plaintext database backup preserved at ${backupPath}`);
+          console.log(`Encrypted database backup preserved at ${backupPath}`);
           database = openEncrypted(dbPath, key);
         } catch (error) {
           throw new Error(`Database could not be opened or encrypted: ${String(error?.message || error).split('\n')[0]}`);
@@ -640,6 +671,17 @@ async function initializeDatabase(userDataPath = app.getPath('userData'), safeSt
       database = openEncrypted(dbPath, key);
     }
     databaseKey = key;
+    const legacyBackupPath = `${dbPath}.pre-encryption.bak`;
+    if (fs.existsSync(legacyBackupPath)) {
+      let encrypted = false;
+      try { const backup = openEncrypted(legacyBackupPath, key, { readonly: true, fileMustExist: true }); backup.close(); encrypted = true; } catch {}
+      if (!encrypted) {
+        const plainBackup = openPlain(legacyBackupPath, { readonly: true, fileMustExist: true });
+        const legacyCounts = databaseCounts(plainBackup);
+        plainBackup.close();
+        await encryptPlainBackupFile(legacyBackupPath, key, legacyCounts);
+      }
+    }
     setDatabaseStatus('ready', true);
     getDatabase();
     try {
@@ -707,7 +749,7 @@ async function migrateDatabaseToPassword(userDataPath, password, options = {}) {
   const oldCounts = databaseCounts(getDatabase());
   let backupPath;
   try { backupPath = migrationBackup(userDataPath, keyPath, oldKey).folder; }
-  catch (error) { oldKey.fill(0); fs.rmSync(workDir, { recursive: true, force: true }); throw error; }
+  catch (error) { oldKey.fill(0); secureRemovePath(workDir); throw error; }
   const newKey = randomBytes(32);
   let vaultWritten = false, databaseMoved = false, databaseInstalled = false, oldKeyMoved = false;
   try {
@@ -755,7 +797,7 @@ async function migrateDatabaseToPassword(userDataPath, password, options = {}) {
     setDatabaseStatus('ready', true);
     getDatabase();
     try { fs.rmSync(rollbackDbPath, { force: true }); } catch {}
-    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+    try { secureRemovePath(workDir); } catch {}
     oldKey.fill(0);
     newKey.fill(0);
     return { backupPath, keyBackupPath };
@@ -771,9 +813,9 @@ async function migrateDatabaseToPassword(userDataPath, password, options = {}) {
       try { fs.copyFileSync(keyBackupPath, keyPath, fs.constants.COPYFILE_EXCL); fs.chmodSync(keyPath, 0o600); } catch {}
     }
     if (vaultWritten) { try { fs.rmSync(vaultPath, { force: true }); } catch {} }
-    try { fs.rmSync(pendingPath, { force: true }); } catch {}
+    try { secureRemovePath(pendingPath); } catch {}
     try { fs.rmSync(rollbackDbPath, { force: true }); } catch {}
-    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+    try { secureRemovePath(workDir); } catch {}
     databaseKey = oldKey;
     try {
       database = openEncrypted(dbPath, oldKey);
@@ -840,7 +882,7 @@ async function exportEncryptedRecoveryFile(userDataPath, destinationPath, passwo
     return { path: destinationPath };
   } finally {
     recoveredKey.fill(0);
-    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+    try { secureRemovePath(workDir); } catch {}
   }
 }
 
@@ -877,7 +919,7 @@ function changeMasterPassword(userDataPath, oldPassword, newPassword) {
     } finally { nextKey.fill(0); }
     return { backupPath };
   } catch (error) {
-    try { fs.rmSync(nextVaultPath, { force: true }); } catch {}
+    try { secureRemovePath(nextVaultPath); } catch {}
     if (backupPath && fs.existsSync(path.join(backupPath, 'db.vault.json'))) {
       try { fs.copyFileSync(path.join(backupPath, 'db.vault.json'), vaultPath); fs.chmodSync(vaultPath, 0o600); } catch {}
     }
@@ -971,7 +1013,7 @@ async function restoreEncryptedRecoveryFile(userDataPath, recoveryPath, password
   } finally {
     oldKey?.fill(0);
     nextKey.fill(0);
-    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+    try { secureRemovePath(workDir); } catch {}
   }
 }
 

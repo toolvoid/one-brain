@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { ALLOWED_TIMEOUTS } = require('./auto-lock');
 
-const DEFAULTS = Object.freeze({ autoLockMinutes: 15, lastUnlockAt: null });
+const DEFAULTS = Object.freeze({ autoLockEnabled: true, autoLockMinutes: 15, lockOnSystemLock: true, lastUnlockAt: null });
 
 function createSecuritySettings(userDataPath) {
   const filePath = path.join(userDataPath, 'security-settings.json');
@@ -12,7 +12,9 @@ function createSecuritySettings(userDataPath) {
     try {
       const saved = JSON.parse(fs.readFileSync(filePath, 'utf8'));
       return {
+        autoLockEnabled: saved.autoLockEnabled === undefined ? Number(saved.autoLockMinutes) !== 0 : saved.autoLockEnabled === true,
         autoLockMinutes: ALLOWED_TIMEOUTS.includes(Number(saved.autoLockMinutes)) ? Number(saved.autoLockMinutes) : DEFAULTS.autoLockMinutes,
+        lockOnSystemLock: saved.lockOnSystemLock === undefined ? true : saved.lockOnSystemLock === true,
         lastUnlockAt: typeof saved.lastUnlockAt === 'string' ? saved.lastUnlockAt : null,
       };
     } catch { return { ...DEFAULTS }; }
@@ -21,7 +23,9 @@ function createSecuritySettings(userDataPath) {
     fs.mkdirSync(userDataPath, { recursive: true, mode: 0o700 });
     const current = read();
     const updated = { ...current, ...next };
-    if (!ALLOWED_TIMEOUTS.includes(Number(updated.autoLockMinutes))) throw new Error('Choose 1, 5, 15, 30 minutes, or Never.');
+    updated.autoLockEnabled = updated.autoLockEnabled === true;
+    updated.lockOnSystemLock = updated.lockOnSystemLock === true;
+    if (!ALLOWED_TIMEOUTS.includes(Number(updated.autoLockMinutes))) throw new Error('Choose 1, 5, 15, 30, or 60 minutes.');
     const temporaryPath = `${filePath}.tmp`;
     fs.writeFileSync(temporaryPath, `${JSON.stringify(updated)}\n`, { mode: 0o600 });
     fs.chmodSync(temporaryPath, 0o600);

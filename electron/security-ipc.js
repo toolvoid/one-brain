@@ -24,6 +24,7 @@ function registerSecurityIpc(ipcMain, {
   verifyMasterPassword,
   exportEncryptedRecoveryFile,
   restoreEncryptedRecoveryFile,
+  deleteOldBackups,
   logFailure = () => {},
 }) {
   ipcMain.handle('security:has-master-password', async () => {
@@ -99,10 +100,30 @@ function registerSecurityIpc(ipcMain, {
       return { ok: false, error: safe.message };
     }
   });
+
+  ipcMain.handle('security:delete-old-backups', async (_event, password, confirmation) => {
+    try {
+      if (confirmation !== 'DELETE OLD BACKUPS') return { ok: false, error: 'Type DELETE OLD BACKUPS to confirm.' };
+      if (!fs.existsSync(path.join(getUserDataPath(), 'db.vault.json'))) return { ok: false, error: 'Set a master password first.' };
+      let valid = false;
+      try { valid = await verifyMasterPassword(getUserDataPath(), password); } catch {}
+      if (!valid) {
+        try { logFailure({ operation: 'delete_old_backups', name: 'WrongPasswordError', message: 'Wrong password' }); } catch {}
+        return { ok: false, error: 'Wrong password' };
+      }
+      const deleted = deleteOldBackups(getUserDataPath());
+      return { ok: true, error: null, deleted };
+    } catch (error) {
+      const safe = safeError(error);
+      try { logFailure({ operation: 'delete_old_backups', ...safe }); } catch {}
+      return { ok: false, error: safe.message };
+    }
+  });
 }
 
 function registerUnlockIpc(ipcMain, {
   lockController,
+  getEpoch = () => lockController.getEpoch?.() || 0,
   logEvent = () => {},
   notifyUnlocked = () => {},
   delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -110,7 +131,7 @@ function registerUnlockIpc(ipcMain, {
   onLockNow = () => {},
 }) {
   let failures = 0;
-  ipcMain.handle('security:startup-state', async () => ({ ok: true, error: null, locked: lockController.isLocked() }));
+  ipcMain.handle('security:startup-state', async () => ({ ok: true, error: null, locked: lockController.isLocked(), epoch: getEpoch() }));
   ipcMain.handle('security:unlock', async (_event, password) => {
     let ok = false;
     try { ok = await lockController.unlock(password); } catch { ok = false; }

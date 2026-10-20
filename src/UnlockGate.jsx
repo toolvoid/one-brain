@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import App from './App.jsx';
 
 function UnlockScreen() {
@@ -32,18 +32,37 @@ function UnlockScreen() {
   </main>;
 }
 
+function AutoLockWarningToast() {
+  const [visible, setVisible] = useState(false);
+  useEffect(() => window.brain.onAutoLockWarning(setVisible), []);
+  if (!visible) return null;
+  return <aside role="status" aria-live="polite" style={{ position: 'fixed', zIndex: 2000, right: 18, bottom: 18, display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', border: '1px solid #425a78', borderRadius: 10, background: '#172336', color: '#edf4ff', boxShadow: '0 10px 35px #0008', fontFamily: 'system-ui, sans-serif', fontSize: 13 }}>
+    <span>Locks in 1 min</span><button type="button" onClick={async () => { await window.brain.stayUnlocked(); setVisible(false); }}>Stay unlocked</button>
+  </aside>;
+}
+
 export default function UnlockGate() {
   const [state, setState] = useState('checking');
+  const latestEpoch = useRef(-1);
   useEffect(() => {
-    const unlistenUnlocked = window.brain.onUnlocked(() => setState('unlocked'));
-    const unlistenLocked = window.brain.onLocked(() => setState('locked'));
+    const applyLockEvent = (nextState, epoch) => {
+      if (Number.isSafeInteger(epoch)) {
+        if (epoch < latestEpoch.current) return;
+        latestEpoch.current = epoch;
+      }
+      setState(nextState);
+    };
+    const unlistenUnlocked = window.brain.onUnlocked((epoch) => applyLockEvent('unlocked', epoch));
+    const unlistenLocked = window.brain.onLocked((epoch) => applyLockEvent('locked', epoch));
     window.brain.getSecurityStartupState().then((result) => {
-      if (result?.ok) setState(result.locked ? 'locked' : 'unlocked');
-      else setState('locked');
-    }).catch(() => setState('locked'));
+      if (result?.ok && Number(result.epoch) >= latestEpoch.current) {
+        latestEpoch.current = Math.max(latestEpoch.current, Number(result.epoch) || 0);
+        setState(result.locked ? 'locked' : 'unlocked');
+      } else if (!result?.ok && latestEpoch.current < 0) setState('locked');
+    }).catch(() => { if (latestEpoch.current < 0) setState('locked'); });
     return () => { unlistenUnlocked(); unlistenLocked(); };
   }, []);
   if (state === 'locked') return <UnlockScreen />;
   if (state !== 'unlocked') return <main role="status" style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: '#0b0f16', color: '#e8edf4', fontFamily: 'system-ui, sans-serif' }}>Starting One Brain…</main>;
-  return <App />;
+  return <><App /><AutoLockWarningToast /></>;
 }

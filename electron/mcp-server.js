@@ -272,7 +272,14 @@ async function handleRequest(request, response, token, dependencies) {
 
 function listen(port, token, dependencies) {
   return new Promise((resolve, reject) => {
-    const server = http.createServer((request, response) => { void handleRequest(request, response, token, dependencies); });
+    const server = http.createServer((request, response) => {
+      dependencies.onActivity?.();
+      const finishActivity = dependencies.beginActivity?.();
+      void handleRequest(request, response, token, dependencies).catch(() => {
+        if (!response.headersSent) sendJson(response, 500, { error: 'MCP request failed.' });
+        else response.destroy();
+      }).finally(() => finishActivity?.());
+    });
     server.once('error', reject);
     server.once('close', () => {
       for (const session of mcpSessions.values()) {

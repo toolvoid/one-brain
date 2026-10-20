@@ -53,15 +53,24 @@ test('window visibility lifecycle events preserve event and window name only', (
   assert.doesNotMatch(fs.readFileSync(log.filePath, 'utf8'), /private page text|synthetic-secret/);
 });
 
-test('vault lock and unlock events log only the allowed lock reason', (t) => {
+test('vault lock events include reason and idle duration without secrets', (t) => {
   const directory = temporaryDirectory(t);
   const log = createLifecycleLog(directory);
-  log.append('vault_locked', { reason: 'suspend', password: 'not-a-secret-to-log' });
+  log.append('vault_locked', { reason: 'suspend', elapsedIdleMs: 91234, password: 'not-a-secret-to-log' });
   log.append('vault_locked', { reason: 'other', memory: 'must not be logged' });
   log.append('vault_unlocked', { password: 'not-a-secret-to-log' });
   const records = log.tail(3).map((line) => JSON.parse(line));
-  assert.deepEqual(records.map(({ event, reason }) => [event, reason]), [['vault_locked', 'suspend'], ['vault_locked', undefined], ['vault_unlocked', undefined]]);
+  assert.deepEqual(records.map(({ event, reason, elapsedIdleMs }) => [event, reason, elapsedIdleMs]), [['vault_locked', 'suspend', 91234], ['vault_locked', undefined, undefined], ['vault_unlocked', undefined, undefined]]);
   assert.doesNotMatch(fs.readFileSync(log.filePath, 'utf8'), /not-a-secret-to-log|must not be logged/);
+});
+
+test('renderer error lifecycle event keeps a redacted error and source location', (t) => {
+  const directory = temporaryDirectory(t);
+  const log = createLifecycleLog(directory);
+  log.append('renderer_error', { name: 'TypeError', message: 'password=TOPSECRET token=ghp_123456789012345', source: 'sandbox_bundle', line: 2 });
+  const entry = JSON.parse(log.tail(1)[0]);
+  assert.deepEqual([entry.name, entry.message, entry.source, entry.line], ['TypeError', 'password=[REDACTED] token=[REDACTED]', 'sandbox_bundle', 2]);
+  assert.doesNotMatch(fs.readFileSync(log.filePath, 'utf8'), /TOPSECRET|ghp_/);
 });
 
 test('lifecycle log trims oversized files already present at startup', (t) => {

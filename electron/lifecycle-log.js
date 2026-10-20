@@ -33,7 +33,7 @@ function safeDetails(event, details = {}) {
     safe.isMainFrame = Boolean(details.isMainFrame);
   }
   if (event === 'vault_operation_failed') {
-    if (['set_password', 'change_password', 'export_recovery', 'restore_recovery'].includes(details.operation)) safe.operation = details.operation;
+    if (['set_password', 'change_password', 'export_recovery', 'restore_recovery', 'delete_old_backups'].includes(details.operation)) safe.operation = details.operation;
     if (/^[\w.-]{1,40}$/.test(String(details.name || ''))) safe.name = String(details.name);
     if (typeof details.message === 'string') {
       safe.message = details.message
@@ -43,7 +43,22 @@ function safeDetails(event, details = {}) {
         .slice(0, 200);
     }
   }
-  if (event === 'vault_locked' && ['idle', 'manual', 'suspend'].includes(details.reason)) safe.reason = details.reason;
+  if (event === 'vault_locked' && ['idle', 'manual', 'suspend'].includes(details.reason)) {
+    safe.reason = details.reason;
+    if (Number.isFinite(Number(details.elapsedIdleMs))) safe.elapsedIdleMs = Math.max(0, Math.floor(Number(details.elapsedIdleMs)));
+  }
+  if (event === 'renderer_error') {
+    if (/^[\w.$-]{1,60}$/.test(String(details.name || ''))) safe.name = String(details.name);
+    if (/^[\w.-]{1,100}$/.test(String(details.source || ''))) safe.source = String(details.source);
+    if (Number.isFinite(Number(details.line)) && Number(details.line) > 0) safe.line = Math.floor(Number(details.line));
+    if (typeof details.message === 'string') safe.message = details.message
+      .replace(/\b(password|passphrase|token|key|api[_ -]?key|secret|private[_ -]?key)\b\s*[:=]\s*[^\s,;&]+/gi, '$1=[REDACTED]')
+      .replace(/\bBearer\s+[^\s,;&]+/gi, 'Bearer [REDACTED]')
+      .replace(/\b(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b/g, '[REDACTED]')
+      .replace(/\b[A-Fa-f0-9]{40,}\b/g, '[REDACTED]')
+      .slice(0, 200);
+  }
+  if (['user_data_permissions_fixed', 'user_data_permissions_failed'].includes(event) && Number.isFinite(Number(details.count))) safe.count = Math.max(0, Math.floor(Number(details.count)));
   if (['window_created', 'window_closed', 'window_unresponsive', 'window_shown', 'window_hidden', 'window_minimized', 'window_restored'].includes(event)) {
     safe.window = String(details.window || 'main').slice(0, 32);
   }

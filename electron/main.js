@@ -1,9 +1,16 @@
+process.umask(0o077);
+const { enforcePrivateTree, cleanupSensitiveTemps } = require('./private-files');
 const { app, powerMonitor } = require('electron');
 const path = require('path');
 const fs = require('node:fs');
 const { createLifecycleLog, instrumentAppExitCalls } = require('./lifecycle-log');
-const lifecycleLog = createLifecycleLog(app.getPath('userData'));
+const userDataRoot = app.getPath('userData');
+const userDataPermissionFix = enforcePrivateTree(userDataRoot);
+cleanupSensitiveTemps(userDataRoot);
+const lifecycleLog = createLifecycleLog(userDataRoot);
 lifecycleLog.append('app_start');
+if (userDataPermissionFix.changed.length) lifecycleLog.append('user_data_permissions_fixed', { count: userDataPermissionFix.changed.length });
+if (userDataPermissionFix.failed.length) lifecycleLog.append('user_data_permissions_failed', { count: userDataPermissionFix.failed.length });
 instrumentAppExitCalls(app, lifecycleLog);
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
@@ -14,7 +21,7 @@ const { getGraphicsStartupConfig, recordGpuCrash, registerShortcutWithFallback }
 const { createCrashLoopLimiter } = require('./window-lifecycle');
 const { rendererErrorLocation, rendererErrorMessage } = require('./renderer-errors');
 const { readGraphicsSettings, writeGraphicsSettings } = require('./graphics-settings');
-const graphicsUserDataPath = app.getPath('userData');
+const graphicsUserDataPath = userDataRoot;
 let graphicsSettings = readGraphicsSettings(graphicsUserDataPath);
 const graphicsStartupConfig = getGraphicsStartupConfig(process.platform, { ...process.env, argv: process.argv }, graphicsSettings);
 let gpuCrashCount = 0;
@@ -47,6 +54,7 @@ const { migrateDatabaseToPassword, verifyMasterPassword, unlockDatabaseWithPassw
 const { createAutoLockMonitor } = require('./auto-lock');
 const { attachSystemLockEvents } = require('./system-lock');
 const { createSecuritySettings } = require('./security-settings');
+const { deleteOldBackups: deleteOldBackupFiles } = require('./private-files');
 
 let mcpConnection;
 let memoryProxy;
@@ -65,12 +73,19 @@ let mainWindow = null;
 let recoveryPageShown = false;
 const mainWindowCrashLimiter = createCrashLoopLimiter({ maxRestarts: 3, windowMs: 60_000 });
 const pendingReloads = new WeakSet();
-const securitySettings = createSecuritySettings(app.getPath('userData'));
+const securitySettings = createSecuritySettings(userDataRoot);
 let autoLockMonitor = null;
 let detachSystemLockEvents = () => {};
-const lockIfVaultConfigured = (reason) => fs.existsSync(path.join(app.getPath('userData'), 'db.vault.json')) && lockController.lock(reason);
+const lockIfVaultConfigured = (reason, elapsedIdleMs) => fs.existsSync(path.join(userDataRoot, 'db.vault.json')) && lockController.lock(reason, elapsedIdleMs);
 
 function logChildProcessSpawn(command) { lifecycleLog.append('child_process_spawn', { command }); }
+
+function recordRendererError(error, source, line = null) {
+  const detail = rendererErrorMessage(`${error?.name || 'Error'}: ${error?.message || error || 'Renderer error'}`);
+  const safeSource = path.basename(String(source || 'renderer')).slice(0, 100);
+  console.error(`One Brain renderer ${detail.name}: ${detail.message} at ${safeSource}${line ? `:${line}` : ''}`);
+  lifecycleLog.append('renderer_error', { ...detail, source: safeSource, line });
+}
 
 function focusExistingMainWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) return false;
@@ -101,6 +116,7 @@ function attachWindowLifecycle(win, windowName) {
   win.on('hide', () => lifecycleLog.append('window_hidden', { window: windowName }));
   win.on('minimize', () => lifecycleLog.append('window_minimized', { window: windowName }));
   win.on('restore', () => lifecycleLog.append('window_restored', { window: windowName }));
+  win.webContents.on('preload-error', (_event, preloadPath, error) => recordRendererError(error, path.basename(preloadPath || 'preload.js')));
   win.webContents.on('did-start-navigation', (navigationEvent, legacyUrl, _legacyIsInPlace, legacyIsMainFrame) => {
     const url = navigationEvent?.url || legacyUrl;
     const isMainFrame = typeof navigationEvent?.isMainFrame === 'boolean' ? navigationEvent.isMainFrame : legacyIsMainFrame !== false;
@@ -199,7 +215,7 @@ function createQuickContextWindow() {
   if (quickContextWindow && !quickContextWindow.isDestroyed()) { quickContextWindow.show(); quickContextWindow.focus(); return; }
   quickContextWindow = new BrowserWindow({ width: 470, height: 570, minWidth: 390, minHeight: 420, alwaysOnTop: true, skipTaskbar: true,
     title: 'Quick context', autoHideMenuBar: true,
-    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false } });
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   attachWindowLifecycle(quickContextWindow, 'quick-context');
   quickContextWindow.loadFile(path.join(__dirname, 'quick-context.html'));
   quickContextWindow.on('closed', () => { quickContextWindow = null; });
@@ -389,11 +405,20 @@ ipcMain.handle('security:status', () => {
   const settings = securitySettings.read();
   let backend = 'unknown';
   try { backend = safeStorage.getSelectedStorageBackend?.() || (safeStorage.isEncryptionAvailable() ? 'safeStorage' : 'basic_text'); } catch { backend = 'unavailable'; }
-  return { ok: true, error: null, locked: lockController.isLocked(), vaultSet: fs.existsSync(path.join(app.getPath('userData'), 'db.vault.json')), backend, lastUnlockAt: settings.lastUnlockAt, autoLockMinutes: settings.autoLockMinutes };
+  return { ok: true, error: null, locked: lockController.isLocked(), vaultSet: fs.existsSync(path.join(userDataRoot, 'db.vault.json')), oldBackupsExist: fs.existsSync(path.join(userDataRoot, 'migration-backups')) || fs.existsSync(path.join(userDataRoot, 'db.key.bak')) || fs.existsSync(path.join(userDataRoot, '.precleanup-backups')), backend, lastUnlockAt: settings.lastUnlockAt, ...settings };
 });
 ipcMain.handle('security:set-auto-lock', (_event, minutes) => {
-  try { return { ok: true, error: null, ...securitySettings.write({ autoLockMinutes: Number(minutes) }) }; }
+  try { return { ok: true, error: null, ...securitySettings.write(typeof minutes === 'object' && minutes ? minutes : { autoLockMinutes: Number(minutes) }) }; }
   catch (error) { return { ok: false, error: error?.message || 'Could not save auto-lock setting.' }; }
+});
+ipcMain.handle('security:stay-unlocked', () => {
+  autoLockMonitor?.touchActivity();
+  return { ok: true, error: null };
+});
+ipcMain.on('security:activity', (event) => {
+  const window = BrowserWindow.fromWebContents(event.sender);
+  if (!window || window.isDestroyed() || event.senderFrame !== event.sender.mainFrame || lockController.isLocked()) return;
+  autoLockMonitor?.touchActivity();
 });
 registerSecurityIpc(ipcMain, {
   getUserDataPath: () => app.getPath('userData'),
@@ -405,12 +430,13 @@ registerSecurityIpc(ipcMain, {
   verifyMasterPassword,
   exportEncryptedRecoveryFile,
   restoreEncryptedRecoveryFile,
+  deleteOldBackups: deleteOldBackupFiles,
   logFailure: (details) => lifecycleLog.append('vault_operation_failed', details),
 });
 registerUnlockIpc(ipcMain, {
   lockController,
   logEvent: (event) => lifecycleLog.append(event),
-  notifyUnlocked: () => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:unlocked'); },
+  notifyUnlocked: () => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:unlocked', lockController.getEpoch()); },
   onLockNow: () => lockIfVaultConfigured('manual'),
 });
 ipcMain.handle('app:quit', () => { app.quit(); return true; });
@@ -514,7 +540,8 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      sandbox: true
     }
   });
   mainWindow = win;
@@ -523,10 +550,7 @@ function createWindow() {
   win.once('ready-to-show', () => { if (!win.isDestroyed()) { win.show(); win.focus(); } });
   win.webContents.on('console-message', (details) => {
     const location = rendererErrorLocation(details.level, details.lineNumber, details.sourceId);
-    if (location) {
-      const error = rendererErrorMessage(details.message);
-      console.error(`One Brain renderer ${error.name} at ${location.source}${location.line ? `:${location.line}` : ''}: ${error.message}`);
-    }
+    if (location) recordRendererError(new Error(details.message), location.source, location.line);
   });
 
   if (!app.isPackaged) {
@@ -558,18 +582,20 @@ app.whenReady().then(async () => {
   const userDataPath = app.getPath('userData');
   lockController.configure({
     verifyPassword: async (password) => { try { return verifyMasterPassword(userDataPath, password); } catch { return false; } },
-    onLock: (reason) => {
+    onLock: (reason, details) => {
       ++embedderGeneration;
       const previous = embedder;
       embedder = null;
       try { void previous?.close(); } catch {}
       lockDatabase();
-      if (['idle', 'manual', 'suspend'].includes(reason)) lifecycleLog.append('vault_locked', { reason });
-      for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:locked');
+      cleanupSensitiveTemps(userDataRoot);
+      if (['idle', 'manual', 'suspend'].includes(reason)) lifecycleLog.append('vault_locked', { reason, elapsedIdleMs: details?.elapsedIdleMs ?? autoLockMonitor?.getIdleMs() });
+      for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:locked', lockController.getEpoch(), reason);
     },
     onUnlock: async (password) => {
       await unlockDatabaseWithPassword(userDataPath, password);
       securitySettings.write({ lastUnlockAt: new Date().toISOString() });
+      autoLockMonitor?.reset();
       startEmbedder();
     }
   });
@@ -579,11 +605,12 @@ app.whenReady().then(async () => {
 
   if (!lockController.isLocked()) startEmbedder();
   autoLockMonitor = createAutoLockMonitor({
-    getSystemIdleSeconds: () => powerMonitor.getSystemIdleTime(),
+    getEnabled: () => securitySettings.read().autoLockEnabled,
     getTimeoutMinutes: () => fs.existsSync(path.join(userDataPath, 'db.vault.json')) ? securitySettings.read().autoLockMinutes : 0,
     lock: lockIfVaultConfigured,
+    onWarning: (visible) => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:auto-lock-warning', visible); },
   });
-  detachSystemLockEvents = attachSystemLockEvents(powerMonitor, () => lockIfVaultConfigured('suspend'));
+  detachSystemLockEvents = attachSystemLockEvents(powerMonitor, () => { if (securitySettings.read().lockOnSystemLock) lockIfVaultConfigured('suspend'); });
   try { globalShortcut.register('CommandOrControl+Shift+L', () => lockIfVaultConfigured('manual')); } catch {}
   try { applyQuickContextSettings(readQuickContextSettings()); } catch { /* Keep the app usable if the OS reserves the selected shortcut. */ }
   createWindow();
@@ -616,6 +643,7 @@ app.whenReady().then(async () => {
   });
 
   memoryProxy = createMemoryProxy({ userDataPath, safeStorage, authenticateClientToken, extensionApi,
+    onActivity: () => autoLockMonitor?.touchActivity(), beginActivity: () => autoLockMonitor?.beginActivity(),
     getClientProfile: getProxyClientProfile, searchMemoriesForClient, getMemoryForClient, recordProxyEvent: recordDashboardEvent,
     addPendingMemory: async (item) => {
       const result = await addPendingMemory(item);
@@ -631,6 +659,7 @@ app.whenReady().then(async () => {
 
   startMcpServer(app.getPath('userData'), connectorAppPath(), {
     onSpawn: logChildProcessSpawn,
+    onActivity: () => autoLockMonitor?.touchActivity(), beginActivity: () => autoLockMonitor?.beginActivity(),
     searchMemoriesForClient, getEmbeddingVector: getMemoryEmbeddingVector,
     embedText: (text) => embedder?.embed(text) || Promise.reject(new Error('Local embedder is unavailable.')),
     listMemories, addMemory, connectionActivity,
@@ -657,6 +686,7 @@ app.whenReady().then(async () => {
   globalShortcut.unregisterAll();
   autoLockMonitor?.stop();
   detachSystemLockEvents();
+  cleanupSensitiveTemps(userDataRoot);
   lockController.lock('quit');
   if (mcpConnection?.server.listening) mcpConnection.server.close();
   embedder?.close();

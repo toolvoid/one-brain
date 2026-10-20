@@ -114,7 +114,7 @@ function candidateSafe(item) {
 function createMemoryProxy(options) {
   const { userDataPath, safeStorage, authenticateClientToken, getClientProfile, searchMemoriesForClient,
     getMemoryForClient, recordProxyEvent, addPendingMemory, fetchImpl = globalThis.fetch,
-    providerUrls = PROVIDER_URLS, searchTimeoutMs = 800, titleTimeoutMs = 3000, listenPort = null, extensionApi = null } = options;
+    providerUrls = PROVIDER_URLS, searchTimeoutMs = 800, titleTimeoutMs = 3000, listenPort = null, extensionApi = null, onActivity = () => {}, beginActivity = () => null } = options;
   const settingsPath = path.join(userDataPath, 'memory-proxy-settings.json');
   const keysPath = path.join(userDataPath, 'provider-keys.enc');
   const inFlightUpstream = new Set();
@@ -273,6 +273,7 @@ function createMemoryProxy(options) {
   }
 
   async function handle(req, res) {
+    onActivity();
     if (lockController.isLocked()) return sendJson(res, 423, { error: 'One Brain is locked. Unlock it to access your data.', code: 'ONE_BRAIN_LOCKED' });
     if (extensionApi && new URL(req.url, 'http://127.0.0.1').pathname.startsWith('/ext/')) {
       await extensionApi.handle(req, res);
@@ -459,7 +460,8 @@ function createMemoryProxy(options) {
     let previous = Number(safeReadJson(portFile, null));
     if (!Number.isInteger(previous) || previous < 1 || previous > 65535) previous = 0;
     const server = http.createServer((req, res) => {
-      void handle(req, res).catch(() => { if (!res.headersSent) sendJson(res, 500, { error: 'Local proxy request failed.' }); else res.destroy(); });
+      const finishActivity = beginActivity();
+      void handle(req, res).catch(() => { if (!res.headersSent) sendJson(res, 500, { error: 'Local proxy request failed.' }); else res.destroy(); }).finally(() => finishActivity?.());
     });
     const candidates = [...new Set([listenPort == null ? (previous || 3738) : listenPort, 3738, 0])];
     let lastError;

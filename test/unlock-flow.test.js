@@ -20,7 +20,7 @@ test('vault startup stays open with no windows and exposes only the locked start
   registerUnlockIpc({ handle: (channel, handler) => handlers.set(channel, handler) }, { lockController });
   try {
     assert.equal(fs.existsSync(path.join(root, 'db.vault.json')), true);
-    assert.deepEqual(await handlers.get('security:startup-state')(), { ok: true, error: null, locked: true });
+    assert.deepEqual(await handlers.get('security:startup-state')(), { ok: true, error: null, locked: true, epoch: lockController.getEpoch() });
     handleAllWindowsClosed({ platform: 'linux', isLocked: lockController.isLocked, quit: () => { quitCalls++; } });
     assert.equal(quitCalls, 0);
     assert.equal(lockController.isLocked(), true);

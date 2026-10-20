@@ -4,6 +4,7 @@ let locked = false;
 let verifyPassword = null;
 let onLock = () => {};
 let onUnlock = () => {};
+let lockEpoch = 0;
 const lockListeners = new Set();
 
 function configure(hooks = {}) {
@@ -13,11 +14,13 @@ function configure(hooks = {}) {
 }
 
 function isLocked() { return locked; }
+function getEpoch() { return lockEpoch; }
 
-function lock(reason = 'manual') {
+function lock(reason = 'manual', elapsedIdleMs) {
   if (locked) return false;
   locked = true;
-  try { onLock(reason); } catch { /* A failed cleanup must never reopen access. */ }
+  lockEpoch += 1;
+  try { onLock(reason, { elapsedIdleMs: Number.isFinite(Number(elapsedIdleMs)) ? Math.max(0, Number(elapsedIdleMs)) : null }); } catch { /* A failed cleanup must never reopen access. */ }
   for (const listener of lockListeners) { try { listener(reason); } catch {} }
   return true;
 }
@@ -29,8 +32,9 @@ async function unlock(password) {
   try { valid = await verifyPassword(password); } catch { valid = false; }
   if (!valid) return false;
   locked = false;
+  lockEpoch += 1;
   try { await onUnlock(password); }
-  catch { locked = true; try { onLock(); } catch {} return false; }
+  catch { locked = true; lockEpoch += 1; try { onLock(); } catch {} return false; }
   return true;
 }
 
@@ -43,6 +47,6 @@ function assertUnlocked() {
 }
 
 function onLocked(listener) { lockListeners.add(listener); return () => lockListeners.delete(listener); }
-function resetForTest() { locked = false; verifyPassword = null; onLock = () => {}; onUnlock = () => {}; lockListeners.clear(); }
+function resetForTest() { locked = false; lockEpoch = 0; verifyPassword = null; onLock = () => {}; onUnlock = () => {}; lockListeners.clear(); }
 
-module.exports = { configure, isLocked, lock, unlock, assertUnlocked, onLocked, resetForTest };
+module.exports = { configure, isLocked, getEpoch, lock, unlock, assertUnlocked, onLocked, resetForTest };

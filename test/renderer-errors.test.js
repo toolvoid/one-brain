@@ -17,4 +17,16 @@ test('renderer diagnostics include a redacted and truncated error name and messa
   assert.match(result.message, /key=\[REDACTED\]/);
   assert.doesNotMatch(result.message, /TOPSECRET|ghp_123456789012345|abcdef/);
   assert.equal(result.message.length, 200);
+  const wrapped = rendererErrorMessage('One Brain UI render failed: TypeError: token=ghp_123456789012345 at App.jsx:4');
+  assert.equal(wrapped.name, 'TypeError');
+  assert.equal(wrapped.message, 'token=[REDACTED] at App.jsx:4');
+});
+
+test('React render failure logger reports sanitized name and message', async () => {
+  const { sanitizeRendererError } = await import('../src/lib/error-sanitizer.mjs');
+  const result = sanitizeRendererError(Object.assign(new Error('password=TOPSECRET; token=ghp_123456789012345'), { name: 'TypeError' }));
+  assert.equal(result.name, 'TypeError');
+  assert.equal(result.message, 'password=[REDACTED]; token=[REDACTED]');
+  assert.doesNotMatch(result.message, /TOPSECRET|ghp_/);
+  assert.equal(sanitizeRendererError(new Error('x'.repeat(240))).message.length, 200);
 });

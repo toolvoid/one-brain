@@ -23,9 +23,9 @@ function rendererErrorMessage(message) {
     .replace(/\b(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b/g, '[REDACTED]')
     .replace(/\b[A-Fa-f0-9]{40,}\b/g, '[REDACTED]')
     .trim();
-  const match = value.match(/^([A-Za-z_$][\w.$]*Error)\s*:\s*/);
+  const match = value.match(/(?:^|:\s*)([A-Za-z_$][\w.$]*(?:Error|Exception))\s*:\s*/);
   const name = match ? match[1].slice(0, 60) : 'RendererError';
-  const detail = (match ? value.slice(match[0].length) : value).slice(0, 200);
+  const detail = (match ? value.slice(match.index + match[0].length) : value).slice(0, 200);
   return { name, message: detail || 'Renderer error' };
 }
 

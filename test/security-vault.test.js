@@ -44,15 +44,41 @@ test('idle lock blocks guarded access until unlock', () => {
   assert.doesNotThrow(() => state.assertUnlocked());
 });
 
-test('auto-lock checks the selected timeout and Never disables the timer lock', () => {
-  let tick, idleSeconds = 0, timeout = 1;
-  const reasons = [];
-  const monitor = createAutoLockMonitor({ getSystemIdleSeconds: () => idleSeconds, getTimeoutMinutes: () => timeout,
-    lock: (reason) => { reasons.push(reason); return true; }, setIntervalImpl: (callback) => { tick = callback; return 1; }, clearIntervalImpl: () => {} });
-  idleSeconds = 59; tick(); assert.deepEqual(reasons, []);
-  idleSeconds = 60; tick(); assert.deepEqual(reasons, ['idle']);
-  timeout = 0; idleSeconds = 3600; tick(); assert.deepEqual(reasons, ['idle']);
+test('auto-lock switch gates idle locking; AI activity resets the timer and warning toast', () => {
+  let tick, time = 0, enabled = false;
+  const reasons = [], warnings = [];
+  const monitor = createAutoLockMonitor({ getEnabled: () => enabled, getTimeoutMinutes: () => 1, now: () => time,
+    onWarning: (visible) => warnings.push(visible), lock: (reason) => { reasons.push(reason); return true; },
+    setIntervalImpl: (callback) => { tick = callback; return 1; }, clearIntervalImpl: () => {} });
+  time = 60_000; tick(); assert.deepEqual(reasons, [], 'OFF means no idle lock');
+  enabled = true;
+  const finishAI = monitor.beginActivity();
+  time = 3_600_000; tick(); assert.deepEqual(reasons, [], 'an in-flight AI request prevents idle lock');
+  finishAI();
+  time += 59_000; tick(); assert.deepEqual(reasons, []); assert.deepEqual(warnings, [true]);
+  monitor.touchActivity(); assert.deepEqual(warnings, [true, false], 'new activity dismisses the warning');
+  time += 60_000; tick(); assert.deepEqual(reasons, ['idle']);
+  const toastSource = fs.readFileSync(path.join(__dirname, '../src/UnlockGate.jsx'), 'utf8');
+  assert.match(toastSource, /Locks in 1 min/);
+  assert.match(toastSource, /Stay unlocked/);
   monitor.stop();
+});
+
+test('lock then unlock after a long idle stays unlocked for five seconds on a fake clock', async () => {
+  let tick, time = 0, locks = 0;
+  lockController.resetForTest();
+  let monitor;
+  lockController.configure({ verifyPassword: async (password) => password === 'correct',
+    onLock: () => { locks++; }, onUnlock: async () => monitor.reset() });
+  monitor = createAutoLockMonitor({ getEnabled: () => true, getTimeoutMinutes: () => 1, now: () => time,
+    lock: (reason, elapsedIdleMs) => lockController.lock(reason, elapsedIdleMs), setIntervalImpl: (callback) => { tick = callback; return 1; }, clearIntervalImpl: () => {} });
+  try {
+    time = 60_000; tick(); assert.equal(lockController.isLocked(), true); assert.equal(locks, 1, 'long idle reaches the lock threshold');
+    assert.equal(await lockController.unlock('correct'), true);
+    for (let elapsed = 1000; elapsed <= 5000; elapsed += 1000) { time = 60_000 + elapsed; tick(); }
+    assert.equal(lockController.isLocked(), false, 'the stale idle timestamp must not immediately lock again');
+    assert.equal(locks, 1);
+  } finally { monitor.stop(); lockController.resetForTest(); }
 });
 
 test('manual Lock now records manual reason and enters locked state', () => {

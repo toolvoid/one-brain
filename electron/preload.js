@@ -1,16 +1,53 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
+const INVOKE_CHANNELS = new Set([
+  'lifecycle:tail', 'graphics:get-settings', 'graphics:set-safe-mode', 'graphics:acknowledge-restart-notice',
+  'memories:add', 'imports:create', 'memories:import', 'imports:finish', 'imports:list', 'imports:undo',
+  'legacy-cleanup:status', 'legacy-cleanup:run', 'links:list', 'links:create', 'links:delete',
+  'suggestions:list', 'suggestions:accept', 'suggestions:join-all', 'suggestions:reject', 'suggestions:list-rejected', 'suggestions:restore', 'suggestions:dismiss-all',
+  'memories:delete', 'memories:set-private', 'memories:set-no-suggest', 'memories:move-source', 'memories:conversation-parts:count', 'memories:conversation-parts:delete',
+  'memories:list', 'memories:search', 'memories:count-by-source', 'mcp:config', 'connectors:list', 'connections:activity', 'connections:counts', 'connections:clear-activity', 'connections:log', 'connections:rotate-all', 'connections:rotate-preview',
+  'connectors:preview', 'connectors:connect', 'connectors:test', 'connectors:disconnect-preview', 'connectors:disconnect', 'connectors:snippet', 'connectors:revoke-token', 'connectors:rotate-token',
+  'extension:check', 'embeddings:status', 'embeddings:retry', 'database:status', 'security:set-master-password', 'security:has-master-password', 'security:export-recovery', 'security:change-master-password', 'security:restore-recovery', 'security:status', 'security:set-auto-lock', 'security:stay-unlocked', 'security:lock-now', 'security:delete-old-backups', 'security:startup-state', 'security:unlock', 'app:quit',
+  'clients:list', 'clients:approve', 'clients:grant', 'clients:update', 'clients:remove-legacy', 'analytics:insights', 'analytics:run-sql', 'analytics:reset-retrieval-counts',
+  'evaluation:cases', 'evaluation:add-case', 'evaluation:update-case', 'evaluation:delete-case', 'evaluation:recent-queries', 'evaluation:history', 'evaluation:update-note', 'evaluation:run', 'evaluation:run-results',
+  'memory-proxy:settings', 'memory-proxy:update-settings', 'memory-proxy:save-key', 'memory-proxy:delete-key', 'memory-proxy:test-key', 'extension:status', 'extension:pair-code', 'extension:revoke', 'extension:rotate',
+  'quick-context:settings', 'quick-context:open', 'quick-context:update-settings', 'quick-context:search', 'quick-context:copy', 'quick-context:close',
+  'chat:models', 'chat:generate-title', 'chat:grant', 'chat:grant-save', 'chat:list', 'chat:create', 'chat:update', 'chat:delete', 'chat:send', 'chat:stop', 'chat:save-memory',
+  'pending-memories:list', 'pending-memories:approve', 'pending-memories:set-source', 'pending-memories:reject'
+]);
+const EVENT_CHANNELS = new Set(['brain:locked', 'brain:unlocked', 'brain:auto-lock-warning', 'graphics:safe-mode-enabled', 'chat:chunk', 'brain:embedding-status', 'brain:retrieved', 'brain:changed', 'brain:client-pending', 'brain:pending-memories-changed']);
+const SEND_CHANNELS = new Set(['security:activity']);
+
 const lockedListeners = new Set();
 const unlockedListeners = new Set();
-function notify(listeners) { for (const listener of listeners) { try { listener(); } catch {} } }
-ipcRenderer.on('brain:locked', () => notify(lockedListeners));
-ipcRenderer.on('brain:unlocked', () => notify(unlockedListeners));
+const autoLockWarningListeners = new Set();
+function notify(listeners, ...args) { for (const listener of listeners) { try { listener(...args); } catch {} } }
+function listen(channel, listener) {
+  if (!EVENT_CHANNELS.has(channel)) throw new Error('Preload event channel is not allowed.');
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+}
+listen('brain:locked', (_event, epoch) => {
+  notify(lockedListeners, epoch);
+});
+listen('brain:unlocked', (_event, epoch) => {
+  notify(unlockedListeners, epoch);
+});
+listen('brain:auto-lock-warning', (_event, visible) => { for (const listener of autoLockWarningListeners) { try { listener(Boolean(visible)); } catch {} } });
+let lastActivitySent = 0;
+function sendUserActivity() {
+  const now = Date.now();
+  if (now - lastActivitySent < 1000) return;
+  lastActivitySent = now;
+  if (SEND_CHANNELS.has('security:activity')) ipcRenderer.send('security:activity');
+}
+for (const eventName of ['pointerdown', 'keydown', 'input', 'wheel', 'touchstart']) {
+  window.addEventListener(eventName, sendUserActivity, { capture: true, passive: true });
+}
 function invoke(channel, ...args) {
-  return ipcRenderer.invoke(channel, ...args).catch((error) => {
-    const message = String(error?.message || error || '');
-    if (Number(error?.status) === 423 || error?.code === 'ONE_BRAIN_LOCKED' || /ONE_BRAIN_LOCKED|423|One Brain is locked/i.test(message)) notify(lockedListeners);
-    throw error;
-  });
+  if (!INVOKE_CHANNELS.has(channel)) return Promise.reject(new Error('Preload IPC channel is not allowed.'));
+  return ipcRenderer.invoke(channel, ...args);
 }
 
 contextBridge.exposeInMainWorld('brain', {
@@ -20,8 +57,7 @@ contextBridge.exposeInMainWorld('brain', {
   acknowledgeGraphicsRestartNotice: () => invoke('graphics:acknowledge-restart-notice'),
   onGraphicsSafeModeEnabled: (callback) => {
     const listener = () => callback();
-    ipcRenderer.on('graphics:safe-mode-enabled', listener);
-    return () => ipcRenderer.removeListener('graphics:safe-mode-enabled', listener);
+    return listen('graphics:safe-mode-enabled', listener);
   },
   addMemory: (memory) => invoke('memories:add', memory),
   createImport: (source) => invoke('imports:create', source),
@@ -77,12 +113,16 @@ contextBridge.exposeInMainWorld('brain', {
   restoreRecoveryFile: (password) => invoke('security:restore-recovery', password),
   getSecurityStatus: () => invoke('security:status'),
   setAutoLockMinutes: (minutes) => invoke('security:set-auto-lock', minutes),
+  setAutoLockSettings: (settings) => invoke('security:set-auto-lock', settings),
+  stayUnlocked: () => invoke('security:stay-unlocked'),
   lockNow: () => invoke('security:lock-now'),
+  deleteOldBackups: (password, confirmation) => invoke('security:delete-old-backups', password, confirmation),
   getSecurityStartupState: () => invoke('security:startup-state'),
   unlock: (password) => invoke('security:unlock', password),
   quitApp: () => invoke('app:quit'),
   onLocked: (callback) => { lockedListeners.add(callback); return () => lockedListeners.delete(callback); },
   onUnlocked: (callback) => { unlockedListeners.add(callback); return () => unlockedListeners.delete(callback); },
+  onAutoLockWarning: (callback) => { autoLockWarningListeners.add(callback); return () => autoLockWarningListeners.delete(callback); },
   listClients: () => invoke('clients:list'),
   approveClient: (client, readSources, writeSource) => invoke('clients:approve', client, readSources, writeSource),
   updateClientGrant: (client, source, status) => invoke('clients:grant', client, source, status),
@@ -128,8 +168,7 @@ contextBridge.exposeInMainWorld('brain', {
   saveChatMemory: (source, title, content) => invoke('chat:save-memory', source, title, content),
   onChatChunk: (callback) => {
     const listener = (_event, payload) => callback(payload);
-    ipcRenderer.on('chat:chunk', listener);
-    return () => ipcRenderer.removeListener('chat:chunk', listener);
+    return listen('chat:chunk', listener);
   },
   listPendingMemories: () => invoke('pending-memories:list'),
   approvePendingMemory: (id, title, content) => invoke('pending-memories:approve', id, title, content),
@@ -137,27 +176,22 @@ contextBridge.exposeInMainWorld('brain', {
   rejectPendingMemory: (id) => invoke('pending-memories:reject', id),
   onEmbeddingStatus: (callback) => {
     const listener = (_event, status) => callback(status);
-    ipcRenderer.on('brain:embedding-status', listener);
-    return () => ipcRenderer.removeListener('brain:embedding-status', listener);
+    return listen('brain:embedding-status', listener);
   },
   onRetrieved: (callback) => {
     const listener = (_event, ids) => callback(ids);
-    ipcRenderer.on('brain:retrieved', listener);
-    return () => ipcRenderer.removeListener('brain:retrieved', listener);
+    return listen('brain:retrieved', listener);
   },
   onChanged: (callback) => {
     const listener = (_event, change) => callback(change);
-    ipcRenderer.on('brain:changed', listener);
-    return () => ipcRenderer.removeListener('brain:changed', listener);
+    return listen('brain:changed', listener);
   },
   onClientPending: (callback) => {
     const listener = (_event, profile) => callback(profile);
-    ipcRenderer.on('brain:client-pending', listener);
-    return () => ipcRenderer.removeListener('brain:client-pending', listener);
+    return listen('brain:client-pending', listener);
   },
   onPendingMemoriesChanged: (callback) => {
     const listener = () => callback();
-    ipcRenderer.on('brain:pending-memories-changed', listener);
-    return () => ipcRenderer.removeListener('brain:pending-memories-changed', listener);
+    return listen('brain:pending-memories-changed', listener);
   }
 });
