@@ -25,6 +25,7 @@ if (!hasSingleInstanceLock) {
   app.quit();
 }
 const { getGraphicsStartupConfig, recordGpuCrash, registerShortcutWithFallback } = require('./platform');
+const { hasQuickContextFlag, getQuickContextShortcutInfo, createQuickContextRequestRouter } = require('./quick-context-launch');
 const { createCrashLoopLimiter } = require('./window-lifecycle');
 const { rendererErrorLocation, rendererErrorMessage } = require('./renderer-errors');
 const { readGraphicsSettings, writeGraphicsSettings } = require('./graphics-settings');
@@ -44,13 +45,32 @@ if (graphicsStartupConfig.disableHardwareAcceleration) app.disableHardwareAccele
 
 const { BrowserWindow, ipcMain, Menu, safeStorage, globalShortcut, clipboard, Tray, nativeImage, dialog, session } = require('electron');
 const { createSecurityEventLogger, createTrustedAppUrl, installIpcSenderValidation, attachWebContentsSecurity, denySessionPermissions, applyCspToSession } = require('./electron-security');
+const { registerClipboardIpc, writeClipboardText } = require('./clipboard-ipc');
 const trustedRendererUrl = createTrustedAppUrl({ appRoot: app.getAppPath(), devUrl: app.isPackaged ? null : 'http://localhost:5173' });
 const securityEventLogger = createSecurityEventLogger((event, details) => lifecycleLog.append(event, details));
 const securityEventFlushTimer = setInterval(() => securityEventLogger.flush(true), 60_000);
 securityEventFlushTimer.unref?.();
 const recordSecurityEvent = (event, details) => securityEventLogger.record(event, details);
 installIpcSenderValidation(ipcMain, { isTrustedUrl: trustedRendererUrl, recordDenied: recordSecurityEvent });
+registerClipboardIpc(ipcMain, { writeText: (text) => clipboard.writeText(text), isTrustedUrl: trustedRendererUrl });
 app.on('before-quit', () => { clearInterval(securityEventFlushTimer); securityEventLogger.flush(true); });
+let secretClipboardTimer = null;
+let secretClipboardValue = null;
+function clearSecretClipboard() {
+  if (secretClipboardTimer) clearTimeout(secretClipboardTimer);
+  secretClipboardTimer = null;
+  if (secretClipboardValue === null) return;
+  try { if (clipboard.readText() === secretClipboardValue) clipboard.writeText(''); } catch {}
+  secretClipboardValue = null;
+}
+function copySecretToClipboard(value) {
+  clipboard.writeText(value);
+  if (secretClipboardTimer) clearTimeout(secretClipboardTimer);
+  secretClipboardValue = String(value);
+  secretClipboardTimer = setTimeout(clearSecretClipboard, 30_000);
+  secretClipboardTimer.unref?.();
+}
+app.on('before-quit', clearSecretClipboard);
 function initializeReadyElectronApis() {
   app.on('web-contents-created', (_event, contents) => attachWebContentsSecurity(contents, { isTrustedUrl: trustedRendererUrl, recordDenied: recordSecurityEvent }));
   denySessionPermissions(session.defaultSession, recordSecurityEvent);
@@ -124,6 +144,17 @@ function focusExistingMainWindow() {
   return true;
 }
 
+let quickContextRuntimeReady = false;
+const quickContextRequestRouter = createQuickContextRequestRouter({
+  isReady: () => quickContextRuntimeReady,
+  isLocked: () => lockController.isLocked() || (!quickContextRuntimeReady && fs.existsSync(path.join(userDataRoot, 'db.vault.json'))),
+  open: () => createQuickContextWindow(),
+  toggle: () => toggleQuickContextWindow(),
+  focusMain: () => focusExistingMainWindow(),
+  showUnlock: () => { if (!focusExistingMainWindow()) createWindow(); },
+});
+if (hasQuickContextFlag(process.argv)) quickContextRequestRouter.handle(process.argv);
+
 function reloadWindow(win) {
   const contents = win.webContents;
   pendingReloads.add(contents);
@@ -131,9 +162,9 @@ function reloadWindow(win) {
   catch (error) { pendingReloads.delete(contents); throw error; }
 }
 
-if (hasSingleInstanceLock) app.on('second-instance', () => {
+if (hasSingleInstanceLock) app.on('second-instance', (_event, commandLine) => {
   lifecycleLog.append('second_instance_received');
-  focusExistingMainWindow();
+  quickContextRequestRouter.handle(commandLine);
 });
 
 function attachWindowLifecycle(win, windowName) {
@@ -303,13 +334,20 @@ function createQuickContextWindow() {
   quickContextWindow.loadFile(path.join(__dirname, 'quick-context.html'));
   quickContextWindow.on('closed', () => { quickContextWindow = null; });
 }
+function toggleQuickContextWindow() {
+  if (quickContextWindow && !quickContextWindow.isDestroyed() && quickContextWindow.isVisible()) {
+    quickContextWindow.hide();
+    return;
+  }
+  createQuickContextWindow();
+}
 function createQuickContextTray() {
   if (quickContextTray) return;
   try {
     quickContextTray = new Tray(nativeImage.createEmpty());
     quickContextTray.setToolTip('One Brain Quick context');
-    quickContextTray.setContextMenu(Menu.buildFromTemplate([{ label: 'Open Quick context', click: createQuickContextWindow }, { label: 'Quit One Brain', click: () => app.quit() }]));
-    quickContextTray.on('click', createQuickContextWindow);
+    quickContextTray.setContextMenu(Menu.buildFromTemplate([{ label: 'Quick context', click: toggleQuickContextWindow }, { label: 'Quit One Brain', click: () => app.quit() }]));
+    quickContextTray.on('click', toggleQuickContextWindow);
   } catch { quickContextTray = null; }
 }
 
@@ -317,6 +355,13 @@ function applyQuickContextSettings(next) {
   const previous = quickContextShortcut;
   if (previous) globalShortcut.unregister(previous);
   quickContextShortcut = null;
+  const shortcutInfo = getQuickContextShortcutInfo({ sessionType: process.env.XDG_SESSION_TYPE, isPackaged: app.isPackaged,
+    execPath: process.execPath, appPath: app.getAppPath() });
+  if (shortcutInfo.isWayland) {
+    quickContextRegistrationError = shortcutInfo.message;
+    persistQuickContextSettings(next);
+    return next;
+  }
   if (next.enabled) {
     const accelerator = String(next.shortcut || '').trim();
     const choice = registerShortcutWithFallback(accelerator, QUICK_CONTEXT_FALLBACKS, (shortcut) => globalShortcut.register(shortcut, createQuickContextWindow));
@@ -334,14 +379,20 @@ function applyQuickContextSettings(next) {
   return next;
 }
 
-ipcMain.handle('quick-context:settings', () => ({ ...readQuickContextSettings(), registered: Boolean(quickContextShortcut), error: quickContextRegistrationError }));
+function getQuickContextSettingsResponse() {
+  const shortcutInfo = getQuickContextShortcutInfo({ sessionType: process.env.XDG_SESSION_TYPE, registrationError: quickContextRegistrationError,
+    isPackaged: app.isPackaged, execPath: process.execPath, appPath: app.getAppPath() });
+  return { ...readQuickContextSettings(), registered: Boolean(quickContextShortcut), error: shortcutInfo.message,
+    isWayland: shortcutInfo.isWayland, systemShortcutCommand: shortcutInfo.systemShortcutCommand };
+}
+ipcMain.handle('quick-context:settings', () => getQuickContextSettingsResponse());
 ipcMain.handle('quick-context:open', () => { createQuickContextWindow(); return true; });
 ipcMain.handle('quick-context:update-settings', (_event, patch = {}) => {
   const current = readQuickContextSettings();
   const next = { enabled: typeof patch.enabled === 'boolean' ? patch.enabled : current.enabled,
     shortcut: typeof patch.shortcut === 'string' ? patch.shortcut.trim().slice(0, 80) : current.shortcut };
   const saved = applyQuickContextSettings(next);
-  return { ...saved, registered: Boolean(quickContextShortcut), error: quickContextRegistrationError };
+  return { ...saved, ...getQuickContextSettingsResponse() };
 });
 ipcMain.handle('quick-context:search', async (_event, query) => prepareQuickContext({ query, searchMemories, getMemory,
   getVector: getMemoryEmbeddingVector,
@@ -350,8 +401,7 @@ ipcMain.handle('quick-context:copy', (_event, memories) => {
   const safe = (Array.isArray(memories) ? memories : []).slice(0, 5).map((item) => ({ source: String(item?.source || ''), title: String(item?.title || '').slice(0, 160), snippet: String(item?.snippet || '').slice(0, 350), selected: item?.selected !== false, private: Boolean(item?.private), no_suggest: Boolean(item?.no_suggest) }));
   const block = buildQuickContextBlock(safe);
   if (!block) return { ok: false };
-  clipboard.writeText(block);
-  return { ok: true };
+  return writeClipboardText(block, (text) => clipboard.writeText(text));
 });
 ipcMain.handle('quick-context:close', (event) => { BrowserWindow.fromWebContents(event.sender)?.close(); return true; });
 
@@ -520,7 +570,7 @@ registerSecurityIpc(ipcMain, {
   exportEncryptedRecoveryFile,
   restoreEncryptedRecoveryFile,
   deleteOldBackups: deleteOldBackupFiles,
-  copyProviderKey: (provider) => memoryProxy.copySavedKey(provider, clipboard),
+  copyProviderKey: (provider) => memoryProxy.copySavedKey(provider, { writeText: copySecretToClipboard }),
   logFailure: (details) => lifecycleLog.append('vault_operation_failed', details),
   logEvent: (event) => event === 'vault_unlock_failed' ? recordSecurityEvent(event) : lifecycleLog.append(event),
   passwordLockout,
@@ -529,7 +579,10 @@ registerUnlockIpc(ipcMain, {
   lockController,
   passwordLockout,
   logEvent: (event) => lifecycleLog.append(event),
-  notifyUnlocked: () => { for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:unlocked', lockController.getEpoch()); },
+  notifyUnlocked: () => {
+    for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:unlocked', lockController.getEpoch());
+    quickContextRequestRouter.onUnlocked();
+  },
   onLockNow: () => lockIfVaultConfigured('manual'),
 });
 ipcMain.handle('app:quit', () => { app.quit(); return true; });
@@ -729,7 +782,9 @@ app.whenReady().then(async () => {
   });
   try { globalShortcut.register('CommandOrControl+Shift+L', () => lockIfVaultConfigured('manual')); } catch {}
   try { applyQuickContextSettings(readQuickContextSettings()); } catch { /* Keep the app usable if the OS reserves the selected shortcut. */ }
+  quickContextRuntimeReady = true;
   createWindow();
+  quickContextRequestRouter.onReady();
 
   connectionActivity = createConnectionActivity(userDataPath);
   const recordDashboardEvent = (event, memoryIds) => {

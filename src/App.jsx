@@ -176,13 +176,14 @@ function ProviderKeysPanel({ clients }) {
   const [extensionError, setExtensionError] = useState('');
   const [quickSettings, setQuickSettings] = useState(null);
   const [quickError, setQuickError] = useState('');
+  const [quickNotice, setQuickNotice] = useState('');
   const [graphicsSettings, setGraphicsSettings] = useState(null);
   const [performanceMode, setPerformanceMode] = useState(() => readManualPerformanceMode());
   const [lifecycleLines, setLifecycleLines] = useState([]);
   const [lifecycleError, setLifecycleError] = useState('');
   const [keyTests, setKeyTests] = useState({});
   useEffect(() => { window.brain.getMemoryProxySettings().then(setSettings).catch(() => setNotice('Proxy settings are unavailable.')); }, []);
-  useEffect(() => { window.brain.getQuickContextSettings().then((value) => { setQuickSettings(value); setQuickError(value.error || ''); }).catch(() => setQuickError('Quick context settings are unavailable.')); }, []);
+  useEffect(() => { window.brain.getQuickContextSettings().then((value) => { setQuickSettings(value); setQuickError(value.isWayland ? '' : value.error || ''); }).catch(() => setQuickError('Quick context settings are unavailable.')); }, []);
   useEffect(() => { window.brain.getGraphicsSettings?.().then(setGraphicsSettings).catch(() => {}); }, []);
   useEffect(() => { void refreshLifecycleLog(); }, []);
   useEffect(() => { window.brain.getExtensionStatus().then(setExtensions).catch((error) => setExtensionError(error.message || 'Extension status is unavailable.')); }, [clients]);
@@ -230,8 +231,15 @@ function ProviderKeysPanel({ clients }) {
     finally { if (keyCopyPassword.current) keyCopyPassword.current.value = ''; }
   }
   async function saveQuickSettings() {
-    try { const result = await window.brain.updateQuickContextSettings(quickSettings); setQuickSettings(result); setQuickError(result.error || ''); }
+    try { const result = await window.brain.updateQuickContextSettings(quickSettings); setQuickSettings(result); setQuickError(result.isWayland ? '' : result.error || ''); }
     catch (error) { setQuickError(error.message || 'Could not register this shortcut.'); }
+  }
+  async function copyQuickContextCommand() {
+    try {
+      const result = await window.brain.copyText(quickSettings?.systemShortcutCommand || '');
+      if (!result?.ok) throw new Error(result?.error || 'Could not copy the system shortcut command.');
+      setQuickError(''); setQuickNotice('Copied the system shortcut command.');
+    } catch (error) { setQuickError(error.message || 'Could not copy the system shortcut command.'); }
   }
   async function updateGraphicsMode(mode, hardwareStrategy = graphicsSettings?.hardwareStrategy) {
     try { setGraphicsSettings(await window.brain.setGraphicsMode(mode, hardwareStrategy)); }
@@ -254,8 +262,11 @@ function ProviderKeysPanel({ clients }) {
     catch { setLifecycleError('Lifecycle diagnostics are unavailable.'); }
   }
   async function copyLifecycleLog() {
-    try { await navigator.clipboard.writeText(lifecycleLines.join('\n')); setNotice('Lifecycle diagnostics copied.'); }
-    catch { setLifecycleError('Could not copy lifecycle diagnostics.'); }
+    try {
+      const result = await window.brain.copyText(lifecycleLines.join('\n'));
+      if (!result?.ok) throw new Error(result?.error || 'Could not copy lifecycle diagnostics.');
+      setLifecycleError(''); setNotice('Copied lifecycle diagnostics.');
+    } catch (error) { setLifecycleError(error.message || 'Could not copy lifecycle diagnostics.'); }
   }
   if (!settings) return <section className="clients-settings"><h2>Provider keys</h2><p className="empty-note">Loading proxy settings…</p></section>;
   return <section className="clients-settings proxy-settings">
@@ -272,7 +283,7 @@ function ProviderKeysPanel({ clients }) {
       </div>
     </article>)}
     <section className="extension-pair-card"><header><h3>Browser extension</h3><button type="button" onClick={() => void makePairCode()}>Pair</button></header><p className="connect-hint">Enter the code and local API address in the One Brain extension popup. New sites appear here for approval and source grants.</p>{pairCode && <p className="extension-pair-code" role="status">Pairing code <strong>{pairCode.code}</strong> · expires in 2 minutes<br />API address <code>{pairCode.endpoint}</code></p>}{extensions.map((item) => <article className="extension-site-row" key={item.site}><span><strong>{item.site}</strong><small>{item.active ? (item.status === 'approved' ? 'Connected' : 'Waiting for approval') : 'Not paired'}{item.origin ? ` · ${item.origin}` : ''}</small></span>{item.paired && <><button type="button" onClick={() => void rotateExtension(item.site)}>Rotate</button><button type="button" onClick={() => void revokeExtension(item.site)}>Revoke</button></>}</article>)}{extensionError && <p role="alert" className="empty-note">{extensionError}</p>}</section>
-    {quickSettings && <section className="extension-pair-card"><header><h3>Quick context</h3></header><p className="connect-hint">Open a small always-on-top context search from any app. The question is searched locally and is not logged.</p><label className="proxy-setting"><input type="checkbox" checked={quickSettings.enabled} onChange={(event) => setQuickSettings((current) => ({ ...current, enabled: event.target.checked }))} />Enable global shortcut</label><label className="proxy-setting">Shortcut<input value={quickSettings.shortcut} onChange={(event) => setQuickSettings((current) => ({ ...current, shortcut: event.target.value }))} placeholder="Control+Alt+B" /></label><button type="button" onClick={() => void saveQuickSettings()}>Save shortcut</button><button type="button" onClick={() => void window.brain.openQuickContext()}>Open Quick context</button>{quickError && <p role="alert" className="empty-note">{quickError}</p>}</section>}
+    {quickSettings && <section className="extension-pair-card"><header><h3>Quick context</h3></header><p className="connect-hint">Open a small always-on-top context search from any app. The question is searched locally and is not logged.</p>{quickSettings.isWayland ? <><p className="connect-hint" role="status">Global shortcuts are not available on Wayland. Use a system shortcut instead</p><label className="proxy-setting">System shortcut command<input readOnly value={quickSettings.systemShortcutCommand || ''} onFocus={(event) => event.target.select()} /></label><button type="button" onClick={() => void copyQuickContextCommand()}>Copy command</button><p className="connect-hint">GNOME: Settings &gt; Keyboard &gt; Custom Shortcuts &gt; add this command, then bind it to a key you choose.</p></> : <><label className="proxy-setting"><input type="checkbox" checked={quickSettings.enabled} onChange={(event) => setQuickSettings((current) => ({ ...current, enabled: event.target.checked }))} />Enable global shortcut</label><label className="proxy-setting">Shortcut<input value={quickSettings.shortcut} onChange={(event) => setQuickSettings((current) => ({ ...current, shortcut: event.target.value }))} placeholder="Control+Alt+B" /></label><button type="button" onClick={() => void saveQuickSettings()}>Save shortcut</button></>}<button type="button" onClick={() => void window.brain.openQuickContext()}>Open Quick context</button>{quickNotice && <p role="status" className="empty-note">{quickNotice}</p>}{quickError && <p role="alert" className="empty-note">{quickError}</p>}</section>}
     {graphicsSettings?.supported && <section className="extension-pair-card"><header><h3>Graphics</h3></header><label className="proxy-setting">Graphics mode<select value={graphicsSettings.mode} onChange={(event) => void updateGraphicsMode(event.target.value)}><option value="auto">Auto</option><option value="hardware">Hardware</option><option value="safe-software">Safe software</option></select></label>{graphicsSettings.mode !== 'safe-software' && <label className="proxy-setting">Hardware GL<select value={graphicsSettings.hardwareStrategy} onChange={(event) => void updateGraphicsMode(graphicsSettings.mode, event.target.value)}><option value="angle-gl">ANGLE with OpenGL</option><option value="egl">EGL</option></select></label>}<p className="connect-hint">Auto uses the selected hardware path. After a failure it relaunches once in Safe software, then retries hardware on the next start. Two consecutive hardware failures keep it in Safe software until you choose Hardware or request a retry.</p>{graphicsSettings.restartRequired && <small role="status">Restart One Brain to apply graphics changes.</small>}</section>}
     <section className="extension-pair-card"><header><h3>Performance</h3></header><label className="proxy-setting"><input type="checkbox" checked={performanceMode} onChange={(event) => updatePerformanceMode(event.target.checked)} />Performance mode</label><p className="connect-hint">Reduces graph rendering work. It also turns on automatically when WebGL uses SwiftShader or llvmpipe.</p></section>
     <section className="extension-pair-card"><header><h3>Diagnostics</h3><div><button type="button" onClick={() => { void refreshLifecycleLog(); window.brain.getGraphicsSettings?.().then(setGraphicsSettings).catch(() => {}); }}>Refresh</button><button type="button" disabled={!lifecycleLines.length} onClick={() => void copyLifecycleLog()}>Copy</button></div></header><p className="connect-hint"><strong>Graphics mode:</strong> {graphicsSettings ? `${graphicsSettings.mode}${graphicsSettings.activeMode !== graphicsSettings.mode ? ` (currently ${graphicsSettings.activeMode})` : ''}` : 'Loading'} · <strong>Consecutive failures:</strong> {graphicsSettings?.failureCount ?? 0}/2 · <strong>Last failure:</strong> {graphicsSettings?.lastFailureReason || 'None'}</p><p className="connect-hint"><strong>WebGL renderer:</strong> {graphicsSettings?.renderer || 'Not reported yet'}{graphicsSettings?.rendererSoftware && <span role="status"> · Software rendering is active; graph effects and frame rate are reduced to keep it responsive.</span>}</p>{graphicsSettings?.mode === 'auto' && graphicsSettings.failureCount >= 2 && <button type="button" onClick={() => void tryGraphicsHardwareAgain()}>Try hardware again</button>}{graphicsSettings?.retryHardwareNextStart && <small role="status">Hardware retry is queued for the next start.</small>}<p className="connect-hint">Last 50 application lifecycle events. The log records event metadata only.</p><pre className="lifecycle-log-view">{lifecycleLines.length ? lifecycleLines.join('\n') : 'No lifecycle events yet.'}</pre>{lifecycleError && <p role="alert" className="empty-note">{lifecycleError}</p>}</section>
@@ -878,6 +889,7 @@ function App() {
   const [connectorAction, setConnectorAction] = useState(null);
   const [connectorSnippet, setConnectorSnippet] = useState(null);
   const [copied, setCopied] = useState('');
+  const [copyError, setCopyError] = useState('');
   const graphRef = useRef(null);
   const searchRequest = useRef(0);
   const typedSearchPending = useRef(null);
@@ -1548,29 +1560,27 @@ function App() {
 
   async function copyText(value, label) {
     try {
-      await navigator.clipboard.writeText(value);
-    } catch {
-      const field = document.createElement('textarea');
-      field.value = value;
-      field.style.position = 'fixed';
-      field.style.opacity = '0';
-      document.body.appendChild(field);
-      field.select();
-      document.execCommand('copy');
-      field.remove();
+      const result = await window.brain.copyText(String(value));
+      if (!result?.ok) throw new Error(result?.error || 'Could not copy text.');
+      setCopyError('');
+      setCopied(`${label}: Copied`);
+      setTimeout(() => setCopied(''), 2000);
+    } catch (error) {
+      setCopied('');
+      setCopyError(error.message || 'Could not copy text.');
     }
-    setCopied(label);
-    setTimeout(() => setCopied(''), 1600);
   }
 
   return (
     <main className="memory-app">
       {graphicsNotice && <div role="alert" style={{ position: 'fixed', zIndex: 10000, top: 12, left: '50%', transform: 'translateX(-50%)', display: 'flex', alignItems: 'center', gap: 12, maxWidth: 'calc(100vw - 32px)', padding: '10px 14px', border: '1px solid #b68138', borderRadius: 8, background: '#302515', color: '#ffe2ad', boxShadow: '0 8px 30px #0008' }}><span>{graphicsNotice}</span><button type="button" aria-label="Dismiss graphics notice" onClick={() => void dismissGraphicsNotice()}>×</button></div>}
+      {copied && <div role="status" className="connection-notice" style={{ position: 'fixed', zIndex: 10000, right: 16, bottom: 16 }}>{copied}</div>}
+      {copyError && <div role="alert" className="connection-notice" style={{ position: 'fixed', zIndex: 10000, right: 16, bottom: 16 }}>{copyError}</div>}
       <BrainGraph ref={graphRef} memories={memories} links={graphLinks} allLinks={links} counts={counts} linkCounts={graphLinkCountValues} linkVisibility={linkVisibility} onLinkVisibilityChange={setLinkVisibility} fitRevision={graphFitRevision} dataReady={dataReady} sidebarCollapsed={sidebarCollapsed} onMemoryClick={openDetail} />
     {insightsOpen && (insightsData ? <InsightsView data={insightsData} onBack={() => { setInsightsOpen(false); setGraphFitRevision((value) => value + 1); }} sql={sql} setSql={setSql} runSql={runAnalyticsQuery} sqlResult={sqlResult} sqlRunning={sqlRunning} onResetRetrievalCounts={resetRetrievalCounts} /> : <section className="insights-view"><header className="insights-header"><button className="back-button" type="button" onClick={() => { setInsightsOpen(false); setGraphFitRevision((value) => value + 1); }}>‹</button><div><h1>Insights</h1><p>Local activity and retrieval analytics</p></div></header><ChannelNotice channel="insights" loading={insightsLoading} error={insightsLoadError} onRetry={() => void openInsights()} /></section>)}
       {chatOpen && <ChatView onBack={() => { setChatOpen(false); setGraphFitRevision((value) => value + 1); }} onManageProviders={() => { setChatOpen(false); openConnectSettings(); }} memoryTitles={Object.fromEntries(memories.map((item) => [item.id, item.title || 'Untitled memory']))} onOpenMemory={(id) => { setChatOpen(false); setInsightsOpen(false); setSelectedId(id); setSidebarCollapsed(false); focusMemory(id); }} />}
       <aside className={`memory-panel${sidebarCollapsed ? ' is-collapsed' : ''}`} style={insightsOpen || chatOpen ? { display: 'none' } : undefined}>
-        <header className="sidebar-header"><strong>One Brain</strong><nav aria-label="Main views"><button title="Open Chat" type="button" onClick={() => { setInsightsOpen(false); setChatOpen(true); }}>Chat</button><button title="Open Insights" type="button" onClick={openInsights}>Insights</button><button title="Pending memories" type="button" onClick={() => { setPendingOpen(true); setConnectOpen(false); void refreshPendingMemories().catch(() => {}); }}>Pending ({pendingMemories.length})</button><button title="Settings" aria-label="Settings" type="button" onClick={openConnectSettings}>⚙</button></nav></header>
+        <header className="sidebar-header"><strong>One Brain</strong><nav aria-label="Main views"><button title="Open Chat" type="button" onClick={() => { setInsightsOpen(false); setChatOpen(true); }}>Chat</button><button title="Open Insights" type="button" onClick={openInsights}>Insights</button><button title="Pending memories" type="button" onClick={() => { setPendingOpen(true); setConnectOpen(false); void refreshPendingMemories().catch(() => {}); }}>Pending ({pendingMemories.length})</button><button title="Quick context" type="button" onClick={() => void window.brain.openQuickContext()}>Quick context</button><button title="Settings" aria-label="Settings" type="button" onClick={openConnectSettings}>⚙</button></nav></header>
         {pendingOpen ? <><header className="detail-header"><button className="back-button" type="button" onClick={() => setPendingOpen(false)}>‹</button><span>Pending memories</span></header><PendingMemoryInbox items={pendingMemories} onRefresh={refreshPendingMemories} loading={pendingLoading} loadError={pendingLoadError} /></> : connectOpen ? (
           <section className="connect-view">
             <header className="detail-header"><button className="back-button" type="button" onClick={() => setConnectOpen(false)}>‹</button><span>Connections</span>{suggestions.length > 0 && <button className="header-suggestions" type="button" onClick={() => { setConnectOpen(false); setSuggestionsOpen(true); }}>Suggestions ({suggestions.length})</button>}</header>

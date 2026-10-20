@@ -24,8 +24,13 @@
   });
   copy.addEventListener('click', async () => {
     const selected = [...results.querySelectorAll('.result')].filter((row) => row.querySelector('input').checked).map((row) => matches[Number(row.dataset.index)]).filter(Boolean);
-    const result = await window.brain.copyQuickContext(selected);
-    if (result?.ok) window.brain.closeQuickContext(); else status.textContent = 'Could not copy context.';
+    copy.disabled = true;
+    try {
+      const result = await window.brain.copyQuickContext(selected);
+      status.textContent = result?.ok ? 'Copied context.' : result?.error || 'Could not copy context.';
+    } catch (error) {
+      status.textContent = error?.message || 'Could not copy context.';
+    } finally { sync(); }
   });
   document.addEventListener('keydown', (event) => { if (event.key === 'Escape') window.brain.closeQuickContext(); });
   query.addEventListener('keydown', (event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') search.click(); });
