@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import App from './App.jsx';
-import { Button, Card, Field, Input } from './components/ui/index.jsx';
+import { Button, Card, Field, IconButton, Input } from './components/ui/index.jsx';
 
 function UnlockScreen() {
   const [password, setPassword] = useState('');
@@ -49,7 +49,7 @@ function UnlockScreen() {
       <div><h1>Unlock One Brain</h1><p>Enter your master password to open your encrypted memories.</p></div>
       <p className="unlock-attempts" aria-live="polite">Failed attempts: {lockout.failedCount}{lockout.locked ? ` · Try again in ${countdown}` : ` · ${lockout.attemptsRemaining} attempts until next lockout`}</p>
       <Field label="Master password"><Input autoFocus type={visible ? 'text' : 'password'} autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} disabled={busy || lockout.locked} /></Field>
-      <Button type="button" variant="ghost" className="unlock-password-toggle" aria-pressed={visible} onClick={() => setVisible((value) => !value)} disabled={busy || lockout.locked}>{visible ? 'Hide password' : 'Show password'}</Button>
+      <IconButton type="button" className="unlock-password-toggle" icon="eye" label={visible ? 'Hide password' : 'Show password'} aria-pressed={visible} onClick={() => setVisible((value) => !value)} disabled={busy || lockout.locked}/>
       {error && <p role="alert" className="unlock-error">{error}</p>}
       <div className="unlock-actions"><Button type="button" onClick={() => void window.brain.quitApp()}>Quit</Button><Button variant="primary" type="submit" disabled={busy || lockout.locked}>{busy ? 'Unlocking…' : lockout.locked ? `Locked · ${countdown}` : 'Unlock'}</Button></div>
     </Card>

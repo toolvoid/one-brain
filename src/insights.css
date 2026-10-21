@@ -130,6 +130,7 @@
 .evaluation-panel .empty-note, .insights-view .empty-note { padding: 14px; border: 1px dashed #506174; border-radius: 9px; color: #d0dae4; background: #111a23; font-size: 13px !important; }
 .evaluation-panel .sql-error { padding: 12px; border: 1px solid #985253; border-radius: 9px; background: #321e22; font-size: 13px !important; }
 .run-sql-card { display: grid; gap: 12px; }.run-sql-card textarea { min-height: 240px !important; }
+.insight-table td, .evaluation-table td { overflow: visible; overflow-wrap: anywhere; text-overflow: clip; }
 @media (max-width: 760px) {
   .insights-view { padding: 16px 12px 28px !important; }
   .insights-grid, .status-layout, .evaluation-panel, .eval-maintenance-grid { grid-template-columns: minmax(0, 1fr) !important; }

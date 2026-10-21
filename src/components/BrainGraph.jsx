@@ -106,7 +106,7 @@ const LINE_FRAGMENT = `
   void main() { gl_FragColor = vec4(vColor, vAlpha); }
 `;
 
-const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], allLinks = links, counts = {}, linkCounts = {}, linkVisibility = {}, onLinkVisibilityChange = () => {}, fitRevision = 0, sidebarCollapsed = false, dataReady = false, onMemoryClick = () => {} }, ref) {
+const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], allLinks = links, counts = {}, linkCounts = {}, linkVisibility = {}, onLinkVisibilityChange = () => {}, fitRevision = 0, sidebarCollapsed = false, sidebarWidth = 360, dataReady = false, onMemoryClick = () => {} }, ref) {
   const hostRef = useRef(null);
   const [webglUnavailable, setWebglUnavailable] = useState(false);
   const initialLinkRevealDoneRef = useRef(false);
@@ -693,7 +693,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     let previousWidth = 0;
     let previousHeight = 0;
     function resize(forceResourceReset = false) {
-      const width = Math.max(1, host.clientWidth - (host.__brainGraphCollapsed ? 0 : Math.min(360, window.innerWidth * 0.92)));
+      const width = Math.max(1, host.clientWidth - (host.__brainGraphCollapsed ? 0 : host.__brainGraphSidebarWidth));
       const height = Math.max(1, host.clientHeight);
       const dimensionsChanged = width !== previousWidth || height !== previousHeight;
       if (dimensionsChanged || forceResourceReset) {
@@ -712,7 +712,13 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
       if (!manualOrbitPaused && initialized) fitView(true);
       scheduleFrame();
     }
-    const observer = new ResizeObserver(() => resize());
+    let resizeTimer = 0;
+    const observer = new ResizeObserver(() => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => resize(), 60);
+    });
+    host.__brainGraphCollapsed = sidebarCollapsed;
+    host.__brainGraphSidebarWidth = sidebarWidth;
     observer.observe(host); resize(); fitView(false);
     host.__brainGraphResize = resize;
 
@@ -993,6 +999,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     return () => {
       if (rafPending) cancelAnimationFrame(raf);
       if (frameTimer) clearTimeout(frameTimer);
+      clearTimeout(resizeTimer);
       document.removeEventListener('visibilitychange', onVisibilityChange);
       observer.disconnect(); controls.dispose();
       window.removeEventListener(PERFORMANCE_MODE_EVENT, onPerformanceModeChange);
@@ -1026,15 +1033,16 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     const host = hostRef.current;
     if (host) {
       host.__brainGraphCollapsed = sidebarCollapsed;
+      host.__brainGraphSidebarWidth = sidebarWidth;
       const webgl = host.querySelector('.brain-webgl');
       const labelLayer = host.querySelector('.brain-label-layer');
-      if (webgl) webgl.style.left = sidebarCollapsed ? '0' : 'min(360px, 92vw)';
-      if (labelLayer) labelLayer.style.left = sidebarCollapsed ? '0' : 'min(360px, 92vw)';
-      if (webgl) webgl.style.width = sidebarCollapsed ? '100%' : 'calc(100% - min(360px, 92vw))';
-      if (labelLayer) labelLayer.style.width = sidebarCollapsed ? '100%' : 'calc(100% - min(360px, 92vw))';
+      if (webgl) webgl.style.left = sidebarCollapsed ? '0' : `${sidebarWidth}px`;
+      if (labelLayer) labelLayer.style.left = sidebarCollapsed ? '0' : `${sidebarWidth}px`;
+      if (webgl) webgl.style.width = sidebarCollapsed ? '100%' : `calc(100% - ${sidebarWidth}px)`;
+      if (labelLayer) labelLayer.style.width = sidebarCollapsed ? '100%' : `calc(100% - ${sidebarWidth}px)`;
       host.__brainGraphResize?.();
     }
-  }, [sidebarCollapsed]);
+  }, [sidebarCollapsed, sidebarWidth]);
 
   // Keep the latest data available to the persistent renderer and rebuild only on data changes.
   useEffect(() => {
