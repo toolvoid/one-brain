@@ -528,8 +528,9 @@ function listEvaluationDatasets() {
     WHERE d.deleted_at IS NULL GROUP BY d.id ORDER BY d.id DESC`).all();
 }
 
-async function runEvaluationDataset(datasetId, { config: rawConfig = {}, includePrivate = false, appVersion = 'unknown', questionTypes = null } = {}) {
+async function runEvaluationDataset(datasetId, { config: rawConfig = {}, includePrivate = false, appVersion = 'unknown', questionTypes = null, kind = 'manual' } = {}) {
   ensureWritable();
+  if (!['manual', 'calibration', 'sweep'].includes(kind)) throw new Error('Evaluation run kind is invalid.');
   const db = getDatabase();
   const dataset = db.prepare('SELECT id, name FROM eval_question_sets WHERE id = ? AND deleted_at IS NULL').get(Number(datasetId));
   if (!dataset) throw new Error('Evaluation dataset was not found.');
@@ -563,18 +564,49 @@ async function runEvaluationDataset(datasetId, { config: rawConfig = {}, include
         filteredByGate: ungatedRank != null && gatedRank == null, cosineSimilarity: vectorMatch ? Number(vectorMatch.score) : null };
     } });
   const storedMetrics = { ...result.metrics, byType: result.byType };
-  const inserted = db.prepare('INSERT INTO eval_run_summaries(dataset_id, app_version, config_json, metrics_json) VALUES (?, ?, ?, ?)')
-    .run(dataset.id, String(appVersion || 'unknown').slice(0, 40), JSON.stringify(config), JSON.stringify(storedMetrics));
-  return { id: Number(inserted.lastInsertRowid), datasetId: dataset.id, datasetName: dataset.name, ts: new Date().toISOString(),
+  const saved = kind === 'manual';
+  const inserted = saved ? db.prepare('INSERT INTO eval_run_summaries(dataset_id, app_version, config_json, metrics_json, kind) VALUES (?, ?, ?, ?, ?)')
+    .run(dataset.id, String(appVersion || 'unknown').slice(0, 40), JSON.stringify(config), JSON.stringify(storedMetrics), kind) : null;
+  return { id: inserted ? Number(inserted.lastInsertRowid) : null, kind, saved, datasetId: dataset.id, datasetName: dataset.name, ts: new Date().toISOString(),
     appVersion, config, metrics: storedMetrics, byType: result.byType, failed: result.failed, records: result.records };
 }
 
 function listEvaluationRunSummaries() {
-  return getDatabase().prepare(`SELECT r.id, r.ts, r.dataset_id AS datasetId,
-    CASE WHEN d.deleted_at IS NULL THEN d.name ELSE d.name || ' (deleted dataset)' END AS datasetName,
-    r.app_version AS appVersion, r.config_json AS configJson, r.metrics_json AS metricsJson
-    FROM eval_run_summaries r JOIN eval_question_sets d ON d.id = r.dataset_id ORDER BY r.id ASC LIMIT 100`).all()
+  return getDatabase().prepare(`SELECT * FROM (
+    SELECT r.id, r.ts, r.dataset_id AS datasetId, r.kind,
+      CASE WHEN d.deleted_at IS NULL THEN d.name ELSE d.name || ' (deleted dataset)' END AS datasetName,
+      r.app_version AS appVersion, r.config_json AS configJson, r.metrics_json AS metricsJson
+    FROM eval_run_summaries r JOIN eval_question_sets d ON d.id = r.dataset_id ORDER BY r.id DESC LIMIT 500
+  ) ORDER BY id ASC`).all()
     .map((row) => ({ ...row, config: JSON.parse(row.configJson), metrics: JSON.parse(row.metricsJson) }));
+}
+
+function previewEvaluationRunCleanup(keepLatestPerDataset = 10) {
+  const keep = Math.max(0, Math.min(500, Math.floor(Number(keepLatestPerDataset) || 0)));
+  const db = getDatabase();
+  const counts = db.prepare(`WITH ranked AS (
+    SELECT id, kind, ROW_NUMBER() OVER (PARTITION BY dataset_id ORDER BY id DESC) AS dataset_rank
+    FROM eval_run_summaries WHERE kind = 'manual'
+  ) SELECT (SELECT count(*) FROM eval_run_summaries WHERE kind IN ('calibration','sweep')) AS experiments,
+      (SELECT count(*) FROM ranked WHERE dataset_rank > ?) AS olderManual`).get(keep);
+  const experiments = Number(counts.experiments || 0), olderManual = Number(counts.olderManual || 0);
+  return { keepLatestPerDataset: keep, experiments, olderManual, total: experiments + olderManual };
+}
+
+function cleanupEvaluationRuns({ keepLatestPerDataset = 10, confirmation = '' } = {}) {
+  ensureWritable();
+  if (confirmation !== 'CLEAN UP RUNS') throw new Error('Type CLEAN UP RUNS to remove evaluation runs.');
+  const preview = previewEvaluationRunCleanup(keepLatestPerDataset);
+  if (!preview.total) return { ...preview, removed: 0 };
+  const db = getDatabase();
+  const result = db.prepare(`WITH ranked AS (
+    SELECT id, kind, ROW_NUMBER() OVER (PARTITION BY dataset_id ORDER BY id DESC) AS dataset_rank
+    FROM eval_run_summaries WHERE kind = 'manual'
+  ) DELETE FROM eval_run_summaries WHERE id IN (
+    SELECT id FROM eval_run_summaries WHERE kind IN ('calibration','sweep')
+    UNION SELECT id FROM ranked WHERE dataset_rank > ?
+  )`).run(preview.keepLatestPerDataset);
+  return { ...preview, removed: Number(result.changes) };
 }
 
 const evaluationYield = () => new Promise((resolve) => setImmediate(resolve));
@@ -1478,12 +1510,47 @@ function getDatabase() {
         dataset_id INTEGER NOT NULL REFERENCES eval_question_sets(id),
         app_version TEXT NOT NULL,
         config_json TEXT NOT NULL,
-        metrics_json TEXT NOT NULL
+        metrics_json TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'manual' CHECK(kind IN ('manual','calibration','sweep'))
       );
     `));
     migrate('evaluation-dataset-management-v1', () => {
       const columns = new Set(database.prepare('PRAGMA table_info(eval_question_sets)').all().map((column) => column.name));
       if (!columns.has('deleted_at')) database.exec('ALTER TABLE eval_question_sets ADD COLUMN deleted_at TEXT');
+    });
+    migrate('evaluation-run-kinds-v1', () => {
+      const runColumns = new Set(database.prepare('PRAGMA table_info(eval_run_summaries)').all().map((column) => column.name));
+      if (!runColumns.has('kind')) {
+        database.exec("ALTER TABLE eval_run_summaries ADD COLUMN kind TEXT NOT NULL DEFAULT 'manual'");
+        const rows = database.prepare('SELECT id, dataset_id, config_json FROM eval_run_summaries ORDER BY id').all().map((row) => {
+          let config = {};
+          try { config = JSON.parse(row.config_json || '{}'); } catch {}
+          return { ...row, config };
+        });
+        const markExperiment = database.prepare("UPDATE eval_run_summaries SET kind = ? WHERE id = ?");
+        for (const row of rows) {
+          const types = row.config.questionTypes || ['all'];
+          if (types.length !== 1 || types[0] !== 'all') markExperiment.run('sweep', row.id);
+        }
+        const cutoffs = [0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6];
+        const byDataset = new Map();
+        for (const row of rows) {
+          if (!byDataset.has(row.dataset_id)) byDataset.set(row.dataset_id, []);
+          byDataset.get(row.dataset_id).push(row);
+        }
+        for (const datasetRows of byDataset.values()) {
+          for (let start = 0; start <= datasetRows.length - cutoffs.length; start++) {
+            const block = datasetRows.slice(start, start + cutoffs.length);
+            if (block.every((row, index) => {
+              const types = row.config.questionTypes || ['all'];
+              return types.length === 1 && types[0] === 'all' && Math.abs(Number(row.config.minScore) - cutoffs[index]) < 1e-6;
+            })) {
+              for (const row of block) markExperiment.run('calibration', row.id);
+              start += cutoffs.length - 1;
+            }
+          }
+        }
+      }
     });
     migrate('chat-save-source-v1', () => {
       const chatColumns = new Set(database.prepare('PRAGMA table_info(chats)').all().map((column) => column.name));
@@ -2684,7 +2751,7 @@ function countBySource() {
     }, {});
 }
 
-module.exports = { initializeDatabase, closeDatabaseForTest, getDatabaseStatus, getRuntimeDatabaseStats, setPerformanceRecorder, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, saveEvaluationDataset, listEvaluationDatasets, runEvaluationDataset, listEvaluationRunSummaries, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, removeLegacyClient, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemoryLowQuality, listLowQualityCandidates, setMemorySource, searchMemoriesForClient, getMemoryEmbeddingVector, getMemoryForClient, countBySourceForClient, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, reembedStatus, reembedAllMemories, SUGGEST_MIN, AUTO_MIN, JOIN_ALL_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
+module.exports = { initializeDatabase, closeDatabaseForTest, getDatabaseStatus, getRuntimeDatabaseStats, setPerformanceRecorder, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, saveEvaluationDataset, listEvaluationDatasets, runEvaluationDataset, listEvaluationRunSummaries, previewEvaluationRunCleanup, cleanupEvaluationRuns, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, recordEvent, getMcpClientProfile, listClients, removeLegacyClient, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemoryLowQuality, listLowQualityCandidates, setMemorySource, searchMemoriesForClient, getMemoryEmbeddingVector, getMemoryForClient, countBySourceForClient, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, listRecentImports, undoImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, addMemory, deleteMemory, deleteConversationParts, countConversationParts, listMemories, getMemory, searchMemories, semanticSearch, configureEmbeddingProvider, reembedStatus, reembedAllMemories, SUGGEST_MIN, AUTO_MIN, JOIN_ALL_MIN, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions };
 module.exports.lockDatabase = lockDatabase;
 module.exports.migrateDatabaseToPassword = migrateDatabaseToPassword;
 module.exports.verifyMasterPassword = verifyMasterPassword;

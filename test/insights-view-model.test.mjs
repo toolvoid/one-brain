@@ -13,6 +13,9 @@ test('delta view model uses favorable arrows and n/a without a previous value', 
   assert.equal(deltaViewModel(12, 10, { higherIsBetter: false }).tone, 'bad');
   assert.equal(deltaViewModel(8, 10, { higherIsBetter: false }).tone, 'good');
   assert.equal(deltaViewModel(null, 10).label, 'No previous run');
+  assert.equal(deltaViewModel(10.04, 10, { unit: 'ms' }).hidden, true, 'latency changes that round to 0.0 ms are omitted');
+  assert.equal(deltaViewModel(10.06, 10, { unit: 'ms' }).label, '+0.1 ms vs previous');
+  assert.equal(deltaViewModel(10, 10, { unit: 'ms' }).hidden, true);
 });
 
 test('best-value highlights use per-metric direction and n/a formatting', () => {

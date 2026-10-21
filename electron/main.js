@@ -652,6 +652,8 @@ ipcMain.handle('evaluation:dataset-replace', (_event, id, rows) => replaceEvalua
 ipcMain.handle('evaluation:dataset-delete', (_event, id, options) => deleteEvaluationDataset(id, options || {}));
 ipcMain.handle('evaluation:run-dataset', (_event, id, options) => runEvaluationDataset(id, { ...(options || {}), appVersion: app.getVersion() }));
 ipcMain.handle('evaluation:runs', () => listEvaluationRunSummaries());
+ipcMain.handle('evaluation:runs-cleanup-preview', (_event, keepLatestPerDataset) => require('./db').previewEvaluationRunCleanup(keepLatestPerDataset));
+ipcMain.handle('evaluation:runs-cleanup', (_event, options) => require('./db').cleanupEvaluationRuns(options || {}));
 ipcMain.handle('status:graph-ready', () => {
   runtimeMilestones.startedToGraphReadyMs ??= Date.now() - appStartedAt;
   performanceMetrics.record('app_start_to_graph_ready', runtimeMilestones.startedToGraphReadyMs);

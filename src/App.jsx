@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import BrainGraph from './components/BrainGraph.jsx';
 import PanelErrorBoundary from './components/PanelErrorBoundary.jsx';
 import SecuritySettingsPanel from './components/SecuritySettingsPanel.jsx';
+import { Card, Icon, SectionHeader, StatusChip } from './components/ui/index.jsx';
 import { MAX_IMPORT_ITEMS, isLogLikeChunk, parseImportText, parseImportFile, inferImportSource } from './lib/importers.mjs';
 import '../extension/src/smart-save.js';
 import { fallbackMemoryTitle, heuristicMemoryTitle, isChatModel, memorySourceForProvider } from './lib/chat-models.mjs';
@@ -63,7 +64,7 @@ function AccessiblePicker({ label, value, options, onChange, renderOption, searc
 
 function SqlPanel({ title, description = 'A recent view of local activity.', children, sql }) {
   const [showSql, setShowSql] = useState(false);
-  return <section className="insight-card"><header><div><h2>{title}</h2><p className="insight-card-description">{description}</p></div><button type="button" className="sql-toggle secondary-button" onClick={() => setShowSql((value) => !value)}>{showSql ? 'Hide SQL' : 'Show SQL'}</button></header>{children}{showSql && <pre className="insight-sql">{sql}</pre>}</section>;
+  return <Card className="insight-card"><SectionHeader title={title} description={description} action={<button type="button" className="sql-toggle secondary-button" onClick={() => setShowSql((value) => !value)}>{showSql ? 'Hide details' : 'Show details'}</button>} />{children}{showSql && <pre className="insight-sql">{sql}</pre>}</Card>;
 }
 
 function InsightBars({ rows, valueKey, labelKey, groupKey, colors }) {
@@ -108,6 +109,11 @@ function EvaluationPanel() {
   const [bulkDeleteNotice, setBulkDeleteNotice] = useState('');
   const [bulkDeleteUndoAvailable, setBulkDeleteUndoAvailable] = useState(false);
   const [savedRuns, setSavedRuns] = useState([]);
+  const [showExperimentRuns, setShowExperimentRuns] = useState(false);
+  const [cleanupKeepCount, setCleanupKeepCount] = useState(10);
+  const [cleanupPreview, setCleanupPreview] = useState(null);
+  const [cleanupTyped, setCleanupTyped] = useState('');
+  const [cleanupMessage, setCleanupMessage] = useState('');
   const [selectedCompareIds, setSelectedCompareIds] = useState([]);
   const [compareOpen, setCompareOpen] = useState(false);
   const [latestImportedRun, setLatestImportedRun] = useState(null);
@@ -283,7 +289,7 @@ function EvaluationPanel() {
       for (const cutoff of calibrationCutoffs()) {
         const byDataset = {};
         for (const dataset of targets) {
-          const run = await window.brain.runEvaluationDataset(dataset.id, { config: { ...runConfig, minScore: cutoff }, includePrivate });
+          const run = await window.brain.runEvaluationDataset(dataset.id, { config: { ...runConfig, minScore: cutoff }, includePrivate, kind: 'calibration' });
           byDataset[dataset.id] = { hit3: run.metrics.hit3, negativeFalsePositiveRate: run.metrics.negativeFalsePositiveRate, mrr: run.metrics.mrr };
         }
         const values = Object.values(byDataset), withNegatives = values.filter((item) => item.negativeFalsePositiveRate != null);
@@ -311,7 +317,7 @@ function EvaluationPanel() {
     try {
       const rows = [];
       for (const tuning of rrfSweepConfigs()) {
-        const run = await window.brain.runEvaluationDataset(Number(selectedDataset), { config: { ...runConfig, ...tuning }, includePrivate, questionTypes: ['direct', 'paraphrase'] });
+        const run = await window.brain.runEvaluationDataset(Number(selectedDataset), { config: { ...runConfig, ...tuning }, includePrivate, questionTypes: ['direct', 'paraphrase'], kind: 'sweep' });
         rows.push({ ...tuning, hit3: run.metrics.hit3, mrr: run.metrics.mrr, count: run.metrics.positiveQuestions });
       }
       rows.sort((a, b) => b.hit3 - a.hit3 || b.mrr - a.mrr);
@@ -319,7 +325,7 @@ function EvaluationPanel() {
       if (rows[0]) {
         const bestConfig = { ...runConfig, ftsWeight: rows[0].ftsWeight, vectorWeight: rows[0].vectorWeight, rrfK: rows[0].rrfK };
         setRunConfig(bestConfig);
-        setVerificationRun(await window.brain.runEvaluationDataset(Number(selectedDataset), { config: bestConfig, includePrivate, questionTypes: ['multi', 'negative'] }));
+        setVerificationRun(await window.brain.runEvaluationDataset(Number(selectedDataset), { config: bestConfig, includePrivate, questionTypes: ['multi', 'negative'], kind: 'sweep' }));
       }
       await refresh();
     } catch (reason) { setError(reason.message || 'Could not sweep RRF settings.'); }
@@ -333,15 +339,28 @@ function EvaluationPanel() {
     })].join('\n');
     const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' })); link.download = 'one-brain-evaluation-metrics.csv'; link.click(); URL.revokeObjectURL(link.href);
   }
+  async function previewRunCleanup() {
+    try { setCleanupPreview(await window.brain.previewEvaluationRunCleanup(Number(cleanupKeepCount))); setCleanupTyped(''); setCleanupMessage(''); }
+    catch (reason) { setError(reason.message || 'Could not preview run cleanup.'); }
+  }
+  async function confirmRunCleanup() {
+    if (cleanupTyped !== 'CLEAN UP RUNS' || !cleanupPreview) return;
+    try {
+      const result = await window.brain.cleanupEvaluationRuns({ keepLatestPerDataset: Number(cleanupKeepCount), confirmation: cleanupTyped });
+      setCleanupMessage(`Removed ${result.removed} runs. Kept the latest ${result.keepLatestPerDataset} manual runs per dataset.`);
+      setCleanupPreview(null); setCleanupTyped(''); await refresh();
+    } catch (reason) { setError(reason.message || 'Could not clean up runs.'); }
+  }
 
   const percent = (value) => value == null ? 'n/a' : `${(Number(value || 0) * 100).toFixed(1)}%`;
   const delta = (value) => value == null ? '—' : `${value > 0 ? '+' : ''}${(Number(value) * 100).toFixed(1)}%`;
   const modeName = (mode) => ({ hybrid: 'Hybrid', 'fts-only': 'FTS only', 'semantic-only': 'Semantic only', 'extension-search': 'Extension search' })[mode] || mode;
 
   const latestPreviousRun = latestImportedRun ? [...savedRuns].reverse().find((run) => Number(run.datasetId) === Number(latestImportedRun.datasetId) && Number(run.id) !== Number(latestImportedRun.id)) : null;
-  const runHighlights = bestValueRows(savedRuns, ['hit1','hit3','hit5','mrr','negativeFalsePositiveRate','medianLatencyMs'], { negativeFalsePositiveRate: 'lower', medianLatencyMs: 'lower' });
-  const selectedRuns = selectedCompareIds.map((id) => savedRuns.find((run) => Number(run.id) === Number(id))).filter(Boolean).sort((a,b) => Number(a.id) - Number(b.id));
-  const hit3Points = runChartPoints(savedRuns, 'hit3'), mrrPoints = runChartPoints(savedRuns, 'mrr');
+  const visibleRuns = savedRuns.filter((run) => showExperimentRuns || (run.kind || 'manual') === 'manual');
+  const runHighlights = bestValueRows(visibleRuns, ['hit1','hit3','hit5','mrr','negativeFalsePositiveRate','medianLatencyMs'], { negativeFalsePositiveRate: 'lower', medianLatencyMs: 'lower' });
+  const selectedRuns = selectedCompareIds.map((id) => visibleRuns.find((run) => Number(run.id) === Number(id))).filter(Boolean).sort((a,b) => Number(a.id) - Number(b.id));
+  const hit3Points = runChartPoints(visibleRuns, 'hit3'), mrrPoints = runChartPoints(visibleRuns, 'mrr');
   return <section id="insights-panel-evaluation" role="tabpanel" aria-labelledby="insights-tab-evaluation" className="insight-card evaluation-panel">
     <header className="evaluation-page-title"><div><h2>Retrieval evaluation</h2><p className="insight-card-description">Run saved question sets, compare quality and manage your datasets.</p></div></header>
     {error && <p className="sql-error" role="alert">{error}</p>}
@@ -361,14 +380,18 @@ function EvaluationPanel() {
     <section className="evaluation-import eval-run-card"><header><div><h3>Run</h3><p className="insight-card-description">Select a dataset, then run it, calibrate all datasets or sweep weights.</p></div><button className="secondary-button" type="button" onClick={exportMetrics} disabled={!savedRuns.length} title={!savedRuns.length ? 'Run a dataset before exporting metrics.' : ''}>Export metrics</button></header>
       <label>Dataset<select value={selectedDataset} onChange={(event) => setSelectedDataset(event.target.value)}><option value="">Choose dataset</option>{datasets.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.questions} questions</option>)}</select></label>
       <label><input type="checkbox" checked={includePrivate} onChange={(event) => setIncludePrivate(event.target.checked)} /> Include private memories</label>
-      <details><summary>Temporary retrieval configuration</summary><p>These values apply only to this run. Chunk size and overlap are recorded for reproducibility; existing memories keep the chunk boundaries used when imported.</p><p>Embedding model: {latestImportedRun?.config?.model || 'Current configured model'}</p>{[['ftsWeight','FTS weight'],['vectorWeight','Vector weight'],['rrfK','RRF k'],['minScore','Minimum cosine relevance'],['topN','Top N'],['chunkSize','Chunk size'],['chunkOverlap','Chunk overlap']].map(([key,label]) => <label key={key}>{label}<input type="number" min="0" max={key === 'minScore' ? '1' : undefined} step={key === 'minScore' || key.includes('Weight') ? '0.01' : '1'} value={runConfig[key]} onChange={(event) => setRunConfig((current) => ({ ...current, [key]: Number(event.target.value) }))} /></label>)}</details>
-      <div className="eval-run-actions"><button type="button" className="primary-button" onClick={() => void runImportedDataset()} disabled={running || !selectedDataset} title={!selectedDataset ? 'Choose a dataset first.' : ''}>{running ? 'Running…' : 'Run dataset'}</button><button type="button" className="secondary-button" onClick={() => void calibrateCutoff()} disabled={running || !datasets.length} title={!datasets.length ? 'Import a dataset first.' : ''}>{running ? 'Calibrating…' : 'Calibrate all datasets'}</button><button type="button" className="secondary-button" onClick={() => void sweepRrfWeights()} disabled={running || !selectedDataset} title={!selectedDataset ? 'Choose a dataset first.' : ''}>{running ? 'Sweeping…' : 'Sweep weights and k'}</button></div>
-      {calibrationRows.length > 0 && <section className="evaluation-results"><h4>Cutoff calibration · all datasets</h4><p>Recommendation balances average hit@3 and negative false-positive rate across the saved datasets.</p><div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>Cosine cutoff</th>{calibrationDatasetNames.map((dataset) => <th key={dataset.id}>{dataset.name} · Hit@3 / Neg. FP</th>)}</tr></thead><tbody>{calibrationRows.map((row) => <tr key={row.cutoff}><td>{row.cutoff.toFixed(2)}{row.cutoff === recommendedCutoff ? ' · recommended' : ''}</td>{calibrationDatasetNames.map((dataset) => <td key={dataset.id}>{percent(row.byDataset?.[dataset.id]?.hit3)} / {percent(row.byDataset?.[dataset.id]?.negativeFalsePositiveRate)}</td>)}</tr>)}</tbody></table></div><button className="secondary-button" type="button" onClick={() => void applyRecommendedCutoff()} disabled={running}>Apply recommended cutoff</button></section>}
-      {weightSweepRows.length > 0 && <section className="evaluation-results"><h4>RRF sweep · tuned on direct + paraphrase</h4><p>Small datasets can overfit. The best configuration is verified separately on multi + negative questions below.</p><div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>FTS weight</th><th>Vector weight</th><th>RRF k</th><th>Hit@3</th><th>MRR</th><th>Questions</th></tr></thead><tbody>{weightSweepRows.map((row, index) => <tr key={`${row.ftsWeight}-${row.vectorWeight}-${row.rrfK}`}><td>{row.ftsWeight}</td><td>{row.vectorWeight}</td><td>{row.rrfK}</td><td>{percent(row.hit3)}{index === 0 ? ' · best' : ''}</td><td>{row.mrr.toFixed(3)}</td><td>{row.count}</td></tr>)}</tbody></table></div></section>}
+      <details><summary>Advanced search settings</summary><p>These values apply only to this run. Chunk size and overlap are recorded for reproducibility; existing memories keep the chunk boundaries used when imported.</p><p>Embedding model: {latestImportedRun?.config?.model || 'Current configured model'}</p>{[['ftsWeight','Text match weight'],['vectorWeight','Meaning match weight'],['rrfK','Rank balance'],['minScore','Minimum relevance'],['topN','Number of results'],['chunkSize','Chunk size'],['chunkOverlap','Chunk overlap']].map(([key,label]) => <label key={key}>{label}<input type="number" min="0" max={key === 'minScore' ? '1' : undefined} step={key === 'minScore' || key.includes('Weight') ? '0.01' : '1'} value={runConfig[key]} onChange={(event) => setRunConfig((current) => ({ ...current, [key]: Number(event.target.value) }))} /></label>)}</details>
+      <div className="eval-run-actions"><button type="button" className="primary-button" onClick={() => void runImportedDataset()} disabled={running || !selectedDataset} title={!selectedDataset ? 'Choose a dataset first.' : ''}>{running ? 'Running…' : 'Run dataset'}</button><button type="button" className="secondary-button" onClick={() => void calibrateCutoff()} disabled={running || !datasets.length} title={!datasets.length ? 'Import a dataset first.' : ''}>{running ? 'Calibrating…' : 'Find best relevance cutoff'}</button><button type="button" className="secondary-button" onClick={() => void sweepRrfWeights()} disabled={running || !selectedDataset} title={!selectedDataset ? 'Choose a dataset first.' : ''}>{running ? 'Comparing settings…' : 'Compare search settings'}</button></div>
+      {calibrationRows.length > 0 && <section className="evaluation-results"><h4>Relevance cutoff · all datasets</h4><p>Recommendation balances average hit@3 and negative false-positive rate across the saved datasets.</p><div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>Relevance cutoff</th>{calibrationDatasetNames.map((dataset) => <th key={dataset.id}>{dataset.name} · Hit@3 / Neg. FP</th>)}</tr></thead><tbody>{calibrationRows.map((row) => <tr key={row.cutoff}><td>{row.cutoff.toFixed(2)}{row.cutoff === recommendedCutoff ? ' · recommended' : ''}</td>{calibrationDatasetNames.map((dataset) => <td key={dataset.id}>{percent(row.byDataset?.[dataset.id]?.hit3)} / {percent(row.byDataset?.[dataset.id]?.negativeFalsePositiveRate)}</td>)}</tr>)}</tbody></table></div><button className="secondary-button" type="button" onClick={() => void applyRecommendedCutoff()} disabled={running}>Apply recommended cutoff</button></section>}
+      {weightSweepRows.length > 0 && <section className="evaluation-results"><h4>Search setting comparison · common questions</h4><details><summary>Advanced details</summary><p>This compares text matching, meaning matching and how their result rankings are combined. Small datasets can overfit, so the top setting is checked again with multi-part and no-answer questions.</p></details><div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>Text weight</th><th>Meaning weight</th><th>Rank balance</th><th>Hit@3</th><th>MRR</th><th>Questions</th></tr></thead><tbody>{weightSweepRows.map((row, index) => <tr key={`${row.ftsWeight}-${row.vectorWeight}-${row.rrfK}`}><td>{row.ftsWeight}</td><td>{row.vectorWeight}</td><td>{row.rrfK}</td><td>{percent(row.hit3)}{index === 0 ? ' · best' : ''}</td><td>{row.mrr.toFixed(3)}</td><td>{row.count}</td></tr>)}</tbody></table></div></section>}
       {verificationRun && <section className="evaluation-results"><h4>Held-out verification · multi + negative</h4><p>Hit@3 {percent(verificationRun.metrics.hit3)} · MRR {verificationRun.metrics.mrr.toFixed(3)} · negative false-positive {percent(verificationRun.metrics.negativeFalsePositiveRate)}</p></section>}
     </section>
-    {savedRuns.length > 0 && <section className="evaluation-results eval-saved-runs"><header><div><h3>Saved runs</h3><p className="insight-card-description">Compare metrics across runs. Select two rows to see their deltas.</p></div><button className="secondary-button" type="button" disabled={selectedRuns.length !== 2} title={selectedRuns.length !== 2 ? 'Select two runs to compare.' : ''} onClick={() => setCompareOpen((value) => !value)}>Compare selected ({selectedRuns.length}/2)</button></header><div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>Compare</th><th>Run</th><th>Dataset</th><th>Hit@1</th><th>Hit@3</th><th>Hit@5</th><th>MRR</th><th>Neg. false positives</th><th>Median ms</th><th>Δ MRR vs previous</th></tr></thead><tbody>{savedRuns.map((run, runIndex) => <tr key={run.id}><td><input aria-label={`Select run ${run.id} for comparison`} type="checkbox" checked={selectedCompareIds.includes(run.id)} onChange={(event) => setSelectedCompareIds((current) => event.target.checked ? [...current, run.id].slice(-2) : current.filter((id) => id !== run.id))} /></td><td>{dateLabel(run.ts)}</td><td>{run.datasetName}</td>{['hit1','hit3','hit5','mrr','negativeFalsePositiveRate','medianLatencyMs'].map((metric) => <td key={metric} className={`${runHighlights[runIndex]?.[metric] ? 'best-value ' : ''}numeric-cell`}>{metric === 'mrr' ? Number(run.metrics[metric]).toFixed(3) : metric === 'medianLatencyMs' ? Number(run.metrics[metric]).toFixed(1) : percent(run.metrics[metric])}</td>)}<td>{run.delta ? delta(run.delta.mrr) : '—'}</td></tr>)}</tbody></table></div>{compareOpen && selectedRuns.length === 2 && <section className="compare-summary"><h4>Compare runs: {selectedRuns[0].datasetName} vs {selectedRuns[1].datasetName}</h4>{['hit1','hit3','hit5','mrr','negativeFalsePositiveRate','medianLatencyMs'].map((metric) => { const value = (run) => metric === 'medianLatencyMs' ? `${Number(run.metrics[metric]).toFixed(1)} ms` : metric === 'mrr' ? Number(run.metrics[metric]).toFixed(3) : percent(run.metrics[metric]); const change = deltaViewModel(selectedRuns[1].metrics[metric], selectedRuns[0].metrics[metric], { higherIsBetter: !['negativeFalsePositiveRate','medianLatencyMs'].includes(metric), unit: metric === 'medianLatencyMs' ? 'ms' : 'pp' }); return <p key={metric}>{metric}: {value(selectedRuns[0])} → {value(selectedRuns[1])} · {change.symbol} {change.label}</p>; })}</section>}<div className="run-history-charts"><InlineRunChart title="Hit@3 across runs" points={hit3Points} /><InlineRunChart title="MRR across runs" points={mrrPoints} /></div></section>}
-    {latestImportedRun && <section className="evaluation-results eval-latest-results"><header><div><h3>Results · {latestImportedRun.datasetName}</h3><p className="insight-card-description">Retrieval quality from the most recent run.</p></div></header><div className="evaluation-kpi-grid">{[['Hit@1',latestImportedRun.metrics.hit1,'hit1',true],['Hit@3',latestImportedRun.metrics.hit3,'hit3',true],['Hit@5',latestImportedRun.metrics.hit5,'hit5',true],['MRR',latestImportedRun.metrics.mrr,'mrr',true],['Negative false-positive',latestImportedRun.metrics.negativeFalsePositiveRate,'negativeFalsePositiveRate',false],['Median latency',latestImportedRun.metrics.medianLatencyMs,'medianLatencyMs',false]].map(([label,value,key,higher]) => { const prior = latestPreviousRun?.metrics?.[key]; const viewModel = deltaViewModel(value, prior, { higherIsBetter: higher, unit: key === 'medianLatencyMs' ? 'ms' : 'pp' }); const width = key === 'medianLatencyMs' ? Math.min(100, Number(value || 0) / Math.max(1, Number(prior || value || 1)) * 50) : Math.max(0, Math.min(100, Number(value || 0) * 100)); return <article className="evaluation-kpi" key={key}><span>{label}</span><strong>{key === 'mrr' ? Number(value || 0).toFixed(3) : key === 'medianLatencyMs' ? `${Number(value || 0).toFixed(1)} ms` : percent(value)}</strong><small className={`metric-delta ${viewModel.tone}`}>{viewModel.symbol} {viewModel.label}{prior == null ? ' · first run' : ''}</small><i className="kpi-bar"><b style={{ width: `${width}%` }} /></i></article>; })}</div><h4>Per type</h4><div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>Type</th><th>Questions</th><th>Hit@1</th><th>Hit@3</th><th>MRR / false positive</th></tr></thead><tbody>{evaluationTypeRows(latestImportedRun.byType).map((row) => <tr key={row.type}><td>{row.type}</td><td>{row.count}</td><td>{row.hit1}</td><td>{row.hit3}</td><td>{row.mrr}</td></tr>)}</tbody></table></div><h4>Failed questions · in-app only</h4>{latestImportedRun.failed.length ? <div className="failed-question-list">{latestImportedRun.failed.map((item) => <details key={item.id}><summary><strong>{item.id} · {item.type} · rank {item.rank ?? '—'}{item.diagnostics?.filteredByGate ? ' · filtered by relevance gate' : ''}</strong><span>{item.question}</span></summary><p><b>Expected:</b> {item.expectedTitle || 'None'} · <b>Returned top 3:</b> {item.returned.map((memory) => memory.title).join(' · ') || 'No results'}</p>{item.docHit && <p>Document hit: matched another part of the expected document.</p>}{item.diagnostics && <p>Ranks: FTS {item.diagnostics.ftsRank ?? '—'} · vector {item.diagnostics.vectorRank ?? '—'} · hybrid {item.diagnostics.hybridRank ?? '—'} · expected cosine {item.diagnostics.cosineSimilarity == null ? '—' : item.diagnostics.cosineSimilarity.toFixed(3)} · gate {item.diagnostics.filteredByGate ? 'filtered' : 'passed / not filtered'}</p>}</details>)}</div> : <p className="empty-note">No failed questions in this run.</p>}</section>}
+    <section className="evaluation-results eval-saved-runs"><header><div><h3>Saved runs</h3><p className="insight-card-description">Compare results across datasets. Experiments stay in their result panels.</p></div><button className="secondary-button" type="button" disabled={selectedRuns.length !== 2} title={selectedRuns.length !== 2 ? 'Select two runs to compare.' : ''} onClick={() => setCompareOpen((value) => !value)}>Compare selected ({selectedRuns.length}/2)</button></header>
+      <label className="experiment-toggle"><input type="checkbox" checked={showExperimentRuns} onChange={(event) => setShowExperimentRuns(event.target.checked)} /> Show experiment runs</label>
+      {visibleRuns.length ? <><div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>Compare</th><th>Run</th><th>Dataset</th><th>Kind</th><th>Hit@1</th><th>Hit@3</th><th>Hit@5</th><th>MRR</th><th>Neg. false positives</th><th>Median ms</th><th>Δ MRR vs previous</th></tr></thead><tbody>{visibleRuns.map((run, runIndex) => <tr key={run.id}><td><input aria-label={`Select run ${run.id} for comparison`} type="checkbox" checked={selectedCompareIds.includes(run.id)} onChange={(event) => setSelectedCompareIds((current) => event.target.checked ? [...current, run.id].slice(-2) : current.filter((id) => id !== run.id))} /></td><td>{dateLabel(run.ts)}</td><td>{run.datasetName}</td><td>{run.kind || 'manual'}</td>{['hit1','hit3','hit5','mrr','negativeFalsePositiveRate','medianLatencyMs'].map((metric) => <td key={metric} className={`${runHighlights[runIndex]?.[metric] ? 'best-value ' : ''}numeric-cell`}>{metric === 'mrr' ? Number(run.metrics[metric]).toFixed(3) : metric === 'medianLatencyMs' ? Number(run.metrics[metric]).toFixed(1) : percent(run.metrics[metric])}</td>)}<td>{run.delta ? delta(run.delta.mrr) : '—'}</td></tr>)}</tbody></table></div>{compareOpen && selectedRuns.length === 2 && <section className="compare-summary"><h4>Compare runs: {selectedRuns[0].datasetName} vs {selectedRuns[1].datasetName}</h4>{['hit1','hit3','hit5','mrr','negativeFalsePositiveRate','medianLatencyMs'].map((metric) => { const value = (run) => metric === 'medianLatencyMs' ? `${Number(run.metrics[metric]).toFixed(1)} ms` : metric === 'mrr' ? Number(run.metrics[metric]).toFixed(3) : percent(run.metrics[metric]); const change = deltaViewModel(selectedRuns[1].metrics[metric], selectedRuns[0].metrics[metric], { higherIsBetter: !['negativeFalsePositiveRate','medianLatencyMs'].includes(metric), unit: metric === 'medianLatencyMs' ? 'ms' : 'pp' }); return change.hidden ? null : <p key={metric}>{metric}: {value(selectedRuns[0])} → {value(selectedRuns[1])} · {change.symbol} {change.label}</p>; })}</section>}<div className="run-history-charts"><InlineRunChart title="Hit@3 across runs" points={hit3Points} /><InlineRunChart title="MRR across runs" points={mrrPoints} /></div></> : <p className="empty-note">No saved manual runs yet. Run a dataset to see its results here.</p>}
+      <details className="run-cleanup"><summary>Clean up runs</summary><p>Remove experiment runs and keep the latest number of manual runs for each dataset.</p><label>Keep latest per dataset<input type="number" min="0" max="500" value={cleanupKeepCount} onChange={(event) => { setCleanupKeepCount(event.target.value); setCleanupPreview(null); }} /></label><button className="secondary-button" type="button" onClick={() => void previewRunCleanup()}>Preview cleanup</button>{cleanupPreview && <div className="run-cleanup-confirm" role="group" aria-label="Confirm run cleanup"><p>Preview: {cleanupPreview.total} runs will be removed ({cleanupPreview.experiments} experiment runs and {cleanupPreview.olderManual} older manual runs).</p><label>Type CLEAN UP RUNS<input value={cleanupTyped} onChange={(event) => setCleanupTyped(event.target.value)} /></label><button className="evaluation-delete" type="button" disabled={!cleanupPreview.total || cleanupTyped !== 'CLEAN UP RUNS'} onClick={() => void confirmRunCleanup()}>Remove runs</button></div>}{cleanupMessage && <p role="status">{cleanupMessage}</p>}</details>
+    </section>
+    {latestImportedRun && <section className="evaluation-results eval-latest-results"><header><div><h3>Results · {latestImportedRun.datasetName}</h3><p className="insight-card-description">Retrieval quality from the most recent run.</p></div></header><div className="evaluation-kpi-grid">{[['Hit@1',latestImportedRun.metrics.hit1,'hit1',true],['Hit@3',latestImportedRun.metrics.hit3,'hit3',true],['Hit@5',latestImportedRun.metrics.hit5,'hit5',true],['MRR',latestImportedRun.metrics.mrr,'mrr',true],['Negative false-positive',latestImportedRun.metrics.negativeFalsePositiveRate,'negativeFalsePositiveRate',false],['Median latency',latestImportedRun.metrics.medianLatencyMs,'medianLatencyMs',false]].map(([label,value,key,higher]) => { const prior = latestPreviousRun?.metrics?.[key]; const viewModel = deltaViewModel(value, prior, { higherIsBetter: higher, unit: key === 'medianLatencyMs' ? 'ms' : 'pp' }); const width = key === 'medianLatencyMs' ? Math.min(100, Number(value || 0) / Math.max(1, Number(prior || value || 1)) * 50) : Math.max(0, Math.min(100, Number(value || 0) * 100)); return <article className="evaluation-kpi" key={key}><span>{label}</span><strong>{key === 'mrr' ? Number(value || 0).toFixed(3) : key === 'medianLatencyMs' ? `${Number(value || 0).toFixed(1)} ms` : percent(value)}</strong>{!viewModel.hidden && <small className={`metric-delta ${viewModel.tone}`}>{viewModel.symbol} {viewModel.label}{prior == null ? ' · first run' : ''}</small>}<i className="kpi-bar"><b style={{ width: `${width}%` }} /></i></article>; })}</div><h4>Per type</h4><div className="evaluation-table-wrap"><table className="evaluation-table"><thead><tr><th>Type</th><th>Questions</th><th>Hit@1</th><th>Hit@3</th><th>MRR / false positive</th></tr></thead><tbody>{evaluationTypeRows(latestImportedRun.byType).map((row) => <tr key={row.type}><td>{row.type}</td><td>{row.count}</td><td>{row.hit1}</td><td>{row.hit3}</td><td>{row.mrr}</td></tr>)}</tbody></table></div><h4>Failed questions · in-app only</h4>{latestImportedRun.failed.length ? <div className="failed-question-list">{latestImportedRun.failed.map((item) => <details key={item.id}><summary><strong>{item.id} · {item.type} · rank {item.rank ?? '—'}{item.diagnostics?.filteredByGate ? ' · filtered by relevance gate' : ''}</strong><span>{item.question}</span></summary><p><b>Expected:</b> {item.expectedTitle || 'None'} · <b>Returned top 3:</b> {item.returned.map((memory) => memory.title).join(' · ') || 'No results'}</p>{item.docHit && <p>Document hit: matched another part of the expected document.</p>}{item.diagnostics && <p>Ranks: FTS {item.diagnostics.ftsRank ?? '—'} · vector {item.diagnostics.vectorRank ?? '—'} · hybrid {item.diagnostics.hybridRank ?? '—'} · expected cosine {item.diagnostics.cosineSimilarity == null ? '—' : item.diagnostics.cosineSimilarity.toFixed(3)} · gate {item.diagnostics.filteredByGate ? 'filtered' : 'passed / not filtered'}</p>}</details>)}</div> : <p className="empty-note">No failed questions in this run.</p>}</section>}
     <details className="eval-legacy"><summary>Manual case tools and run history</summary><div className="eval-legacy-content"><p className="insight-card-description">Keep one-off query checks and the original case-by-case evaluator available here.</p><div className="evaluation-add">
       <label>Query<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search query to evaluate" /></label>
       <button type="button" onClick={() => void searchForExpected(query, editingCase)} disabled={searching || !query.trim()}>{searching ? 'Searching…' : 'Search'}</button>
@@ -524,7 +547,7 @@ function ProviderKeysPanel({ clients }) {
     <label className="proxy-setting"><input type="checkbox" checked={settings.enabled} onChange={(event) => void update({ enabled: event.target.checked })} />Enabled</label>
     <label className="proxy-setting"><input type="checkbox" checked={settings.dryRun} onChange={(event) => void update({ dryRun: event.target.checked })} />Dry run (measure retrieval, send unchanged request)</label>
     <label className="proxy-setting">Maximum memories<input type="number" min="1" max="10" value={settings.count} onChange={(event) => void update({ count: event.target.value })} /></label>
-    <label className="proxy-setting">Minimum cosine relevance<input type="number" min="0" max="1" step="0.05" value={settings.minScore} onChange={(event) => void update({ minScore: event.target.value })} /></label>
+    <label className="proxy-setting">Minimum relevance<input type="number" min="0" max="1" step="0.05" value={settings.minScore} onChange={(event) => void update({ minScore: event.target.value })} /></label>
     <h3>Save-back review (off by default)</h3>
     <label className="proxy-setting">Cheap model<input value={settings.saveBackModel || ''} onChange={(event) => setSettings((value) => ({ ...value, saveBackModel: event.target.value }))} onBlur={() => void update({ saveBackModel: settings.saveBackModel })} /></label>
     {clients.filter((client) => client.verified).map((client) => <label className="proxy-setting" key={client.client}><input type="checkbox" checked={Boolean(settings.saveBackClients?.[client.client])} onChange={(event) => void update({ saveBackClients: { [client.client]: event.target.checked } })} />Allow save-back candidates for {client.client}</label>)}
@@ -533,8 +556,8 @@ function ProviderKeysPanel({ clients }) {
   </section>;
 }
 
-function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContext, activity, counts, mcpConfig, onRefresh, onConnect, onDisconnect, onTest, onConnectAll, onRotateAll }) {
-  const [tab, setTab] = useState('connections');
+function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContext, activity, counts, mcpConfig, onRefresh, onConnect, onDisconnect, onTest, onConnectAll, onRotateAll, initialTab = 'connections' }) {
+  const [tab, setTab] = useState(initialTab);
   const [filter, setFilter] = useState('');
   const [notice, setNotice] = useState('');
   const [pairCode, setPairCode] = useState(null);
@@ -553,6 +576,7 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
     if (statusFilter === 'setup') return ['not_set_up', 'not_installed', 'manual_only', 'not_checked'].includes(row.healthStatus);
     return true;
   });
+  useEffect(() => { setTab(initialTab); }, [initialTab]);
   const filteredActivity = activity.filter((event) => !filter || event.client === filter);
   const seenSuccessfulChecks = new Set();
   const visibleActivity = filteredActivity.filter((event) => {
@@ -664,8 +688,9 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
     {tab === 'security' ? <PanelErrorBoundary><SecuritySettingsPanel /></PanelErrorBoundary> : tab === 'connections' ? <>
       <nav className="connection-filters" aria-label="Filter connections">{[['all', 'All', rows.length], ['connected', 'Connected', connectedCount], ['attention', 'Needs attention', limitedCount + health.needAction], ['setup', 'Not set up', health.notSetUp]].map(([value, label, count]) => <button type="button" key={value} aria-pressed={statusFilter === value} onClick={() => setStatusFilter(value)}>{label} <span>{count}</span></button>)}</nav>
       <div className="connection-compact-list">{visibleRows.map((row) => <article className="connection-compact-row" key={row.id}>
-        <div className="connection-compact-heading"><div><strong>{row.name}</strong><small className="connection-type">{row.type}</small></div><span className={`connection-status ${row.status.toLowerCase().replaceAll(' ', '-')}`}>{row.status === 'Degraded' ? 'Limited' : row.status}</span></div>
+        <div className="connection-compact-heading"><div><strong>{row.name}</strong><small className="connection-type">{row.type.includes('MCP') ? 'AI connection' : row.type}</small></div><StatusChip status={row.status === 'Degraded' ? 'Limited' : row.status}>{row.status === 'Degraded' ? 'Limited' : row.status}</StatusChip></div>
         {row.reason && <small className="connection-compact-reason">{row.reason}</small>}
+        <button type="button" className="connection-primary-action" onClick={() => ['needs_restart', 'failing', 'degraded'].includes(row.healthStatus) ? void connect(row) : ['not_set_up', 'not_installed', 'manual_only'].includes(row.healthStatus) ? void connect(row) : void testOne(row)}>{['needs_restart', 'failing', 'degraded'].includes(row.healthStatus) ? 'Fix connection' : ['not_set_up', 'not_installed', 'manual_only'].includes(row.healthStatus) ? 'Connect' : 'Test connection'}</button>
         {row.healthStatus === 'needs_restart' && row.mcpHealthDetails && <small className="connection-compact-meta">Why? Token generation {row.mcpHealthDetails.tokenGeneration}; last real call {row.mcpHealthDetails.lastRealCall ? `${relative(row.mcpHealthDetails.lastRealCall.time)} at generation ${row.mcpHealthDetails.lastRealCall.generation} (${row.mcpHealthDetails.lastRealCall.ok ? 'succeeded' : 'failed'})` : 'not recorded'}; last probe {row.mcpHealthDetails.lastProbe ? `${relative(row.mcpHealthDetails.lastProbe.time)} (${row.mcpHealthDetails.lastProbe.ok ? 'passed' : 'failed'})` : 'not recorded'}.</small>}
         {row.healthDetails && <details className="connection-tech-details"><summary>Technical details</summary><small>Last check {relative(row.healthDetails.pingAt)} · token {row.healthDetails.tokenValid ? 'valid' : 'invalid'} · approval {row.healthDetails.approval} · origin {row.healthDetails.receivedOrigin || '—'} / expected {row.healthDetails.expectedOrigin || '—'} · API {row.healthDetails.apiVersion || '—'} · build {row.healthDetails.buildId || '—'} · host permission {row.healthDetails.hostPermission === true ? 'granted' : row.healthDetails.hostPermission === false ? 'missing' : 'unknown'} · self-check {row.healthDetails.selfCheck ? `${Object.values(row.healthDetails.selfCheck.matched || {}).filter((count) => count > 0).length} selectors matched ${relative(row.healthDetails.selfCheck.at)}` : 'not run'} · last successful {row.healthDetails.lastSuccessfulUse ? `${row.healthDetails.lastSuccessfulUse.action} ${relative(row.healthDetails.lastSuccessfulUse.time)}` : 'search/save not recorded'}</small></details>}
         {row.site && <button type="button" className="connection-check-extension" onClick={() => void checkExtension(row)}>Check extension</button>}
@@ -768,7 +793,7 @@ function InsightsView({ data, onBack, sql, setSql, runSql, sqlResult, sqlRunning
       <SqlPanel title="Most retrieved memories" sql={retrievals.sql}>{table(retrievals.rows, [['id','ID'],['title','Title'],['source','Source'],['retrieved','Retrieved'],['views','UI views']])}<p className="insight-note">Never retrieved: <b>{never.rows[0]?.total ?? 0}</b></p><p className="insight-note">{data?.retrievalResetAt ? `Retrieval counts reset ${dateLabel(data.retrievalResetAt)}.` : `Counts before ${data?.retrievalWarningDate || 'the reset'} may include list loads.`}</p>{!data?.retrievalResetAt && <button type="button" onClick={onResetRetrievalCounts}>Reset retrieval counts</button>}</SqlPanel>
       <SqlPanel title="Most viewed in the UI" sql={viewed.sql}>{table(viewed.rows, [['id','ID'],['title','Title'],['source','Source'],['views','Views']])}</SqlPanel>
       <SqlPanel title="Embedding index status" sql={embedding.sql}><div className="insight-stat"><strong>{embedding.rows[0]?.indexed ?? 0}</strong><span>indexed of {embedding.rows[0]?.total ?? 0} memories</span></div></SqlPanel>
-      <SqlPanel title="Connected MCP clients" sql={clients.sql}>{table(clients.rows, [['client','Client'],['identity','Identity'],['first_seen','First seen'],['last_seen','Last seen'],['total_calls','Total calls'],['calls_last_7_days','Last 7 days']])}</SqlPanel>
+      <SqlPanel title="Connected AI services" sql={clients.sql}>{table(clients.rows, [['client','Client'],['identity','Identity'],['first_seen','First seen'],['last_seen','Last seen'],['total_calls','Total calls'],['calls_last_7_days','Last 7 days']])}</SqlPanel>
       <SqlPanel title="Proxy" sql={proxyCalls.sql}>{table(proxyCalls.rows, [['client','Client'],['provider','Provider'],['calls','Calls'],['average_memories_injected','Average memories injected']])}</SqlPanel>
     </div>
     <section className="insight-card run-sql-card"><header><h2>Run SQL</h2><small>Read only · SELECT only · 200 rows · 3 second timeout</small></header><textarea aria-label="SQL query" spellCheck="false" value={sql} onChange={(event) => setSql(event.target.value)} /><button className="run-sql-button" type="button" onClick={runSql} disabled={sqlRunning}>{sqlRunning ? 'Running…' : 'Run SQL'}</button>{sqlResult?.error && <p className="sql-error" role="alert">{sqlResult.error}</p>}{sqlResult?.rows && table(sqlResult.rows, sqlResult.columns.map((column) => [column, column]), 'Query returned no rows')}</section>
@@ -1153,6 +1178,7 @@ function App() {
   const [embeddingStatus, setEmbeddingStatus] = useState({ state: 'loading' });
   const [databaseStatus, setDatabaseStatus] = useState({ writable: true, message: '' });
   const [connectOpen, setConnectOpen] = useState(false);
+  const [connectionsStartTab, setConnectionsStartTab] = useState('connections');
   const [pendingOpen, setPendingOpen] = useState(false);
   const [pendingMemories, setPendingMemories] = useState([]);
   const [clients, setClients] = useState([]);
@@ -1181,6 +1207,8 @@ function App() {
   const [copyError, setCopyError] = useState('');
   const [quitPending, setQuitPending] = useState(false);
   const [quitError, setQuitError] = useState('');
+  const [vaultConfigured, setVaultConfigured] = useState(false);
+  const [searchChecklistDone, setSearchChecklistDone] = useState(() => window.localStorage.getItem('one-brain-checklist-search-done') === '1');
   const graphRef = useRef(null);
   const searchRequest = useRef(0);
   const typedSearchPending = useRef(null);
@@ -1190,12 +1218,15 @@ function App() {
 
   const selectedMemory = memories.find((memory) => String(memory.id) === String(selectedId)) || null;
   useEffect(() => {
+    const updateVaultState = () => window.brain.getSecurityStatus?.().then((result) => setVaultConfigured(Boolean(result?.vaultSet))).catch(() => {});
+    void updateVaultState();
+    const vaultTimer = setInterval(updateVaultState, 2000);
     let active = true;
     window.brain.getGraphicsSettings?.().then((value) => {
       if (active && value.restartNotice) setGraphicsNotice('Graphics driver problem: safe mode enabled, restart to apply');
     }).catch(() => {});
     const unsubscribe = window.brain.onGraphicsSafeModeEnabled?.(() => setGraphicsNotice('Graphics driver problem: safe mode enabled, restart to apply'));
-    return () => { active = false; unsubscribe?.(); };
+    return () => { active = false; clearInterval(vaultTimer); unsubscribe?.(); };
   }, []);
   async function dismissGraphicsNotice() {
     setGraphicsNotice('');
@@ -1410,6 +1441,9 @@ function App() {
   }
 
   function openConnectSettings() {
+    setConnectionsStartTab('connections');
+    setInsightsOpen(false); setChatOpen(false); setPendingOpen(false);
+    setSidebarCollapsed(false);
     setConnectOpen(true);
     void refreshConnectionDashboard().catch(() => {});
     void refreshConnectors().catch(() => {});
@@ -1421,6 +1455,15 @@ function App() {
         setPendingWriteSource(pending.write_source || defaultWriteSource(pending.client));
       }
     }).catch(() => {});
+  }
+  function openSecuritySettings() {
+    setConnectionsStartTab('security');
+    setInsightsOpen(false); setChatOpen(false); setPendingOpen(false);
+    setSidebarCollapsed(false);
+    setConnectOpen(true);
+    void refreshConnectionDashboard().catch(() => {});
+    void refreshConnectors().catch(() => {});
+    void refreshClients().catch(() => {});
   }
 
   async function handleApproveClient() {
@@ -1583,6 +1626,12 @@ function App() {
     const timer = setTimeout(() => setDebouncedQuery(query), 150);
     return () => clearTimeout(timer);
   }, [query]);
+  useEffect(() => {
+    if (debouncedQuery.trim() && dataReady) {
+      window.localStorage.setItem('one-brain-checklist-search-done', '1');
+      setSearchChecklistDone(true);
+    }
+  }, [debouncedQuery, dataReady]);
 
   useEffect(() => {
     if (!suggestionToast) return undefined;
@@ -1875,21 +1924,50 @@ function App() {
     }
   }
 
+  function openGraphView() {
+    setInsightsOpen(false); setChatOpen(false); setConnectOpen(false); setPendingOpen(false); setSuggestionsOpen(false);
+    setGraphFitRevision((value) => value + 1);
+  }
+  function openImportView() { openGraphView(); setAddMode('import'); setAddOpen(true); }
+  function lockVault() { void window.brain.lockNow(); }
+  const checklist = [
+    { id: 'password', label: 'Set a master password', done: vaultConfigured, action: openSecuritySettings, icon: 'lock' },
+    { id: 'connect', label: 'Connect an AI', done: clients.some((client) => client.status === 'approved') || connectorCards.some((item) => /connected/i.test(item.status || '')), action: openConnectSettings, icon: 'link' },
+    { id: 'import', label: 'Import memories', done: recentImports.length > 0 || Object.values(counts).some((count) => Number(count) > 0), action: openImportView, icon: 'import' },
+    { id: 'search', label: 'Run a test search', done: searchChecklistDone, action: () => { openGraphView(); requestAnimationFrame(() => document.querySelector('[aria-label="Search memories"]')?.focus()); }, icon: 'insight' },
+  ];
+  const checklistDone = checklist.every((item) => item.done);
+
   return (
     <main className="memory-app">
       {graphicsNotice && <div role="alert" style={{ position: 'fixed', zIndex: 10000, top: 12, left: '50%', transform: 'translateX(-50%)', display: 'flex', alignItems: 'center', gap: 12, maxWidth: 'calc(100vw - 32px)', padding: '10px 14px', border: '1px solid #b68138', borderRadius: 8, background: '#302515', color: '#ffe2ad', boxShadow: '0 8px 30px #0008' }}><span>{graphicsNotice}</span><button type="button" aria-label="Dismiss graphics notice" onClick={() => void dismissGraphicsNotice()}>×</button></div>}
       {copied && <div role="status" className="connection-notice" style={{ position: 'fixed', zIndex: 10000, right: 16, bottom: 16 }}>{copied}</div>}
       {copyError && <div role="alert" className="connection-notice" style={{ position: 'fixed', zIndex: 10000, right: 16, bottom: 16 }}>{copyError}</div>}
       {quitError && <div role="alert" className="connection-notice" style={{ position: 'fixed', zIndex: 10002, top: 56, right: 16, maxWidth: 320 }}>{quitError}</div>}
+      <header className="app-topbar"><nav aria-label="Main sections">
+        <button type="button" onClick={openGraphView} aria-current={!insightsOpen && !chatOpen && !connectOpen ? 'page' : undefined}><Icon name="graph"/><span>Graph</span></button>
+        <button type="button" onClick={() => { openGraphView(); setChatOpen(true); }} aria-current={chatOpen ? 'page' : undefined}><Icon name="chat"/><span>Chat</span></button>
+        <button type="button" onClick={() => { openGraphView(); openConnectSettings(); }} aria-current={connectOpen ? 'page' : undefined}><Icon name="link"/><span>Connections</span></button>
+        <button type="button" onClick={() => { openGraphView(); void openInsights(); }} aria-current={insightsOpen ? 'page' : undefined}><Icon name="insight"/><span>Insights</span></button>
+        <button type="button" onClick={openImportView}><Icon name="import"/><span>Import</span></button>
+        <button type="button" onClick={openSecuritySettings}><Icon name="settings"/><span>Settings</span></button>
+      </nav><div className="app-topbar-status"><span className="vault-state"><i/>{vaultConfigured ? 'Unlocked' : 'Password not set'}</span><button type="button" onClick={lockVault} disabled={!vaultConfigured} aria-label="Lock vault" title="Lock vault"><Icon name="lock"/><span>Lock</span></button><button type="button" onClick={() => void quitApp()} disabled={quitPending}>{quitPending ? 'Closing…' : 'Quit'}</button></div></header>
       <BrainGraph ref={graphRef} memories={memories} links={graphLinks} allLinks={links} counts={counts} linkCounts={graphLinkCountValues} linkVisibility={linkVisibility} onLinkVisibilityChange={setLinkVisibility} fitRevision={graphFitRevision} dataReady={dataReady} sidebarCollapsed={sidebarCollapsed} onMemoryClick={openDetail} />
     {insightsOpen && (insightsData ? <InsightsView data={insightsData} onBack={() => { setInsightsOpen(false); setGraphFitRevision((value) => value + 1); }} sql={sql} setSql={setSql} runSql={runAnalyticsQuery} sqlResult={sqlResult} sqlRunning={sqlRunning} onResetRetrievalCounts={resetRetrievalCounts} /> : <section className="insights-view"><header className="insights-header"><button className="back-button" type="button" onClick={() => { setInsightsOpen(false); setGraphFitRevision((value) => value + 1); }}>‹</button><div><h1>Insights</h1><p>Local activity and retrieval analytics</p></div></header><ChannelNotice channel="insights" loading={insightsLoading} error={insightsLoadError} onRetry={() => void openInsights()} /></section>)}
       {chatOpen && <ChatView onBack={() => { setChatOpen(false); setGraphFitRevision((value) => value + 1); }} onManageProviders={() => { setChatOpen(false); openConnectSettings(); }} memoryTitles={Object.fromEntries(memories.map((item) => [item.id, item.title || 'Untitled memory']))} onOpenMemory={(id) => { setChatOpen(false); setInsightsOpen(false); setSelectedId(id); setSidebarCollapsed(false); focusMemory(id); }} />}
       <aside className={`memory-panel${sidebarCollapsed ? ' is-collapsed' : ''}`} style={insightsOpen || chatOpen ? { display: 'none' } : undefined}>
-        <header className="sidebar-header"><strong>One Brain</strong><nav aria-label="Main views"><button title="Open Chat" type="button" onClick={() => { setInsightsOpen(false); setChatOpen(true); }}>Chat</button><button title="Open Insights" type="button" onClick={openInsights}>Insights</button><button title="Pending memories" type="button" onClick={() => { setPendingOpen(true); setConnectOpen(false); void refreshPendingMemories().catch(() => {}); }}>Pending ({pendingMemories.length})</button><button title="Quick context" type="button" onClick={() => void window.brain.openQuickContext()}>Quick context</button><button title="Settings" aria-label="Settings" type="button" onClick={openConnectSettings}>⚙</button><button className="app-quit-button" type="button" onClick={() => void quitApp()} disabled={quitPending} aria-label="Quit One Brain" title="Quit One Brain">{quitPending ? 'Closing…' : 'Quit'}</button></nav></header>
+        <header className="sidebar-header"><strong>One Brain</strong><nav className="sidebar-main-nav" aria-label="Main sections">
+          <button type="button" onClick={openGraphView}><Icon name="graph"/><span>Graph</span></button>
+          <button type="button" onClick={() => { openGraphView(); setChatOpen(true); }}><Icon name="chat"/><span>Chat</span></button>
+          <button type="button" onClick={openConnectSettings}><Icon name="link"/><span>Connections</span></button>
+          <button type="button" onClick={() => void openInsights()}><Icon name="insight"/><span>Insights</span></button>
+          <button type="button" onClick={openImportView}><Icon name="import"/><span>Import</span></button>
+          <button type="button" onClick={openSecuritySettings}><Icon name="settings"/><span>Settings</span></button>
+        </nav><div className="sidebar-utilities"><button title="Pending memories" type="button" onClick={() => { setPendingOpen(true); setConnectOpen(false); void refreshPendingMemories().catch(() => {}); }}>Pending ({pendingMemories.length})</button><button title="Quick context" type="button" onClick={() => void window.brain.openQuickContext()}>Quick context</button></div></header>
         {pendingOpen ? <><header className="detail-header"><button className="back-button" type="button" onClick={() => setPendingOpen(false)}>‹</button><span>Pending memories</span></header><PendingMemoryInbox items={pendingMemories} onRefresh={refreshPendingMemories} loading={pendingLoading} loadError={pendingLoadError} /></> : connectOpen ? (
           <section className="connect-view">
             <header className="detail-header"><button className="back-button" type="button" onClick={() => setConnectOpen(false)}>‹</button><span>Connections</span>{suggestions.length > 0 && <button className="header-suggestions" type="button" onClick={() => { setConnectOpen(false); setSuggestionsOpen(true); }}>Suggestions ({suggestions.length})</button>}</header>
-            <ConnectionsDashboard mcp={connectorCards} clients={clients} extensions={extensionConnectionSites} providers={providerConnectionSettings} quickContext={quickConnectionSettings} activity={connectionActivity} counts={connectionCounts} mcpConfig={mcpConfig} onRefresh={refreshConnectionDashboard} onConnect={(id) => previewConnector(id)} onDisconnect={disconnectConnection} onTest={testMcpConnection} onConnectAll={connectAllDetected} onRotateAll={previewRotateAllTokens} />
+            <ConnectionsDashboard mcp={connectorCards} clients={clients} extensions={extensionConnectionSites} providers={providerConnectionSettings} quickContext={quickConnectionSettings} activity={connectionActivity} counts={connectionCounts} mcpConfig={mcpConfig} onRefresh={refreshConnectionDashboard} onConnect={(id) => previewConnector(id)} onDisconnect={disconnectConnection} onTest={testMcpConnection} onConnectAll={connectAllDetected} onRotateAll={previewRotateAllTokens} initialTab={connectionsStartTab} />
             {mcpConfig ? <>
               {embeddingStatus.state === 'error' && <section className="clients-settings embedding-retry-card"><header><h2>Semantic search model</h2><button type="button" onClick={() => void retryEmbedding()} disabled={embeddingRetrying}>{embeddingRetrying ? 'Retrying…' : 'Retry'}</button></header><p>{embeddingStatus.message}</p></section>}
               <ProviderKeysPanel clients={clients} />
@@ -1908,7 +1986,7 @@ function App() {
                 {!client.verified && client.last_seen && Date.now() - Date.parse(`${String(client.last_seen).replace(' ', 'T')}Z`) >= 3 * 86400_000 && <button type="button" className="client-block" onClick={async () => { if (!window.confirm(`Remove the stale client profile and its grants for ${client.client}? Memories will remain.`)) return; await window.brain.removeLegacyClient(client.client); await refreshClients(); }}>Remove stale client</button>}
                 {client.status === 'blocked' ? <button type="button" className="client-unblock" disabled={!client.write_source} onClick={() => handleClientStatus(client.client, 'approved')}>Unblock</button> : <button type="button" className="client-block" onClick={() => handleClientStatus(client.client, 'blocked')}>Block</button>}
               </article>)}
-              {clients.length === 0 && <p className="empty-note">No MCP clients have connected yet.</p>}
+              {clients.length === 0 && <p className="empty-note">No AIs have connected yet. Use Connections above to get started.</p>}
             </section>
             {legacyCleanupStatus.count >= 200 && <section className="legacy-cleanup-section"><h2>Legacy import cleanup</h2><p>{legacyCleanupStatus.count.toLocaleString()} matching Claude memories found.</p>{legacyCleanupStatus.error && <p className="import-error">Safety backup failed: {legacyCleanupStatus.error}</p>}<button type="button" disabled={!legacyCleanupStatus.backupPath} onClick={handleLegacyCleanup}>{legacyCleanupStatus.backupPath ? 'Remove legacy junk import' : 'Preparing safety backup…'}</button></section>}
           </section>
@@ -1952,13 +2030,13 @@ function App() {
               {suggestions.length > 0 && <button className="header-suggestions" type="button" onClick={() => { setSelectedId(null); setSuggestionsOpen(true); }}>Suggestions ({suggestions.length})</button>}
             </header>
             <div className="detail-source"><i style={{ background: SOURCE_COLORS[selectedMemory.source] }} />{selectedMemory.source}</div>
-            <h1>{selectedMemory.private ? '🔒 ' : ''}{selectedMemory.title || 'Untitled memory'}</h1>
+            <h1>{selectedMemory.private && <Icon name="lock" size={14} />} {selectedMemory.title || 'Untitled memory'}</h1>
             <p className="detail-content">{selectedMemory.content}</p>
             <time className="detail-date">{dateLabel(selectedMemory.created_at)}</time>
             <div className="detail-actions">
               <label className="move-source-action">Move to source<select aria-label="Move memory to source" value={selectedMemory.source} onChange={(event) => void handleMoveMemory(selectedMemory, event.target.value)}>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label>
               <button type="button" onClick={() => graphRef.current?.retrieve(selectedMemory.id)}>Retrieve</button>
-              <button type="button" aria-pressed={Boolean(selectedMemory.private)} onClick={() => handlePrivateToggle(selectedMemory)}>{selectedMemory.private ? '🔒 Private · turn off' : 'Mark private'}</button>
+              <button type="button" aria-pressed={Boolean(selectedMemory.private)} onClick={() => handlePrivateToggle(selectedMemory)}>{selectedMemory.private ? 'Private · turn off' : 'Mark private'}</button>
               <button type="button" aria-pressed={Boolean(selectedMemory.no_suggest)} onClick={() => void handleNoSuggestToggle(selectedMemory)}>{selectedMemory.no_suggest ? 'Never suggest · on' : 'Never suggest'}</button>
               <button type="button" className="danger-button" onClick={() => handleDelete(selectedMemory.id)}>Delete</button>
               {conversationPartCount >= 2 && / \(part \d+\/\d+\)$/.test(selectedMemory.title || '') && <button type="button" className="danger-button" onClick={handleDeleteConversationParts}>Delete all {conversationPartCount} parts of this chat</button>}
@@ -1974,7 +2052,7 @@ function App() {
                       const [aId, bId] = Number(selectedMemory.id) < Number(item.id) ? [Number(selectedMemory.id), Number(item.id)] : [Number(item.id), Number(selectedMemory.id)];
                       return <button type="button" className="picker-result" key={item.id} onClick={() => handleLink(item.id)}><i style={{ background: SOURCE_COLORS[item.source] }} /><span>{item.title || memory?.content.slice(0, 40) || 'Untitled'}<small>{item.source}{rejectedPairKeys.has(`${aId}:${bId}`) ? ' · rejected before' : ''}</small></span></button>;
                     })}
-                    {pickerResults.length === 0 && <p className="empty-note">No memories found</p>}
+                    {pickerResults.length === 0 && <p className="empty-note">No memories found. Try another search or import memories.</p>}
                   </div>
                 </div>
               )}
@@ -1983,7 +2061,7 @@ function App() {
                   <button type="button" className="linked-open" onClick={() => openDetail(memory.id)}><i style={{ background: SOURCE_COLORS[memory.source] }} /><span>{memory.title || memory.content.slice(0, 40)}<small>{memory.source} · {link.kind}</small></span></button>
                   <button type="button" className="unlink-button" aria-label={`Unlink ${memory.title || 'memory'}`} onClick={() => handleUnlink(link.id)}>×</button>
                 </div>)}
-                {regularLinkedMemories.length === 0 && !pickerOpen && <p className="empty-note">No linked memories</p>}
+                {regularLinkedMemories.length === 0 && !pickerOpen && <p className="empty-note">No linked memories yet. Choose “Link to…” to connect a related memory.</p>}
               </div>
             </section>
             <section className="related-section">
@@ -1998,6 +2076,7 @@ function App() {
           </section>
         ) : (
           <>
+            {!checklistDone && <section className="setup-checklist" aria-labelledby="setup-checklist-title"><h2 id="setup-checklist-title">Getting started</h2><p>Finish these steps to set up your shared memory space.</p><ol>{checklist.map((item) => <li key={item.id} className={item.done ? 'is-done' : ''}><span className="checklist-icon">{item.done ? <Icon name="check"/> : <Icon name={item.icon}/>}</span><button type="button" disabled={item.done} onClick={item.action}>{item.label}</button><span className="checklist-state">{item.done ? 'Done' : 'Next'}</span></li>)}</ol></section>}
             <div className="search-row">
               <input value={query} onChange={(event) => { typedSearchPending.current = event.target.value; setQuery(event.target.value); setPageOffset(0); }} placeholder="Search memories..." aria-label="Search memories" />
               <button className="add-button" type="button" aria-label="Add memory or import" title={databaseStatus.writable ? 'Add or import memories' : 'Memory writes are disabled'} disabled={!databaseStatus.writable} onClick={() => { setAddMode('add'); setAddOpen(true); }}>+</button>
@@ -2020,11 +2099,11 @@ function App() {
                 const displayTitle = item.title?.trim() || (full?.content || '').slice(0, 40) || 'Untitled memory';
                 return <button type="button" className="result-item" key={item.id} onClick={() => openDetail(item.id)}>
                   <i className="result-dot" style={{ background: SOURCE_COLORS[item.source] }} />
-                  <span className="result-copy"><strong>{item.private ? '🔒 ' : ''}{displayTitle}</strong><small>{item.snippet || full?.content.slice(0, 120) || ''}</small></span>
+                  <span className="result-copy"><strong>{item.private && <Icon name="lock" size={13} />} {displayTitle}</strong><small>{item.snippet || full?.content.slice(0, 120) || ''}</small></span>
                   <span className="result-meta"><span>{item.source}</span><time>{relativeDate(item.created_at || resultMemory(item.id)?.created_at)}</time></span>
                 </button>;
               })}
-              {results.length === 0 && dataReady && <p className="empty-note">No memories found</p>}
+              {results.length === 0 && dataReady && <p className="empty-note">No memories found. Try another search or import memories.</p>}
               {hasMore && <button className="load-more" type="button" onClick={() => { typedSearchPending.current = null; setPageOffset((offset) => offset + PAGE_SIZE); }}>Load more</button>}
             </section>
           </>

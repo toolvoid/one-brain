@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import App from './App.jsx';
+import { Button, Card, Field, Input } from './components/ui/index.jsx';
 
 function UnlockScreen() {
   const [password, setPassword] = useState('');
@@ -43,15 +44,15 @@ function UnlockScreen() {
     } finally { setBusy(false); }
   }
 
-  return <main style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', boxSizing: 'border-box', padding: 24, background: '#0b0f16', color: '#e8edf4', fontFamily: 'system-ui, sans-serif' }}>
-    <form onSubmit={(event) => void submit(event)} style={{ display: 'grid', gap: 14, width: 'min(400px, 100%)', padding: 24, border: '1px solid #334155', borderRadius: 14, background: '#121a26', boxShadow: '0 20px 70px #0008' }}>
-      <div><h1 style={{ margin: 0, fontSize: 22 }}>Unlock One Brain</h1><p style={{ margin: '8px 0 0', color: '#aab9cb', fontSize: 13 }}>Enter your master password to open your encrypted memories.</p></div>
-      <p style={{ margin: 0, color: '#aab9cb', fontSize: 12 }} aria-live="polite">Failed attempts: {lockout.failedCount}{lockout.locked ? ` · Try again in ${countdown}` : ` · ${lockout.attemptsRemaining} attempts until next lockout`}</p>
-      <label style={{ display: 'grid', gap: 7, fontSize: 13 }}>Master password<input autoFocus type={visible ? 'text' : 'password'} autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} disabled={busy || lockout.locked} style={{ boxSizing: 'border-box', width: '100%', minHeight: 40, padding: 9, border: '1px solid #465a73', borderRadius: 7, background: '#080d14', color: '#f4f7fb', font: 'inherit' }} /></label>
-      <button type="button" aria-pressed={visible} onClick={() => setVisible((value) => !value)} disabled={busy || lockout.locked} style={{ justifySelf: 'start' }}>{visible ? 'Hide password' : 'Show password'}</button>
-      {error && <p role="alert" style={{ margin: 0, color: '#ffaaa4', fontSize: 13 }}>{error}</p>}
-      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}><button type="button" onClick={() => void window.brain.quitApp()}>Quit</button><button type="submit" disabled={busy || lockout.locked}>{busy ? 'Unlocking…' : lockout.locked ? `Locked · ${countdown}` : 'Unlock'}</button></div>
-    </form>
+  return <main className="unlock-screen">
+    <Card as="form" className="unlock-card" onSubmit={(event) => void submit(event)}>
+      <div><h1>Unlock One Brain</h1><p>Enter your master password to open your encrypted memories.</p></div>
+      <p className="unlock-attempts" aria-live="polite">Failed attempts: {lockout.failedCount}{lockout.locked ? ` · Try again in ${countdown}` : ` · ${lockout.attemptsRemaining} attempts until next lockout`}</p>
+      <Field label="Master password"><Input autoFocus type={visible ? 'text' : 'password'} autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} disabled={busy || lockout.locked} /></Field>
+      <Button type="button" variant="ghost" className="unlock-password-toggle" aria-pressed={visible} onClick={() => setVisible((value) => !value)} disabled={busy || lockout.locked}>{visible ? 'Hide password' : 'Show password'}</Button>
+      {error && <p role="alert" className="unlock-error">{error}</p>}
+      <div className="unlock-actions"><Button type="button" onClick={() => void window.brain.quitApp()}>Quit</Button><Button variant="primary" type="submit" disabled={busy || lockout.locked}>{busy ? 'Unlocking…' : lockout.locked ? `Locked · ${countdown}` : 'Unlock'}</Button></div>
+    </Card>
   </main>;
 }
 

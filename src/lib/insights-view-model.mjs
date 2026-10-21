@@ -3,9 +3,12 @@ export function deltaViewModel(current, previous, { higherIsBetter = true, digit
     return { label: 'No previous run', direction: 'flat', tone: 'neutral', symbol: '—' };
   }
   const delta = Number(current) - Number(previous);
-  if (delta === 0) return { label: 'No change', direction: 'flat', tone: 'neutral', symbol: '→', delta };
+  if (delta === 0) return unit === 'ms'
+    ? { label: '', direction: 'flat', tone: 'neutral', symbol: '', delta, hidden: true }
+    : { label: 'No change', direction: 'flat', tone: 'neutral', symbol: '→', delta };
   const improved = higherIsBetter ? delta > 0 : delta < 0;
   const amount = unit === 'ms' ? `${delta > 0 ? '+' : ''}${delta.toFixed(digits)} ms` : `${delta > 0 ? '+' : ''}${(delta * 100).toFixed(digits)} pp`;
+  if (unit === 'ms' && Number(amount.replace(/[^0-9.-]/g, '')) === 0) return { label: '', direction: 'flat', tone: 'neutral', symbol: '', delta, hidden: true };
   return { label: `${amount} vs previous`, direction: delta > 0 ? 'up' : 'down', tone: improved ? 'good' : 'bad', symbol: delta > 0 ? '↑' : '↓', delta };
 }
 

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { createPortal as reactCreatePortal } from 'react-dom';
 import { validateSecurityPasswordForm } from '../lib/security-password-validation.mjs';
+import { Card, SectionHeader, StatusChip } from './ui/index.jsx';
 
 function createPortal(content) {
   return typeof document === 'undefined' ? content : reactCreatePortal(content, document.body);
@@ -63,9 +64,10 @@ export default function SecuritySettingsPanel({ initialMode = null } = {}) {
     finally { setBusy(false); }
   }
   const modeLabel = mode === 'set' ? 'Set master password' : mode === 'change' ? 'Change master password' : mode === 'export' ? 'Export recovery file' : mode === 'restore' ? 'Restore encrypted backup' : 'Delete old backups';
-  return <section className="connection-security security-settings-page">
-    <h3>Vault security</h3>
-    {status ? <dl className="security-status-list"><dt>Vault</dt><dd>{status.vaultSet ? status.locked ? 'Locked' : 'Unlocked' : 'No master password set'}</dd><dt>Key backend</dt><dd>{status.backend}</dd><dt>Last unlock</dt><dd>{status.lastUnlockAt ? new Date(status.lastUnlockAt).toLocaleString() : 'Not recorded'}</dd></dl> : <p>Loading security status…</p>}
+  return <Card as="section" className="connection-security security-settings-page">
+    <SectionHeader title="Security" description="Control how your encrypted memory vault is protected." action={status && <StatusChip status={status.vaultSet ? status.locked ? 'Locked' : 'Unlocked' : 'Password not set'}>{status.vaultSet ? status.locked ? 'Locked' : 'Unlocked' : 'Password not set'}</StatusChip>} />
+    {status ? <dl className="security-status-list"><dt>Vault</dt><dd>{status.vaultSet ? status.locked ? 'Locked' : 'Unlocked' : 'No master password set'}</dd><dt>Last unlock</dt><dd>{status.lastUnlockAt ? new Date(status.lastUnlockAt).toLocaleString() : 'Not recorded'}</dd></dl> : <p>Loading security status…</p>}
+    <details className="security-advanced"><summary>Advanced details</summary><dl className="security-status-list"><dt>Storage backend</dt><dd>{status?.backend || 'Checking'}</dd><dt>Recovery file</dt><dd>Encrypted backup managed by One Brain</dd></dl></details>
     <label className="proxy-setting"><span>Auto-lock</span><input type="checkbox" checked={status?.autoLockEnabled ?? true} disabled={!status} onChange={async (event) => { const result = await window.brain.setAutoLockSettings({ autoLockEnabled: event.target.checked }); if (result?.ok) await refresh(); else setError(result?.error || 'Could not save auto-lock setting.'); }} /><span>{status?.autoLockEnabled ? 'On' : 'Off'}</span></label>
     {status?.autoLockEnabled && <label className="proxy-setting">Lock after<select value={status.autoLockMinutes} onChange={async (event) => { const result = await window.brain.setAutoLockSettings({ autoLockMinutes: Number(event.target.value) }); if (result?.ok) await refresh(); else setError(result?.error || 'Could not save auto-lock setting.'); }}><option value={1}>1 minute</option><option value={5}>5 minutes</option><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option value={60}>60 minutes</option></select></label>}
     <label className="proxy-setting">Stay unlocked duration<select value={status?.keepUnlockedMinutes ?? 120} disabled={!status} onChange={async (event) => { const result = await window.brain.setAutoLockSettings({ keepUnlockedMinutes: Number(event.target.value) }); if (result?.ok) await refresh(); else setError(result?.error || 'Could not save stay-unlocked duration.'); }}><option value={30}>30 minutes</option><option value={60}>1 hour</option><option value={120}>2 hours</option><option value={240}>4 hours</option></select></label>
@@ -87,5 +89,5 @@ export default function SecuritySettingsPanel({ initialMode = null } = {}) {
       {error && <p className="security-password-error" role="alert">{error}</p>}
       <footer><button type="button" disabled={busy} onClick={() => setMode(null)}>Cancel</button><button type="submit" disabled={busy || !validation.canSubmit}>{busy ? 'Working…' : mode === 'export' ? 'Choose save location' : mode === 'restore' ? 'Choose backup file' : modeLabel}</button></footer>
     </form></div>)}
-  </section>;
+  </Card>;
 }

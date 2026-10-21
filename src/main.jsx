@@ -1,5 +1,8 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
+import './styles/tokens.css';
+import './components/ui/ui.css';
+import './styles/product.css';
 import UnlockGate from './UnlockGate.jsx';
 import { sanitizeRendererError } from './lib/error-sanitizer.mjs';
 

@@ -91,12 +91,24 @@ test('evaluation imports and runs against a synthetic temporary database; privat
     assert.ok(run.failed.some((item) => item.id === 'q2'), 'private expected memory is excluded by default');
     assert.ok(run.failed.find((item) => item.id === 'q2').diagnostics, 'failed questions include FTS, vector, hybrid, and cosine diagnostics');
     assert.equal(run.records.find((item) => item.id === 'q3').falsePositive, false, 'unrelated negative query is gated by cosine rather than RRF');
-    const privateIncludedRun = await db.runEvaluationDataset(imported.id, { config: { minScore: 0.001 }, includePrivate: true, appVersion: 'test-version' });
+    const privateIncludedRun = await db.runEvaluationDataset(imported.id, { config: { minScore: 0.001 }, includePrivate: true, appVersion: 'test-version', kind: 'sweep' });
     assert.equal(privateIncludedRun.records.find((item) => item.id === 'q2').rank, 1, `private memories are included only when explicitly requested: ${JSON.stringify(privateIncludedRun.records.find((item) => item.id === 'q2'))}`);
+    assert.equal(privateIncludedRun.kind, 'sweep');
+    assert.equal(privateIncludedRun.saved, false);
+    const calibration = await db.runEvaluationDataset(imported.id, { config: { minScore: 0.2 }, kind: 'calibration' });
+    assert.equal(calibration.saved, false);
     const summaries = db.listEvaluationRunSummaries();
-    assert.equal(summaries.length, 2);
+    assert.equal(summaries.length, 1, 'sweep and calibration results are returned without persisting normal runs');
+    assert.equal(summaries[0].kind, 'manual');
     assert.equal(summaries[0].appVersion, 'test-version');
     assert.equal(JSON.stringify(summaries[0].metrics).includes('quartz bicycle'), false, 'saved run summaries contain metrics only');
+    await db.runEvaluationDataset(imported.id, { config: { minScore: 0.15 } });
+    await db.runEvaluationDataset(imported.id, { config: { minScore: 0.25 } });
+    assert.deepEqual(db.previewEvaluationRunCleanup(1), { keepLatestPerDataset: 1, experiments: 0, olderManual: 2, total: 2 });
+    assert.throws(() => db.cleanupEvaluationRuns({ keepLatestPerDataset: 1, confirmation: 'wrong' }), /Type CLEAN UP RUNS/);
+    const cleanup = db.cleanupEvaluationRuns({ keepLatestPerDataset: 1, confirmation: 'CLEAN UP RUNS' });
+    assert.equal(cleanup.removed, 2);
+    assert.equal(db.listEvaluationRunSummaries().length, 1, 'cleanup keeps the latest manual run for the dataset');
     assert.equal(db.getRuntimeDatabaseStats().memories, 2);
     assert.equal(db.getMemory(publicMemory.id).title, 'Quartz bicycle');
 
