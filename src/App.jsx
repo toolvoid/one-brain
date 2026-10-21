@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import BrainGraph from './components/BrainGraph.jsx';
 import PanelErrorBoundary from './components/PanelErrorBoundary.jsx';
 import SecuritySettingsPanel from './components/SecuritySettingsPanel.jsx';
-import { Card, Icon, SectionHeader, StatusChip, Switch } from './components/ui/index.jsx';
+import { Button, Card, Field, Icon, KPIStat, SectionHeader, Select, StatusChip, Switch } from './components/ui/index.jsx';
 import { MAX_IMPORT_ITEMS, isLogLikeChunk, parseImportText, parseImportFile, inferImportSource } from './lib/importers.mjs';
 import '../extension/src/smart-save.js';
 import { fallbackMemoryTitle, heuristicMemoryTitle, isChatModel, memorySourceForProvider } from './lib/chat-models.mjs';
@@ -17,6 +17,7 @@ import { PERFORMANCE_MODE_EVENT, readManualPerformanceMode, writeManualPerforman
 import { calibrationCutoffs, recommendCutoff, rrfSweepConfigs } from './lib/evaluation-tuning.mjs';
 import { evaluationTypeRows } from './lib/evaluation-display.mjs';
 import { bestValueRows, deltaViewModel, formatInsightsValue, runChartPoints } from './lib/insights-view-model.mjs';
+import { activityKpis, filterActivityRange, groupDailySeries, linkCategorySegments } from './lib/activity-view-model.mjs';
 import './insights.css';
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
@@ -63,14 +64,48 @@ function AccessiblePicker({ label, value, options, onChange, renderOption, searc
   </div>;
 }
 
-function SqlPanel({ title, description = 'A recent view of local activity.', children, sql }) {
-  const [showSql, setShowSql] = useState(false);
-  return <Card className="insight-card"><SectionHeader title={title} description={description} action={<button type="button" className="sql-toggle secondary-button" onClick={() => setShowSql((value) => !value)}>{showSql ? 'Hide details' : 'Show details'}</button>} />{children}{showSql && <pre className="insight-sql">{sql}</pre>}</Card>;
+function SqlPanel({ title, description, children, sql }) {
+  return <Card className="insight-card"><SectionHeader title={title} description={description} />{children}<details className="activity-query-details"><summary>Show query details</summary><pre className="insight-sql">{sql || 'No query details available.'}</pre></details></Card>;
 }
 
-function InsightBars({ rows, valueKey, labelKey, groupKey, colors }) {
-  const maximum = Math.max(1, ...rows.map((row) => Number(row[valueKey]) || 0));
-  return <div className="insight-bars">{rows.map((row, index) => <div className="insight-bar-row" key={`${row[labelKey]}-${row[groupKey] || index}`}><span title={`${row[labelKey]}${groupKey ? ` · ${row[groupKey]}` : ''}`}>{row[labelKey]}{groupKey ? ` · ${row[groupKey]}` : ''}</span><div className="insight-bar-track" title={`${row[valueKey]} ${valueKey}`}><i style={{ width: `${Math.max(1, (Number(row[valueKey]) || 0) / maximum * 100)}%`, background: colors?.[row[groupKey]] || '#83b9f4' }} /></div><b>{row[valueKey]}</b></div>)}{rows.length === 0 && <p className="empty-note">No activity has been recorded yet.</p>}</div>;
+function clientColor(client) {
+  const key = Object.keys(SOURCE_COLORS).find((source) => String(client).toLowerCase().includes(source));
+  if (key) return SOURCE_COLORS[key];
+  const palette = Object.values(SOURCE_COLORS);
+  let hash = 0; for (const char of String(client)) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  return palette[hash % palette.length];
+}
+
+function ActivityBarChart({ rows, valueKey, groupKey, colors = clientColor, emptyMessage }) {
+  const series = groupDailySeries(rows, { valueKey, groupKey });
+  if (!series.days.length) return <div className="activity-chart-empty" role="status">{emptyMessage}</div>;
+  const width = Math.max(760, series.days.length * 42), height = 220, left = 34, right = 12, top = 12, bottom = 32;
+  const chartWidth = width - left - right, chartHeight = height - top - bottom;
+  const max = Math.max(1, ...series.days.map((day) => day.total));
+  const slot = chartWidth / series.days.length, barWidth = Math.max(3, Math.min(24, slot * .62));
+  return <><div className="activity-chart-scroll"><svg className="activity-bar-svg" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${valueKey} by day, stacked by ${groupKey}`}>
+    {[0,.5,1].map((fraction) => <g key={fraction}><line x1={left} x2={width-right} y1={top + chartHeight * fraction} y2={top + chartHeight * fraction}/><text x={left-7} y={top + chartHeight * fraction + 4} textAnchor="end">{Math.round(max * (1-fraction))}</text></g>)}
+    {series.days.map((day, index) => { let stack = 0; const x = left + slot * index + (slot - barWidth) / 2; return <g key={day.day}>{series.groups.map((group) => { const value = day.values[group] || 0; if (!value) return null; const barHeight = value / max * chartHeight; const y = top + chartHeight - stack - barHeight; stack += barHeight; return <rect key={group} x={x} y={y} width={barWidth} height={barHeight} fill={colors[group] || clientColor(group)}><title>{`${day.day} · ${group}: ${value}`}</title></rect>; })}<text className="activity-axis-label" x={x + barWidth/2} y={height-8} textAnchor="middle">{day.day.slice(5)}</text></g>; })}
+  </svg></div><div className="activity-legend">{series.groups.map((group) => <span key={group}><i style={{ background: colors[group] || clientColor(group) }}/>{group}</span>)}</div></>;
+}
+
+function LatencyChart({ rows }) {
+  const points = [...rows].sort((a,b) => String(a.day).localeCompare(String(b.day)));
+  if (!points.length) return <div className="activity-chart-empty" role="status">No search timing data in this time range.</div>;
+  const width = Math.max(760, points.length * 42), height = 220, left = 42, right = 16, top = 18, bottom = 32;
+  const chartHeight = height-top-bottom, maximum = Math.max(1, ...points.map((item) => Math.max(Number(item.average_ms)||0, Number(item.p95_ms)||0)));
+  const coord = (index, value) => `${points.length === 1 ? width/2 : left + index*(width-left-right)/(points.length-1)},${top+chartHeight-(Number(value)||0)/maximum*chartHeight}`;
+  return <div className="activity-chart-scroll"><svg className="activity-line-svg" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Average search latency and p95 by day">
+    {[0,.5,1].map((fraction) => <g key={fraction}><line x1={left} x2={width-right} y1={top+chartHeight*fraction} y2={top+chartHeight*fraction}/><text x={left-7} y={top+chartHeight*fraction+4} textAnchor="end">{Math.round(maximum*(1-fraction))} ms</text></g>)}
+    <polyline className="latency-average" points={points.map((item,index)=>coord(index,item.average_ms)).join(' ')}/><polyline className="latency-p95" points={points.map((item,index)=>coord(index,item.p95_ms)).join(' ')}/>
+    {points.map((item,index)=>{const [x,y]=coord(index,item.average_ms).split(',').map(Number);const [,p95y]=coord(index,item.p95_ms).split(',').map(Number);return <g key={item.day}><circle cx={x} cy={y} r="3.5"><title>{`${item.day} · average ${item.average_ms} ms · ${item.samples} searches`}</title></circle><circle className="latency-p95-point" cx={x} cy={p95y} r="3.5"><title>{`${item.day} · p95 ${item.p95_ms} ms`}</title></circle><text className="activity-axis-label" x={x} y={height-8} textAnchor="middle">{item.day.slice(5)}</text></g>;})}
+  </svg></div>;
+}
+
+function LinkSegments({ rows }) {
+  const segments = linkCategorySegments(rows); const total = segments.reduce((sum,item)=>sum+item.value,0);
+  if (!total) return <div className="activity-chart-empty" role="status">No links or suggestions have been recorded yet.</div>;
+  return <><div className="activity-segment-bar" role="img" aria-label={`Links and suggestions, ${total} total`}>{segments.map((item,index)=><i key={`${item.label}-${index}`} title={`${item.label}: ${item.value}`} style={{width:`${item.value/total*100}%`,background:item.category==='link'?'#7aa8d8':'#78b894'}} />)}</div><ul className="activity-segment-legend">{segments.map((item,index)=><li key={`${item.label}-${index}`}><span><i style={{background:item.category==='link'?'#7aa8d8':'#78b894'}}/>{item.label}</span><strong>{item.value}</strong></li>)}</ul></>;
 }
 
 function InlineRunChart({ title, points }) {
@@ -773,29 +808,43 @@ function StatusPanel() {
   </section>;
 }
 
+function InsightsLoading({ onBack, onRetry, error = false }) {
+  return <section className="insights-view"><header className="insights-header"><button className="back-button" type="button" aria-label="Back to main view" onClick={onBack}>‹</button><div><h1>Insights</h1><p>Memory activity and local usage trends</p></div></header><div className="activity-loading" role={error ? 'alert' : 'status'} aria-live="polite"><strong>{error ? 'Activity data could not be loaded' : 'Loading activity data…'}</strong>{error && <button type="button" onClick={onRetry}>Try again</button>}</div><div className="activity-kpi-grid activity-loading-kpis">{['Total memories','Searches today','Average search time','Retrievals this week','Connected AI clients'].map((label)=><KPIStat key={label} label={label} value="—" detail="Preparing summary" />)}</div><div className="insights-grid activity-loading-grid">{['Memory activity','AI calls','Search performance','Links and suggestions','Recent searches','Memory rankings'].map((label)=><Card className="activity-skeleton" key={label} aria-label={`Loading ${label}`}><strong>{label}</strong><div/></Card>)}</div></section>;
+}
+
 function InsightsView({ data, onBack, sql, setSql, runSql, sqlResult, sqlRunning, onResetRetrievalCounts }) {
   const [activeTab, setActiveTab] = useState('data');
+  const [range, setRange] = useState('7d');
   const view = (key) => data?.[key] || { rows: [], sql: '' };
-  const table = (rows, keys, empty = 'No data yet') => rows.length ? <div className="insight-table-wrap"><table className="insight-table"><thead><tr>{keys.map(([key, label]) => <th key={key}>{label}</th>)}</tr></thead><tbody>{rows.map((row, index) => <tr key={row.id ?? row.ts ?? `${index}`} >{keys.map(([key]) => <td key={key} className={typeof row[key] === 'number' ? 'numeric-cell' : ''} title={row[key] == null ? '' : String(row[key])}>{row[key] == null ? '—' : String(row[key])}</td>)}</tr>)}</tbody></table></div> : <p className="empty-note">{empty}</p>;
+  const table = (rows, keys, empty = 'No matching activity in this time range') => rows.length ? <div className="insight-table-wrap"><table className="insight-table"><thead><tr>{keys.map(([key, label]) => <th key={key}>{label}</th>)}</tr></thead><tbody>{rows.map((row, index) => <tr key={row.id ?? row.ts ?? `${index}`} >{keys.map(([key]) => <td key={key} className={`${typeof row[key] === 'number' ? 'numeric-cell ' : ''}${key === 'id' ? 'table-id' : ''}${key === 'title' ? 'table-title' : ''}`} title={row[key] == null ? '' : String(row[key])}>{row[key] == null ? '—' : String(row[key])}</td>)}</tr>)}</tbody></table></div> : <p className="empty-note">{empty}</p>;
   const memories = view('memoriesByDay'), links = view('linksAndSuggestions'), calls = view('mcpCallsByDay'), latency = view('searchLatency');
   const retrievals = view('retrievals'), viewed = view('mostViewed'), never = view('neverRetrieved'), embedding = view('embeddingStatus'), clients = view('connectedClients'), proxyCalls = view('proxyCalls');
-  const linkRows = links.rows;
-  return <section className="insights-view"><header className="insights-header"><button className="back-button" type="button" aria-label="Back to main view" onClick={onBack}>‹</button><div><h1>Insights</h1><p>Local activity, retrieval evaluation and resource status</p></div></header>
+  const retrievalEvents = view('retrievalsByDay');
+  const now = Date.now();
+  const chartMemories = filterActivityRange(memories.rows, range, now);
+  const chartCalls = filterActivityRange(calls.rows, range, now);
+  const chartLatency = filterActivityRange(latency.rows, range, now);
+  const zeroRows = filterActivityRange(view('zeroResultSearches').rows, range, now);
+  const clientRows = filterActivityRange(clients.rows, range, now);
+  const kpis = activityKpis({ memories: embedding.rows[0]?.total, searches: latency.rows, retrievals: retrievalEvents.rows, clients: clients.rows, now });
+  const averageLabel = kpis.averageSearchMs7d == null ? '—' : `${kpis.averageSearchMs7d.toFixed(1)} ms`;
+  return <section className="insights-view"><header className="insights-header"><button className="back-button" type="button" aria-label="Back to main view" onClick={onBack}>‹</button><div><h1>Insights</h1><p>Memory activity and local usage trends</p></div></header>
     <nav className="insights-tabs" role="tablist" aria-label="Insights sections">{[['data','Activity'],['evaluation','Evaluation'],['status','Status']].map(([id,label]) => <button key={id} id={`insights-tab-${id}`} role="tab" aria-selected={activeTab === id} aria-controls={`insights-panel-${id}`} type="button" aria-pressed={activeTab === id} onClick={() => setActiveTab(id)}>{label}</button>)}</nav>
     {activeTab === 'evaluation' && <EvaluationPanel />}
     {activeTab === 'status' && <StatusPanel />}
     {activeTab === 'data' && <div id="insights-panel-data" role="tabpanel" aria-labelledby="insights-tab-data" className="activity-tab-panel">
+    <Card className="activity-summary"><SectionHeader title="Activity summary" description="A snapshot of memory use and connected AI activity." action={<Field label="Time range" htmlFor="activity-range"><Select id="activity-range" value={range} onChange={(event) => setRange(event.target.value)}><option value="7d">7 days</option><option value="30d">30 days</option><option value="all">All</option></Select></Field>} /><div className="activity-kpi-grid"><KPIStat label="Total memories" value={kpis.memories.toLocaleString()} detail="In your local memory library"/><KPIStat label="Searches today" value={kpis.searchesToday.toLocaleString()} detail="Searches recorded today"/><KPIStat label="Average search time" value={averageLabel} detail="Weighted average · last 7 days"/><KPIStat label="Retrievals this week" value={kpis.retrievalsThisWeek.toLocaleString()} detail="Memory results returned"/><KPIStat label="Connected AI clients" value={kpis.connectedClients.toLocaleString()} detail="Clients with recorded activity"/></div></Card>
     <div className="insights-grid">
-      <SqlPanel title="Memories added per day, per source" sql={memories.sql}><InsightBars rows={memories.rows.slice(0, 60)} valueKey="memories" labelKey="day" groupKey="source" colors={SOURCE_COLORS} /></SqlPanel>
-      <SqlPanel title="Links and suggestions" sql={links.sql}>{table(linkRows, [['category','Type'],['label','Kind or status'],['total','Count']])}</SqlPanel>
-      <SqlPanel title="MCP calls per day per client" sql={calls.sql}><InsightBars rows={calls.rows.slice(0, 60)} valueKey="calls" labelKey="day" groupKey="client" /></SqlPanel>
-      <SqlPanel title="Search latency by day" sql={latency.sql}>{table(latency.rows, [['day','Day'],['average_ms','Average ms'],['p95_ms','p95 ms'],['samples','Searches']])}</SqlPanel>
-      <SqlPanel title="Searches with zero results" sql={view('zeroResultSearches').sql}>{table(view('zeroResultSearches').rows, [['ts','Time'],['client','Client'],['source','Source'],['query','Query']], 'No zero result searches')}</SqlPanel>
-      <SqlPanel title="Most retrieved memories" sql={retrievals.sql}>{table(retrievals.rows, [['id','ID'],['title','Title'],['source','Source'],['retrieved','Retrieved'],['views','UI views']])}<p className="insight-note">Never retrieved: <b>{never.rows[0]?.total ?? 0}</b></p><p className="insight-note">{data?.retrievalResetAt ? `Retrieval counts reset ${dateLabel(data.retrievalResetAt)}.` : `Counts before ${data?.retrievalWarningDate || 'the reset'} may include list loads.`}</p>{!data?.retrievalResetAt && <button type="button" onClick={onResetRetrievalCounts}>Reset retrieval counts</button>}</SqlPanel>
-      <SqlPanel title="Most viewed in the UI" sql={viewed.sql}>{table(viewed.rows, [['id','ID'],['title','Title'],['source','Source'],['views','Views']])}</SqlPanel>
-      <SqlPanel title="Embedding index status" sql={embedding.sql}><div className="insight-stat"><strong>{embedding.rows[0]?.indexed ?? 0}</strong><span>indexed of {embedding.rows[0]?.total ?? 0} memories</span></div></SqlPanel>
-      <SqlPanel title="Connected AI services" sql={clients.sql}>{table(clients.rows, [['client','Client'],['identity','Identity'],['first_seen','First seen'],['last_seen','Last seen'],['total_calls','Total calls'],['calls_last_7_days','Last 7 days']])}</SqlPanel>
-      <SqlPanel title="Proxy" sql={proxyCalls.sql}>{table(proxyCalls.rows, [['client','Client'],['provider','Provider'],['calls','Calls'],['average_memories_injected','Average memories injected']])}</SqlPanel>
+      <SqlPanel title="Memories added per day" description="Daily additions, stacked by memory source." sql={memories.sql}><ActivityBarChart rows={chartMemories} valueKey="memories" groupKey="source" colors={SOURCE_COLORS} emptyMessage="No memories were added in this time range." /></SqlPanel>
+      <SqlPanel title="MCP calls per day" description="Daily calls grouped by connected AI client." sql={calls.sql}><ActivityBarChart rows={chartCalls} valueKey="calls" groupKey="client" emptyMessage="No MCP calls were recorded in this time range." /></SqlPanel>
+      <SqlPanel title="Search latency" description="Daily average and p95 search time, with sample count." sql={latency.sql}><LatencyChart rows={chartLatency}/><div className="activity-legend"><span><i className="legend-average"/>Average</span><span><i className="legend-p95"/>p95</span></div><div className="insight-table-wrap"><table className="insight-table"><thead><tr><th>Day</th><th>Average</th><th>p95</th><th>Searches</th></tr></thead><tbody>{[...chartLatency].sort((a,b)=>String(b.day).localeCompare(String(a.day))).map((row)=><tr key={row.day}><td>{row.day}</td><td>{row.average_ms} ms</td><td>{row.p95_ms} ms</td><td>{row.samples}</td></tr>)}</tbody></table></div></SqlPanel>
+      <SqlPanel title="Links and suggestions" description="Current linked memories and pending or resolved suggestions." sql={links.sql}><LinkSegments rows={links.rows}/></SqlPanel>
+      <SqlPanel title="Searches with no results" description="Recent searches that did not find a matching memory." sql={view('zeroResultSearches').sql}>{table(zeroRows, [['ts','Time'],['client','Client'],['source','Source'],['query','Search']])}</SqlPanel>
+      <SqlPanel title="Most retrieved memories" description="Lifetime retrieval ranking from AI and search results." sql={retrievals.sql}>{table(retrievals.rows, [['title','Memory'],['retrieved','Retrieved'],['views','Views'],['source','Source'],['id','ID']])}<p className="insight-note">Never retrieved: <b>{never.rows[0]?.total ?? 0}</b></p><p className="insight-note">Lifetime ranking. Retrieval counts reset {data?.retrievalResetAt ? dateLabel(data.retrievalResetAt) : 'has not been reset'}.</p>{!data?.retrievalResetAt && <button type="button" onClick={onResetRetrievalCounts}>Reset retrieval counts</button>}</SqlPanel>
+      <SqlPanel title="Most viewed in the UI" description="Lifetime ranking of memories opened in the detail view." sql={viewed.sql}>{table(viewed.rows, [['title','Memory'],['views','Views'],['source','Source'],['id','ID']])}<p className="insight-note">Legacy counts include list and search results loaded before this fix and cannot be separated. New counts track opening a memory detail, at most once per minute.</p></SqlPanel>
+      <SqlPanel title="Embedding index" description="Memories with a vector available for meaning-based search." sql={embedding.sql}><div className="insight-stat"><strong>{embedding.rows[0]?.indexed ?? 0}</strong><span>indexed of {embedding.rows[0]?.total ?? 0} memories</span></div></SqlPanel>
+      <SqlPanel title="Connected AI clients" description="Known clients and their most recent recorded activity." sql={clients.sql}>{table(clientRows, [['client','Client'],['identity','Identity'],['first_seen','First seen'],['last_seen','Last seen'],['total_calls','Total calls'],['calls_last_7_days','Last 7 days']])}</SqlPanel>
+      <SqlPanel title="Memory proxy calls" description="Request volume and average injected memories by client and provider." sql={proxyCalls.sql}>{table(proxyCalls.rows, [['client','Client'],['provider','Provider'],['calls','Calls'],['average_memories_injected','Average memories injected']])}</SqlPanel>
     </div>
     <section className="insight-card run-sql-card"><header><h2>Run SQL</h2><small>Read only · SELECT only · 200 rows · 3 second timeout</small></header><textarea aria-label="SQL query" spellCheck="false" value={sql} onChange={(event) => setSql(event.target.value)} /><button className="run-sql-button" type="button" onClick={runSql} disabled={sqlRunning}>{sqlRunning ? 'Running…' : 'Run SQL'}</button>{sqlResult?.error && <p className="sql-error" role="alert">{sqlResult.error}</p>}{sqlResult?.rows && table(sqlResult.rows, sqlResult.columns.map((column) => [column, column]), 'Query returned no rows')}</section>
     </div>}
@@ -1697,6 +1746,7 @@ function App() {
     setSelectedId(memoryId);
     setSuggestionsOpen(false);
     setPickerOpen(false);
+    void window.brain.recordMemoryView(memoryId).catch(() => {});
     focusMemory(memoryId);
   }
 
@@ -1972,8 +2022,8 @@ function App() {
         <button type="button" aria-label="Settings" title="Settings" onClick={openSecuritySettings} aria-current={connectOpen && connectionsStartTab !== 'connections' ? 'page' : undefined}><Icon name="settings"/><span>Settings</span></button>
       </nav><div className="app-topbar-tools"><button type="button" title={`Pending memories (${pendingMemories.length})`} onClick={() => { openGraphView(); setPendingOpen(true); void refreshPendingMemories().catch(() => {}); }}>Pending <span>{pendingMemories.length}</span></button><button type="button" title="Open Quick context" onClick={() => void window.brain.openQuickContext()}>Quick context</button></div><div className="app-topbar-status"><span className="vault-state" title={vaultConfigured ? 'Vault unlocked' : 'Master password is not set'}><i/>{vaultConfigured ? 'Unlocked' : 'Password not set'}</span><button type="button" onClick={lockVault} disabled={!vaultConfigured} aria-label="Lock vault" title="Lock vault"><Icon name="lock"/><span>Lock</span></button><button type="button" onClick={() => void quitApp()} disabled={quitPending}>{quitPending ? 'Closing…' : 'Quit'}</button></div></header>
       <BrainGraph ref={graphRef} memories={memories} links={graphLinks} allLinks={links} counts={counts} linkCounts={graphLinkCountValues} linkVisibility={linkVisibility} onLinkVisibilityChange={setLinkVisibility} fitRevision={graphFitRevision} dataReady={dataReady} sidebarCollapsed={sidebarCollapsed || layoutMode(viewportWidth) === 'drawer'} sidebarWidth={sidebarWidth} onMemoryClick={openDetail} />
-    {insightsOpen && (insightsData ? <InsightsView data={insightsData} onBack={() => { setInsightsOpen(false); setGraphFitRevision((value) => value + 1); }} sql={sql} setSql={setSql} runSql={runAnalyticsQuery} sqlResult={sqlResult} sqlRunning={sqlRunning} onResetRetrievalCounts={resetRetrievalCounts} /> : <section className="insights-view"><header className="insights-header"><button className="back-button" type="button" onClick={() => { setInsightsOpen(false); setGraphFitRevision((value) => value + 1); }}>‹</button><div><h1>Insights</h1><p>Local activity and retrieval analytics</p></div></header><ChannelNotice channel="insights" loading={insightsLoading} error={insightsLoadError} onRetry={() => void openInsights()} /></section>)}
-      {chatOpen && <ChatView onBack={() => { setChatOpen(false); setGraphFitRevision((value) => value + 1); }} onManageProviders={() => { setChatOpen(false); openConnectSettings(); }} memoryTitles={Object.fromEntries(memories.map((item) => [item.id, item.title || 'Untitled memory']))} onOpenMemory={(id) => { setChatOpen(false); setInsightsOpen(false); setSelectedId(id); setSidebarCollapsed(false); focusMemory(id); }} />}
+    {insightsOpen && (insightsData ? <InsightsView data={insightsData} onBack={() => { setInsightsOpen(false); setGraphFitRevision((value) => value + 1); }} sql={sql} setSql={setSql} runSql={runAnalyticsQuery} sqlResult={sqlResult} sqlRunning={sqlRunning} onResetRetrievalCounts={resetRetrievalCounts} /> : <InsightsLoading onBack={() => { setInsightsOpen(false); setGraphFitRevision((value) => value + 1); }} onRetry={() => void openInsights()} error={!insightsLoading && insightsLoadError} />)}
+      {chatOpen && <ChatView onBack={() => { setChatOpen(false); setGraphFitRevision((value) => value + 1); }} onManageProviders={() => { setChatOpen(false); openConnectSettings(); }} memoryTitles={Object.fromEntries(memories.map((item) => [item.id, item.title || 'Untitled memory']))} onOpenMemory={(id) => { setChatOpen(false); setInsightsOpen(false); setSidebarCollapsed(false); openDetail(id); }} />}
       <aside className={`memory-panel${sidebarCollapsed ? ' is-collapsed' : ''}${layoutMode(viewportWidth) === 'drawer' ? ' is-drawer' : ''}${connectOpen ? ' is-page' : ''}`} style={{ '--sidebar-width': `${sidebarWidth}px`, display: insightsOpen || chatOpen || (addOpen && addMode === 'import') ? 'none' : undefined }}>
         <header className="sidebar-header"><strong>Memories</strong><div className="sidebar-tools"><button type="button" aria-label={sidebarCollapsed ? 'Expand memories sidebar' : 'Collapse memories sidebar'} onClick={() => setSidebarCollapsed((collapsed) => { const next = !collapsed; try { window.localStorage.setItem('one-brain-sidebar-collapsed', next ? '1' : '0'); } catch {} return next; })}>{sidebarCollapsed ? 'Show' : 'Hide'}</button></div></header>
         {!connectOpen && <div className="sidebar-resize-handle" role="separator" aria-orientation="vertical" aria-label="Resize memories sidebar" aria-valuemin="280" aria-valuemax="520" aria-valuenow={sidebarWidth} tabIndex="0" onPointerDown={beginSidebarResize} onKeyDown={(event) => { if (event.key === 'ArrowLeft') updateSidebarWidth(sidebarWidth - 16); if (event.key === 'ArrowRight') updateSidebarWidth(sidebarWidth + 16); }} />}

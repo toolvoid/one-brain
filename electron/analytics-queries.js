@@ -25,6 +25,9 @@ SELECT day, round(avg(latency_ms), 1) AS average_ms,
   max(CASE WHEN position = max(1, CAST((sample_count * 95 + 99) / 100 AS INTEGER)) THEN latency_ms END) AS p95_ms,
   max(sample_count) AS samples
 FROM ranked GROUP BY day ORDER BY day DESC`,
+  retrievalsByDay: `SELECT date(e.ts) AS day, count(*) AS total
+FROM event_memory_retrievals r JOIN events e ON e.id = r.event_id
+GROUP BY date(e.ts) ORDER BY day DESC`,
   zeroResultSearches: `SELECT ts, coalesce(client, 'UI') AS client, source, query
 FROM events WHERE kind IN ('search', 'mcp_call') AND tool IN ('search_memories', 'ui_search')
   AND coalesce(result_count, 0) = 0 ORDER BY ts DESC LIMIT 200`,

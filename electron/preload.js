@@ -2,7 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 const INVOKE_CHANNELS = new Set([
   'lifecycle:tail', 'clipboard:write-text', 'graphics:get-settings', 'graphics:set-mode', 'graphics:try-hardware-again', 'graphics:report-renderer', 'graphics:context-failed', 'graphics:acknowledge-restart-notice',
-  'memories:add', 'imports:create', 'memories:import', 'imports:finish', 'imports:list', 'imports:undo',
+  'memories:add', 'memories:viewed', 'imports:create', 'memories:import', 'imports:finish', 'imports:list', 'imports:undo',
   'legacy-cleanup:status', 'legacy-cleanup:run', 'links:list', 'links:create', 'links:delete',
   'suggestions:list', 'suggestions:accept', 'suggestions:join-all', 'suggestions:reject', 'suggestions:list-rejected', 'suggestions:restore', 'suggestions:dismiss-all',
   'memories:delete', 'memories:bulk-delete-preview', 'memories:bulk-delete', 'memories:bulk-delete-undo', 'memories:bulk-delete-undo-status', 'memories:set-private', 'memories:set-no-suggest', 'memories:move-source', 'memories:conversation-parts:count', 'memories:conversation-parts:delete',
@@ -95,6 +95,7 @@ contextBridge.exposeInMainWorld('brain', {
   countConversationParts: (id) => invoke('memories:conversation-parts:count', id),
   deleteConversationParts: (id) => invoke('memories:conversation-parts:delete', id),
   listMemories: () => invoke('memories:list'),
+  recordMemoryView: (id) => invoke('memories:viewed', id),
   searchMemories: (query, source, limit, offset, countRetrieval = false) => invoke('memories:search', query, source, limit, offset, countRetrieval),
   countBySource: () => invoke('memories:count-by-source'),
   getMcpConfig: () => invoke('mcp:config'),
