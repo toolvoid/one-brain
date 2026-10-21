@@ -107,6 +107,8 @@ const { attachSystemLockEvents } = require('./system-lock');
 const { createSecuritySettings } = require('./security-settings');
 const { deleteOldBackups: deleteOldBackupFiles, hasOldBackups } = require('./private-files');
 const { setMemoryLowQuality, listLowQualityCandidates, reembedStatus, reembedAllMemories } = require('./db');
+const { previewBulkDeleteMemories, bulkDeleteMemories, undoBulkDeleteMemories, getBulkDeleteUndoStatus } = require('./db');
+const { findEvaluationDatasetByName, renameEvaluationDataset, replaceEvaluationDataset, deleteEvaluationDataset } = require('./db');
 
 let mcpConnection;
 let memoryProxy;
@@ -555,6 +557,18 @@ ipcMain.handle('embeddings:reembed', async () => {
 ipcMain.handle('embeddings:reembed-status', () => reembedStatus());
 ipcMain.handle('evaluation:low-quality-candidates', () => listLowQualityCandidates());
 ipcMain.handle('evaluation:set-low-quality', (_event, id, lowQuality) => setMemoryLowQuality(id, lowQuality));
+ipcMain.handle('memories:bulk-delete-preview', (_event, ids) => previewBulkDeleteMemories(ids));
+ipcMain.handle('memories:bulk-delete', async (_event, ids) => {
+  const result = await bulkDeleteMemories(ids);
+  for (const id of result.ids) for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.send('brain:changed', { type: 'delete', id });
+  return { ok: true, ...result };
+});
+ipcMain.handle('memories:bulk-delete-undo', (_event) => {
+  const result = undoBulkDeleteMemories();
+  for (const id of result.ids) for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.send('brain:changed', { type: 'restore', id });
+  return { ok: true, ...result };
+});
+ipcMain.handle('memories:bulk-delete-undo-status', () => getBulkDeleteUndoStatus());
 ipcMain.handle('database:status', () => getDatabaseStatus());
 ipcMain.handle('security:status', () => {
   const settings = securitySettings.read();
@@ -632,6 +646,10 @@ ipcMain.handle('evaluation:run-results', (_event, runId) => getEvaluationRunResu
 ipcMain.handle('evaluation:parse-import', (_event, text) => parseEvaluationCsv(String(text || '').slice(0, 1_000_000)));
 ipcMain.handle('evaluation:save-dataset', (_event, name, rows) => saveEvaluationDataset(String(name || 'Imported evaluation'), Array.isArray(rows) ? rows.slice(0, 500) : []));
 ipcMain.handle('evaluation:datasets', () => listEvaluationDatasets());
+ipcMain.handle('evaluation:dataset-find', (_event, name) => findEvaluationDatasetByName(name));
+ipcMain.handle('evaluation:dataset-rename', (_event, id, name) => renameEvaluationDataset(id, name));
+ipcMain.handle('evaluation:dataset-replace', (_event, id, rows) => replaceEvaluationDataset(id, Array.isArray(rows) ? rows.slice(0, 500) : []));
+ipcMain.handle('evaluation:dataset-delete', (_event, id, options) => deleteEvaluationDataset(id, options || {}));
 ipcMain.handle('evaluation:run-dataset', (_event, id, options) => runEvaluationDataset(id, { ...(options || {}), appVersion: app.getVersion() }));
 ipcMain.handle('evaluation:runs', () => listEvaluationRunSummaries());
 ipcMain.handle('status:graph-ready', () => {

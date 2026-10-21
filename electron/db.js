@@ -14,6 +14,9 @@ const { secureRemovePath } = require('./private-files');
 const { writeVault, readVault, atomicPrivateWrite, unwrapDatabaseKey, passwordCharacterCount } = require('./security-vault');
 const { normalizeEvaluationConfig, runEvaluationQuestions } = require('./evaluation-tool');
 const { passesRelevanceGate } = require('./relevance-gate');
+const { buildFtsQuery } = require('./fts-query');
+const { collapseDocumentParts, documentTitle, matchesDocumentTitle, normalizedDocumentTitle } = require('./document-results');
+const { createQueryEmbeddingCache } = require('./query-embedding-cache');
 const MEMORY_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 
 let database;
@@ -40,6 +43,26 @@ let legacyCleanupStatus = { count: 0, backupPath: null, error: '' };
 const cancelledEmbeddingIds = new Set();
 let performanceRecorder = () => {};
 let embeddingRebuildProgress = { state: 'idle', done: 0, total: 0 };
+const queryEmbeddingCache = createQueryEmbeddingCache({ maxEntries: 512, ttlMs: 300_000 });
+const queryEmbeddingInflight = new Map();
+let queryEmbeddingEpoch = 0;
+function clearQueryEmbeddingCache() { queryEmbeddingEpoch++; queryEmbeddingCache.clear(); queryEmbeddingInflight.clear(); }
+function cachedQueryEmbedding(query) {
+  const model = embeddingIndexModel;
+  const cached = queryEmbeddingCache.get(model, query);
+  if (cached) return Promise.resolve(cached);
+  const key = `${model}\0${String(query || '').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en-US')}`;
+  if (queryEmbeddingInflight.has(key)) return queryEmbeddingInflight.get(key);
+  const epoch = queryEmbeddingEpoch;
+  let pending;
+  pending = Promise.resolve().then(() => embeddingProvider(String(query))).then((vector) => {
+    lockController.assertUnlocked();
+    if (epoch === queryEmbeddingEpoch && model === embeddingIndexModel) queryEmbeddingCache.set(model, query, vector);
+    return vector;
+  }).finally(() => { if (queryEmbeddingInflight.get(key) === pending) queryEmbeddingInflight.delete(key); });
+  queryEmbeddingInflight.set(key, pending);
+  return pending;
+}
 function setPerformanceRecorder(recorder) { performanceRecorder = typeof recorder === 'function' ? recorder : () => {}; }
 
 function setDatabaseStatus(state, writable, message = '') {
@@ -394,11 +417,10 @@ function updateEvaluationNote(id, note) {
   if (!changed) throw new Error('Evaluation run was not found.');
 }
 
-function saveEvaluationDataset(name, rows) {
-  ensureWritable();
+function prepareEvaluationQuestions(rows) {
   if (!Array.isArray(rows) || !rows.length || rows.length > 500) throw new Error('A dataset must contain 1 to 500 valid questions.');
   const db = getDatabase();
-  const prepared = rows.map((row, index) => {
+  return rows.map((row, index) => {
     const type = String(row?.type || '');
     const question = String(row?.question || '').trim().slice(0, 1000);
     if (!question || !['direct', 'paraphrase', 'multi', 'negative'].includes(type)) throw new Error(`Invalid evaluation question at row ${index + 1}.`);
@@ -409,33 +431,107 @@ function saveEvaluationDataset(name, rows) {
     if (type !== 'negative') for (const token of expectedText.split(';').map((value) => value.trim())) {
       if (/^\d+$/.test(token)) {
         const memory = db.prepare('SELECT id, title FROM memories WHERE id = ?').get(Number(token));
-        if (memory) { expectedIds.add(Number(memory.id)); expectedTitles.add(memory.title || 'Untitled'); continue; }
+        if (memory) {
+          const base = normalizedDocumentTitle(memory.title || 'Untitled');
+          const baseTitle = documentTitle(memory.title || 'Untitled');
+          const escaped = baseTitle.replace(/[\\%_]/g, '\\$&');
+          const siblingRows = db.prepare(`SELECT id, title FROM memories WHERE lower(title) = lower(?) OR title LIKE ? ESCAPE '\\'`).all(baseTitle, `${escaped} (part %/%`);
+          const siblings = siblingRows.filter((candidate) => normalizedDocumentTitle(candidate.title) === base);
+          for (const sibling of siblings.length ? siblings : [memory]) expectedIds.add(Number(sibling.id));
+          expectedTitles.add(baseTitle);
+          continue;
+        }
       }
-      const matches = db.prepare('SELECT id, title FROM memories WHERE title = ? ORDER BY id').all(token);
-      if (!matches.length) throw new Error(`Expected memory "${token.slice(0, 80)}" was not found at row ${index + 1}.`);
-      for (const memory of matches) { expectedIds.add(Number(memory.id)); expectedTitles.add(memory.title || 'Untitled'); }
+      const baseTitle = documentTitle(token);
+      const escaped = baseTitle.replace(/[\\%_]/g, '\\$&');
+      const candidates = db.prepare(`SELECT id, title FROM memories WHERE lower(title) = lower(?) OR title LIKE ? ESCAPE '\\' ORDER BY id`).all(baseTitle, `${escaped} (part %/%`)
+        .filter((candidate) => normalizedDocumentTitle(candidate.title) === normalizedDocumentTitle(baseTitle));
+      if (!candidates.length) throw new Error(`Expected memory "${token.slice(0, 80)}" was not found at row ${index + 1}.`);
+      for (const memory of candidates) expectedIds.add(Number(memory.id));
+      expectedTitles.add(baseTitle);
     }
     return { externalId: String(row.id || `row-${index + 1}`).slice(0, 100), question, type,
       expectedIds: [...expectedIds], expectedTitles: [...expectedTitles] };
   });
+}
+
+function addPreparedEvaluationQuestions(db, datasetId, prepared) {
+  const add = db.prepare('INSERT INTO eval_questions(dataset_id, external_id, question, type, expected_ids, expected_titles) VALUES (?, ?, ?, ?, ?, ?)');
+  for (const row of prepared) add.run(datasetId, row.externalId, row.question, row.type, JSON.stringify(row.expectedIds), JSON.stringify(row.expectedTitles));
+}
+
+function saveEvaluationDataset(name, rows) {
+  ensureWritable();
+  const db = getDatabase();
+  const prepared = prepareEvaluationQuestions(rows);
+  const cleanName = String(name || 'Imported evaluation').trim().slice(0, 100);
+  if (!cleanName) throw new Error('Enter a dataset name.');
+  if (db.prepare('SELECT 1 FROM eval_question_sets WHERE deleted_at IS NULL AND lower(name) = lower(?)').get(cleanName)) throw new Error('A dataset with this name already exists; choose Replace or Add as new.');
   const create = db.transaction(() => {
-    const datasetId = Number(db.prepare('INSERT INTO eval_question_sets(name) VALUES (?)').run(String(name || 'Imported evaluation').slice(0, 100)).lastInsertRowid);
-    const add = db.prepare('INSERT INTO eval_questions(dataset_id, external_id, question, type, expected_ids, expected_titles) VALUES (?, ?, ?, ?, ?, ?)');
-    for (const row of prepared) add.run(datasetId, row.externalId, row.question, row.type, JSON.stringify(row.expectedIds), JSON.stringify(row.expectedTitles));
+    const datasetId = Number(db.prepare('INSERT INTO eval_question_sets(name) VALUES (?)').run(cleanName).lastInsertRowid);
+    addPreparedEvaluationQuestions(db, datasetId, prepared);
     return datasetId;
   });
   return { id: create(), count: prepared.length };
 }
 
+function findEvaluationDatasetByName(name) {
+  const cleanName = String(name || '').trim().slice(0, 100);
+  if (!cleanName) return null;
+  return getDatabase().prepare(`SELECT d.id, d.name, count(q.id) AS questions,
+    (SELECT count(*) FROM eval_run_summaries r WHERE r.dataset_id = d.id) AS runs
+    FROM eval_question_sets d LEFT JOIN eval_questions q ON q.dataset_id = d.id
+    WHERE d.deleted_at IS NULL AND lower(d.name) = lower(?) GROUP BY d.id ORDER BY d.id DESC LIMIT 1`).get(cleanName) || null;
+}
+
+function renameEvaluationDataset(id, name) {
+  ensureWritable();
+  const db = getDatabase(), cleanName = String(name || '').trim().slice(0, 100), datasetId = Number(id);
+  if (!cleanName) throw new Error('Enter a dataset name.');
+  if (db.prepare('SELECT 1 FROM eval_question_sets WHERE deleted_at IS NULL AND lower(name) = lower(?) AND id != ?').get(cleanName, datasetId)) throw new Error('Another dataset already uses this name.');
+  if (!db.prepare('UPDATE eval_question_sets SET name = ? WHERE id = ? AND deleted_at IS NULL').run(cleanName, datasetId).changes) throw new Error('Dataset was not found.');
+  return true;
+}
+
+function replaceEvaluationDataset(id, rows) {
+  ensureWritable();
+  const db = getDatabase(), datasetId = Number(id), prepared = prepareEvaluationQuestions(rows);
+  if (!db.prepare('SELECT 1 FROM eval_question_sets WHERE id = ? AND deleted_at IS NULL').get(datasetId)) throw new Error('Dataset was not found.');
+  db.transaction(() => {
+    db.prepare('DELETE FROM eval_run_summaries WHERE dataset_id = ?').run(datasetId);
+    db.prepare('DELETE FROM eval_questions WHERE dataset_id = ?').run(datasetId);
+    addPreparedEvaluationQuestions(db, datasetId, prepared);
+  })();
+  return { id: datasetId, count: prepared.length, runsReset: true };
+}
+
+function deleteEvaluationDataset(id, { deleteRuns = false, confirmation = '', runsConfirmation = '' } = {}) {
+  ensureWritable();
+  if (confirmation !== 'DELETE') throw new Error('Type DELETE to confirm removal of this dataset.');
+  if (deleteRuns && runsConfirmation !== 'DELETE RUNS') throw new Error('Type DELETE RUNS to also remove saved runs.');
+  const db = getDatabase(), datasetId = Number(id);
+  const dataset = db.prepare(`SELECT id, name, (SELECT count(*) FROM eval_run_summaries r WHERE r.dataset_id = d.id) AS runs
+    FROM eval_question_sets d WHERE id = ? AND deleted_at IS NULL`).get(datasetId);
+  if (!dataset) throw new Error('Dataset was not found.');
+  if (deleteRuns) db.prepare('DELETE FROM eval_run_summaries WHERE dataset_id = ?').run(datasetId);
+  db.transaction(() => {
+    db.prepare('DELETE FROM eval_questions WHERE dataset_id = ?').run(datasetId);
+    db.prepare('UPDATE eval_question_sets SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?').run(datasetId);
+  })();
+  return { deleted: true, keptRuns: deleteRuns ? 0 : Number(dataset.runs), removedRuns: deleteRuns ? Number(dataset.runs) : 0 };
+}
+
 function listEvaluationDatasets() {
-  return getDatabase().prepare(`SELECT d.id, d.name, d.created_at, count(q.id) AS questions
-    FROM eval_question_sets d LEFT JOIN eval_questions q ON q.dataset_id = d.id GROUP BY d.id ORDER BY d.id DESC`).all();
+  return getDatabase().prepare(`SELECT d.id, d.name, d.created_at, count(q.id) AS questions,
+    (SELECT count(*) FROM eval_run_summaries r WHERE r.dataset_id = d.id) AS runs
+    FROM eval_question_sets d LEFT JOIN eval_questions q ON q.dataset_id = d.id
+    WHERE d.deleted_at IS NULL GROUP BY d.id ORDER BY d.id DESC`).all();
 }
 
 async function runEvaluationDataset(datasetId, { config: rawConfig = {}, includePrivate = false, appVersion = 'unknown', questionTypes = null } = {}) {
   ensureWritable();
   const db = getDatabase();
-  const dataset = db.prepare('SELECT id, name FROM eval_question_sets WHERE id = ?').get(Number(datasetId));
+  const dataset = db.prepare('SELECT id, name FROM eval_question_sets WHERE id = ? AND deleted_at IS NULL').get(Number(datasetId));
   if (!dataset) throw new Error('Evaluation dataset was not found.');
   let questions = db.prepare('SELECT id, external_id, question, type, expected_ids, expected_titles FROM eval_questions WHERE dataset_id = ? ORDER BY id').all(dataset.id)
     .map((row) => ({ id: row.external_id || row.id, question: row.question, type: row.type,
@@ -447,16 +543,24 @@ async function runEvaluationDataset(datasetId, { config: rawConfig = {}, include
     (query, options) => searchMemories(query, 'all', options.limit, 0, null, { ...options.config, includePrivate: options.includePrivate }),
     { config, includePrivate, diagnose: async (question, options) => {
       const expected = new Set(question.expectedIds.map(Number));
-      if (!expected.size) return null;
+      const expectedTitles = question.expectedTitles || [];
+      const matchesExpected = (row) => expected.has(Number(row.id)) || matchesDocumentTitle(row.title, expectedTitles);
+      if (!expected.size && !expectedTitles.length) return null;
       const visible = (rows) => options.includePrivate ? rows : rows.filter((row) => !row.private);
-      const [ftsRows, vectorRows, hybridRows] = await Promise.all([
+      const ranking = { ftsWeight: options.config.ftsWeight, vectorWeight: options.config.vectorWeight, rrfK: options.config.rrfK, minScore: options.config.minScore, includePrivate: options.includePrivate };
+      const [ftsRaw, vectorRaw, hybridRows, ungatedRows] = await Promise.all([
         Promise.resolve(searchFts(question.question, 'all', 500, 0)),
         semanticSearch(question.question, 'all', 500).catch(() => []),
-        searchMemories(question.question, 'all', 500, 0, null, { ftsWeight: options.config.ftsWeight, vectorWeight: options.config.vectorWeight, rrfK: options.config.rrfK, includePrivate: options.includePrivate })
+        searchMemories(question.question, 'all', 500, 0, null, ranking),
+        searchMemories(question.question, 'all', 500, 0, null, { ...ranking, ignoreRelevanceGate: true })
       ]);
-      const expectedRank = (rows) => { const index = visible(rows).findIndex((row) => expected.has(Number(row.id))); return index < 0 ? null : index + 1; };
-      const vectorMatch = visible(vectorRows).find((row) => expected.has(Number(row.id)));
-      return { ftsRank: expectedRank(ftsRows), vectorRank: expectedRank(vectorRows), hybridRank: expectedRank(hybridRows), cosineSimilarity: vectorMatch ? Number(vectorMatch.score) : null };
+      const ftsRows = collapseDocumentParts(visible(ftsRaw));
+      const vectorRows = collapseDocumentParts(visible(vectorRaw));
+      const expectedRank = (rows) => { const index = rows.findIndex(matchesExpected); return index < 0 ? null : index + 1; };
+      const vectorMatch = vectorRows.find(matchesExpected);
+      const gatedRank = expectedRank(hybridRows), ungatedRank = expectedRank(ungatedRows);
+      return { ftsRank: expectedRank(ftsRows), vectorRank: expectedRank(vectorRows), hybridRank: gatedRank,
+        filteredByGate: ungatedRank != null && gatedRank == null, cosineSimilarity: vectorMatch ? Number(vectorMatch.score) : null };
     } });
   const storedMetrics = { ...result.metrics, byType: result.byType };
   const inserted = db.prepare('INSERT INTO eval_run_summaries(dataset_id, app_version, config_json, metrics_json) VALUES (?, ?, ?, ?)')
@@ -466,7 +570,10 @@ async function runEvaluationDataset(datasetId, { config: rawConfig = {}, include
 }
 
 function listEvaluationRunSummaries() {
-  return getDatabase().prepare('SELECT r.id, r.ts, r.dataset_id AS datasetId, d.name AS datasetName, r.app_version AS appVersion, r.config_json AS configJson, r.metrics_json AS metricsJson FROM eval_run_summaries r JOIN eval_question_sets d ON d.id = r.dataset_id ORDER BY r.id ASC LIMIT 100').all()
+  return getDatabase().prepare(`SELECT r.id, r.ts, r.dataset_id AS datasetId,
+    CASE WHEN d.deleted_at IS NULL THEN d.name ELSE d.name || ' (deleted dataset)' END AS datasetName,
+    r.app_version AS appVersion, r.config_json AS configJson, r.metrics_json AS metricsJson
+    FROM eval_run_summaries r JOIN eval_question_sets d ON d.id = r.dataset_id ORDER BY r.id ASC LIMIT 100`).all()
     .map((row) => ({ ...row, config: JSON.parse(row.configJson), metrics: JSON.parse(row.metricsJson) }));
 }
 
@@ -1374,6 +1481,10 @@ function getDatabase() {
         metrics_json TEXT NOT NULL
       );
     `));
+    migrate('evaluation-dataset-management-v1', () => {
+      const columns = new Set(database.prepare('PRAGMA table_info(eval_question_sets)').all().map((column) => column.name));
+      if (!columns.has('deleted_at')) database.exec('ALTER TABLE eval_question_sets ADD COLUMN deleted_at TEXT');
+    });
     migrate('chat-save-source-v1', () => {
       const chatColumns = new Set(database.prepare('PRAGMA table_info(chats)').all().map((column) => column.name));
       if (!chatColumns.has('memory_source')) database.exec('ALTER TABLE chats ADD COLUMN memory_source TEXT');
@@ -1473,6 +1584,13 @@ function getDatabase() {
         source_hash TEXT NOT NULL
       )`);
     });
+    migrate('bulk-delete-undo-v1', () => {
+      database.exec(`CREATE TABLE IF NOT EXISTS bulk_delete_undo (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        snapshot TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`);
+    });
     database.exec('CREATE INDEX IF NOT EXISTS memories_import_id_idx ON memories(import_id)');
 
     const backfillHashes = database.transaction(() => {
@@ -1523,6 +1641,7 @@ function closeDatabaseForTest() {
   embeddingJobs = new Map();
   embeddingProvider = null;
   embeddingReady = false;
+  clearQueryEmbeddingCache();
   cancelledEmbeddingIds.clear();
 }
 
@@ -1542,6 +1661,7 @@ function lockDatabase() {
   embeddingJobs = new Map();
   embeddingProvider = null;
   embeddingReady = false;
+  clearQueryEmbeddingCache();
   cancelledEmbeddingIds.clear();
   databaseStatus = { state: 'locked', writable: false, message: 'One Brain is locked. Unlock it to access your data.' };
 }
@@ -1693,9 +1813,11 @@ async function drainEmbeddingQueue() {
 
 function configureEmbeddingProvider(provider, model, { onProgress = () => {}, onLinksChanged = () => {}, onError = () => {} } = {}) {
   lockController.assertUnlocked();
+  const nextIndexModel = indexedEmbeddingModel(model);
+  if (nextIndexModel !== embeddingIndexModel) clearQueryEmbeddingCache();
   embeddingProvider = provider;
   embeddingModel = model;
-  embeddingIndexModel = indexedEmbeddingModel(model);
+  embeddingIndexModel = nextIndexModel;
   embeddingReady = true;
   semanticLinksListener = onLinksChanged;
   const db = getDatabase();
@@ -1732,7 +1854,7 @@ function reembedStatus() {
   const indexed = embeddingIndexModel ? db.prepare('SELECT count(*) AS n FROM embeddings WHERE model = ?').get(embeddingIndexModel).n : 0;
   const oldEmbeddingCount = db.prepare('SELECT count(*) AS n FROM embeddings').get().n;
   const staged = embeddingIndexModel ? db.prepare('SELECT count(*) AS n FROM embedding_staging WHERE model = ?').get(embeddingIndexModel).n : 0;
-  return { state: embeddingRebuildProgress.state, done: embeddingRebuildProgress.done || staged, staged, total, model: embeddingModel, indexed, oldEmbeddingCount, needsReembed: Math.max(0, total - indexed) };
+  return { state: embeddingRebuildProgress.state, done: embeddingRebuildProgress.done || staged, staged, total, model: embeddingModel, indexed, formatVersion: 'title-content-v1', oldEmbeddingCount, needsReembed: Math.max(0, total - indexed) };
 }
 
 async function reembedAllMemories(onProgress = () => {}) {
@@ -2147,29 +2269,31 @@ function searchFts(query, source, limit, offset) {
   const db = getDatabase();
   const safeLimit = Math.max(1, Math.min(500, Math.floor(Number(limit) || 50)));
   const safeOffset = Math.max(0, Math.floor(Number(offset) || 0));
-  const terms = String(query || '').replace(/"/g, '').match(/[\p{L}\p{N}_]+/gu) || [];
+  const querySpec = buildFtsQuery(query);
   const filterSource = source && source !== 'all' ? String(source) : null;
 
-  if (!terms.length) {
+  if (!querySpec.match) {
     const params = filterSource ? [filterSource, safeLimit, safeOffset] : [safeLimit, safeOffset];
     const where = filterSource ? 'WHERE source = ?' : '';
     return db.prepare(`
-      SELECT id, source, title, created_at, private, low_quality, substr(content, 1, 120) AS snippet
+      SELECT id, source, title, created_at, private, low_quality, import_id, substr(content, 1, 120) AS snippet
       FROM memories ${where}
       ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
     `).all(...params).map((row, index) => ({ ...row, score: 1 / (60 + safeOffset + index + 1) }));
   }
 
-  const match = terms.slice(0, 16).map((term) => `"${term.replace(/"/g, '')}"*`).join(' ');
-  const params = filterSource ? [match, filterSource, safeLimit, safeOffset] : [match, safeLimit, safeOffset];
+  const phraseBoost = querySpec.phrases.length
+    ? `CASE WHEN ${querySpec.phrases.map(() => `instr(lower(coalesce(memories.title, '') || ' ' || coalesce(memories.content, '')), lower(?)) > 0`).join(' OR ')} THEN 0 ELSE 1 END,`
+    : '';
+  const params = [querySpec.match, ...querySpec.phrases, ...(filterSource ? [filterSource] : []), safeLimit, safeOffset];
   const sourceWhere = filterSource ? 'AND memories.source = ?' : '';
   return db.prepare(`
-    SELECT memories.id, memories.source, memories.title, memories.created_at, memories.private, memories.no_suggest, memories.low_quality,
+    SELECT memories.id, memories.source, memories.title, memories.created_at, memories.private, memories.no_suggest, memories.low_quality, memories.import_id,
       substr(snippet(memories_fts, -1, '', '', ' … ', 24), 1, 120) AS snippet
     FROM memories_fts
     JOIN memories ON memories.id = memories_fts.rowid
     WHERE memories_fts MATCH ? ${sourceWhere}
-    ORDER BY bm25(memories_fts, 8.0, 1.0), memories.created_at DESC, memories.id DESC
+    ORDER BY ${phraseBoost} bm25(memories_fts, 8.0, 1.0), memories.created_at DESC, memories.id DESC
     LIMIT ? OFFSET ?
   `).all(...params).map((row, index) => ({ ...row, score: 1 / (60 + safeOffset + index + 1) }));
 }
@@ -2178,7 +2302,7 @@ async function semanticSearch(query, source, limit = 50) {
   lockController.assertUnlocked();
   const safeLimit = Math.max(1, Math.min(500, Math.floor(Number(limit) || 50)));
   if (!embeddingReady || !embeddingProvider || !String(query || '').trim()) return [];
-  const queryVector = await embeddingProvider(String(query));
+  const queryVector = await cachedQueryEmbedding(query);
   lockController.assertUnlocked();
   const results = [];
   for (const [id, entry] of vectorCache) {
@@ -2186,7 +2310,7 @@ async function semanticSearch(query, source, limit = 50) {
     const memory = memoryCache.get(id);
     if (!memory || (source && source !== 'all' && memory.source !== source)) continue;
     const score = cosineSimilarity(queryVector, entry.vector);
-    results.push({ id, source: memory.source, title: memory.title, created_at: memory.created_at, snippet: String(memory.content || '').slice(0, 120), private: memory.private, no_suggest: memory.no_suggest, low_quality: memory.low_quality, score });
+    results.push({ id, source: memory.source, title: memory.title, created_at: memory.created_at, import_id: memory.import_id, snippet: String(memory.content || '').slice(0, 120), private: memory.private, no_suggest: memory.no_suggest, low_quality: memory.low_quality, score });
   }
   results.sort((a, b) => b.score - a.score);
   return results.slice(0, safeLimit);
@@ -2200,25 +2324,25 @@ async function searchMemories(query, source, limit = 50, offset = 0, event = nul
   const vectorWeight = Math.max(0, Math.min(10, Number(rankingConfig.vectorWeight ?? 1)));
   const safeLimit = Math.max(1, Math.min(50, Math.floor(Number(limit) || 50)));
   const safeOffset = Math.max(0, Math.floor(Number(offset) || 0));
-  const terms = String(query || '').replace(/"/g, '').match(/[\p{L}\p{N}_]+/gu) || [];
+  const querySpec = buildFtsQuery(query);
   const poolSize = Math.min(500, Math.max(100, safeLimit + safeOffset));
   let fts;
   const ftsStarted = performance.now();
-  try { fts = searchFts(query, source, terms.length ? poolSize : safeLimit, terms.length ? 0 : safeOffset); performanceRecorder('search_fts', performance.now() - ftsStarted); }
+  try { fts = searchFts(query, source, querySpec.match ? poolSize : safeLimit, querySpec.match ? 0 : safeOffset); performanceRecorder('search_fts', performance.now() - ftsStarted); }
   catch (error) {
     performanceRecorder('search_fts', performance.now() - ftsStarted);
     performanceRecorder('search_hybrid', performance.now() - startedPerf);
     if (event) recordEvent({ ...event, source: source === 'all' ? null : source, query, result_count: 0, latency_ms: Date.now() - startedAt, ok: false, error: error?.name || 'Search failed' });
     throw error;
   }
-  if (!terms.length || !embeddingReady || !embeddingProvider) {
+  if (!querySpec.match || !embeddingReady || !embeddingProvider) {
     if (rankingConfig.minScore != null) {
       performanceRecorder('search_hybrid', performance.now() - startedPerf);
       return [];
     }
     const ftsResults = rankingConfig.includePrivate === false ? fts.filter((row) => !row.private) : fts;
-    const results = ftsResults.map((row, index) => ({ ...row, score: (ftsWeight / (rrfK + index + 1)) * (row.low_quality ? 0.5 : 1) }))
-      .sort((a, b) => b.score - a.score).slice(0, safeLimit);
+    const results = collapseDocumentParts(ftsResults.map((row, index) => ({ ...row, score: (ftsWeight / (rrfK + index + 1)) * (row.low_quality ? 0.5 : 1) }))
+      .sort((a, b) => b.score - a.score)).slice(safeOffset, safeOffset + safeLimit);
     performanceRecorder('search_hybrid', performance.now() - startedPerf);
     if (event) recordEvent({ ...event, source: source === 'all' ? null : source, query, result_count: results.length, top_score: results[0]?.score ?? null, latency_ms: Date.now() - startedAt }, results.map((row) => row.id));
     return results;
@@ -2231,8 +2355,8 @@ async function searchMemories(query, source, limit = 50, offset = 0, event = nul
     performanceRecorder('search_vector', performance.now() - vectorStarted);
     if (rankingConfig.minScore != null) { performanceRecorder('search_hybrid', performance.now() - startedPerf); return []; }
     const ftsResults = rankingConfig.includePrivate === false ? fts.filter((row) => !row.private) : fts;
-    const results = ftsResults.map((row, index) => ({ ...row, score: (ftsWeight / (rrfK + index + 1)) * (row.low_quality ? 0.5 : 1) }))
-      .sort((a, b) => b.score - a.score).slice(0, safeLimit);
+    const results = collapseDocumentParts(ftsResults.map((row, index) => ({ ...row, score: (ftsWeight / (rrfK + index + 1)) * (row.low_quality ? 0.5 : 1) }))
+      .sort((a, b) => b.score - a.score)).slice(safeOffset, safeOffset + safeLimit);
     performanceRecorder('search_hybrid', performance.now() - startedPerf);
     if (event) recordEvent({ ...event, source: source === 'all' ? null : source, query, result_count: results.length, top_score: results[0]?.score ?? null, latency_ms: Date.now() - startedAt, ok: false, error: error?.name || 'Search failed' }, results.map((row) => row.id));
     return results;
@@ -2247,8 +2371,8 @@ async function searchMemories(query, source, limit = 50, offset = 0, event = nul
   });
   const allResults = [...combined.values()].map((row) => ({ ...row, score: row.score * (row.low_quality ? 0.5 : 1) })).sort((a, b) => b.score - a.score);
   const visibleResults = (rankingConfig.includePrivate === false ? allResults.filter((row) => !row.private) : allResults)
-    .filter((row) => rankingConfig.minScore == null || passesRelevanceGate(row, rankingConfig.minScore));
-  const results = visibleResults.slice(safeOffset, safeOffset + safeLimit);
+    .filter((row) => rankingConfig.ignoreRelevanceGate || rankingConfig.minScore == null || passesRelevanceGate(row, rankingConfig.minScore));
+  const results = collapseDocumentParts(visibleResults).slice(safeOffset, safeOffset + safeLimit);
   performanceRecorder('search_hybrid', performance.now() - startedPerf);
   if (event) recordEvent({ ...event, source: source === 'all' ? null : source, query, result_count: results.length, top_score: results[0]?.score ?? null, latency_ms: Date.now() - startedAt }, results.map((row) => row.id));
   return results;
@@ -2268,6 +2392,84 @@ function deleteMemory(id, event = null) {
   memoryCache.delete(Number(id));
   if (deleted) recordEvent(event || { kind: 'delete', tool: 'delete_memory', result_count: 1 });
   return deleted;
+}
+
+function normalizeBulkMemoryIds(ids) {
+  if (!Array.isArray(ids) || ids.length < 1 || ids.length > 500) throw new Error('Enter between 1 and 500 memory IDs.');
+  const normalized = [...new Set(ids.map((value) => Number(value)))];
+  if (normalized.some((id) => !Number.isSafeInteger(id) || id < 1)) throw new Error('Memory IDs must be positive whole numbers.');
+  return normalized;
+}
+
+function previewBulkDeleteMemories(ids) {
+  lockController.assertUnlocked();
+  const normalized = normalizeBulkMemoryIds(ids);
+  const placeholders = normalized.map(() => '?').join(',');
+  return getDatabase().prepare(`SELECT id, title, source FROM memories WHERE id IN (${placeholders}) ORDER BY id`).all(...normalized)
+    .map((row) => ({ id: Number(row.id), title: String(row.title || 'Untitled memory'), source: String(row.source || 'unknown') }));
+}
+
+async function bulkDeleteMemories(ids) {
+  ensureWritable();
+  const db = getDatabase();
+  const rows = previewBulkDeleteMemories(ids);
+  if (!rows.length) throw new Error('No matching memories were found.');
+  const memoryIds = rows.map((row) => row.id);
+  const placeholders = memoryIds.map(() => '?').join(',');
+  const snapshot = {
+    memories: db.prepare(`SELECT * FROM memories WHERE id IN (${placeholders}) ORDER BY id`).all(...memoryIds),
+    links: db.prepare(`SELECT * FROM links WHERE a_id IN (${placeholders}) OR b_id IN (${placeholders})`).all(...memoryIds, ...memoryIds),
+    suggestions: db.prepare(`SELECT * FROM link_suggestions WHERE a_id IN (${placeholders}) OR b_id IN (${placeholders})`).all(...memoryIds, ...memoryIds),
+    embeddings: db.prepare(`SELECT * FROM embeddings WHERE memory_id IN (${placeholders})`).all(...memoryIds).map((row) => ({ ...row, vector: Buffer.from(row.vector).toString('base64') })),
+    stagedEmbeddings: db.prepare(`SELECT * FROM embedding_staging WHERE memory_id IN (${placeholders})`).all(...memoryIds).map((row) => ({ ...row, vector: Buffer.from(row.vector).toString('base64') })),
+  };
+  const backupPath = await createPreCleanupBackup();
+  cancelEmbeddingJobs(memoryIds);
+  db.transaction(() => {
+    db.prepare(`DELETE FROM links WHERE a_id IN (${placeholders}) OR b_id IN (${placeholders})`).run(...memoryIds, ...memoryIds);
+    db.prepare(`DELETE FROM link_suggestions WHERE a_id IN (${placeholders}) OR b_id IN (${placeholders})`).run(...memoryIds, ...memoryIds);
+    db.prepare(`DELETE FROM embeddings WHERE memory_id IN (${placeholders})`).run(...memoryIds);
+    db.prepare(`DELETE FROM memories WHERE id IN (${placeholders})`).run(...memoryIds);
+    db.prepare('INSERT INTO bulk_delete_undo(id, snapshot, created_at) VALUES (1, ?, CURRENT_TIMESTAMP) ON CONFLICT(id) DO UPDATE SET snapshot = excluded.snapshot, created_at = excluded.created_at').run(JSON.stringify(snapshot));
+  })();
+  for (const id of memoryIds) { vectorCache.delete(id); memoryCache.delete(id); }
+  recordEvent({ kind: 'delete', tool: 'bulk_delete_memories', result_count: memoryIds.length });
+  return { deleted: memoryIds.length, ids: memoryIds, backupPath };
+}
+
+function undoBulkDeleteMemories() {
+  ensureWritable();
+  const db = getDatabase();
+  const saved = db.prepare('SELECT snapshot FROM bulk_delete_undo WHERE id = 1').get();
+  if (!saved) return { restored: 0, ids: [] };
+  const snapshot = JSON.parse(saved.snapshot);
+  const insertRows = (table, rows, { omit = [], ignore = false, decodeVector = false } = {}) => {
+    if (!rows.length) return;
+    const keys = Object.keys(rows[0]).filter((key) => !omit.includes(key));
+    const sql = `INSERT ${ignore ? 'OR IGNORE ' : ''}INTO "${table}" (${keys.map((key) => `"${key}"`).join(',')}) VALUES (${keys.map(() => '?').join(',')})`;
+    const statement = db.prepare(sql);
+    for (const row of rows) statement.run(...keys.map((key) => decodeVector && key === 'vector' ? Buffer.from(row[key], 'base64') : row[key]));
+  };
+  db.transaction(() => {
+    insertRows('memories', snapshot.memories);
+    insertRows('embeddings', snapshot.embeddings || [], { decodeVector: true });
+    insertRows('embedding_staging', snapshot.stagedEmbeddings || [], { decodeVector: true });
+    insertRows('links', snapshot.links || [], { omit: ['id'], ignore: true });
+    insertRows('link_suggestions', snapshot.suggestions || [], { omit: ['id'], ignore: true });
+    db.prepare('DELETE FROM bulk_delete_undo WHERE id = 1').run();
+  })();
+  cachesLoaded = false;
+  memoryCache = new Map(); vectorCache = new Map();
+  loadCaches(db);
+  const restored = snapshot.memories.length;
+  recordEvent({ kind: 'restore', tool: 'undo_bulk_delete', result_count: restored });
+  return { restored, ids: snapshot.memories.map((row) => Number(row.id)) };
+}
+
+function getBulkDeleteUndoStatus() {
+  lockController.assertUnlocked();
+  const row = getDatabase().prepare('SELECT created_at FROM bulk_delete_undo WHERE id = 1').get();
+  return { available: Boolean(row), createdAt: row?.created_at || null };
 }
 
 function conversationPartScope(memoryId) {
@@ -2490,3 +2692,11 @@ module.exports.unlockDatabaseWithPassword = unlockDatabaseWithPassword;
 module.exports.exportEncryptedRecoveryFile = exportEncryptedRecoveryFile;
 module.exports.changeMasterPassword = changeMasterPassword;
 module.exports.restoreEncryptedRecoveryFile = restoreEncryptedRecoveryFile;
+module.exports.previewBulkDeleteMemories = previewBulkDeleteMemories;
+module.exports.bulkDeleteMemories = bulkDeleteMemories;
+module.exports.undoBulkDeleteMemories = undoBulkDeleteMemories;
+module.exports.getBulkDeleteUndoStatus = getBulkDeleteUndoStatus;
+module.exports.findEvaluationDatasetByName = findEvaluationDatasetByName;
+module.exports.renameEvaluationDataset = renameEvaluationDataset;
+module.exports.replaceEvaluationDataset = replaceEvaluationDataset;
+module.exports.deleteEvaluationDataset = deleteEvaluationDataset;

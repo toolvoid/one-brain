@@ -1,6 +1,7 @@
 'use strict';
 
 const QUESTION_TYPES = Object.freeze(['direct', 'paraphrase', 'multi', 'negative']);
+const { matchesDocumentTitle } = require('./document-results');
 const DEFAULT_EVALUATION_CONFIG = Object.freeze({ ftsWeight: 1, vectorWeight: 1, rrfK: 60, minScore: 0.3, topN: 10, chunkSize: 1200, chunkOverlap: 0 });
 
 function parseCsv(text) {
@@ -90,10 +91,17 @@ async function runEvaluationQuestions(questions, search, { config: rawConfig = {
     const latencyMs = performance.now() - started;
     if (!includePrivate) returned = returned.filter((item) => !item.private);
     const expectedIds = new Set((question.expectedIds || []).map(Number));
-    const rankIndex = expectedIds.size ? returned.findIndex((item) => expectedIds.has(Number(item.id))) : -1;
+    const expectedTitles = question.expectedTitles || [];
+    const matchesExpectedId = (item) => expectedIds.has(Number(item.id));
+    const matchesExpectedTitle = (item) => matchesDocumentTitle(item.title, expectedTitles);
+    const rankIndex = expectedIds.size || expectedTitles.length ? returned.findIndex((item) => matchesExpectedId(item) || matchesExpectedTitle(item)) : -1;
+    const hit = rankIndex >= 0 ? returned[rankIndex] : null;
+    const exactExpectedTitle = expectedTitles.some((title) => String(title).trim().toLocaleLowerCase('en-US') === String(hit?.title || '').trim().toLocaleLowerCase('en-US'));
+    const docHit = Boolean(hit && matchesExpectedTitle(hit) && !exactExpectedTitle);
     const diagnostics = typeof diagnose === 'function' ? await diagnose(question, { config, includePrivate, hybrid: returned }) : null;
     records.push({ id: question.id, question: question.question, type: question.type,
       rank: rankIndex < 0 ? null : rankIndex + 1, topScore: Number(returned[0]?.score) || 0,
+      docHit,
       falsePositive: question.type === 'negative' && returned.some((item) => Number(item.relevanceScore ?? item.cosineSimilarity ?? item.score) >= config.minScore),
       diagnostics,
       latencyMs, expectedTitle: (question.expectedTitles || []).join('; ') || '',
@@ -103,10 +111,10 @@ async function runEvaluationQuestions(questions, search, { config: rawConfig = {
   const negative = records.filter((record) => record.type === 'negative');
   const byType = Object.fromEntries(QUESTION_TYPES.map((type) => {
     const items = records.filter((record) => record.type === type);
-    return [type, type === 'negative' ? { count: items.length, falsePositiveRate: items.length ? items.filter((item) => item.falsePositive).length / items.length : 0 } : scores(items.map((item) => item.rank))];
+    return [type, type === 'negative' ? { count: items.length, falsePositiveRate: items.length ? items.filter((item) => item.falsePositive).length / items.length : null } : items.length ? scores(items.map((item) => item.rank)) : { count: 0, hit1: null, hit3: null, hit5: null, mrr: null }];
   }));
   return { config, metrics: { ...scores(positives.map((record) => record.rank)), positiveQuestions: positives.length,
-    negativeQuestions: negative.length, negativeFalsePositiveRate: negative.length ? negative.filter((record) => record.falsePositive).length / negative.length : 0,
+    negativeQuestions: negative.length, negativeFalsePositiveRate: negative.length ? negative.filter((record) => record.falsePositive).length / negative.length : null,
     medianLatencyMs: median(records.map((record) => record.latencyMs)) }, byType,
     failed: records.filter((record) => record.type === 'negative' ? record.falsePositive : record.rank == null || record.rank > 3), records };
 }

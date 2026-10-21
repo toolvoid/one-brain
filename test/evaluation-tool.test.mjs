@@ -100,15 +100,41 @@ test('evaluation imports and runs against a synthetic temporary database; privat
     assert.equal(db.getRuntimeDatabaseStats().memories, 2);
     assert.equal(db.getMemory(publicMemory.id).title, 'Quartz bicycle');
 
+    db.configureEmbeddingProvider(async (text) => text.includes('Vector suggestion target') ? new Float32Array([0.6, 0.8]) : new Float32Array([1, 0]), 'synthetic-model');
+    const relatedMemory = db.addMemory({ source: 'codex', title: 'Vector suggestion target', content: 'A second synthetic fact used to create a pending semantic suggestion.' }, { event: false });
+    for (let attempt = 0; attempt < 200 && !db.getMemoryEmbeddingVector(relatedMemory.id); attempt++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(db.listLinks().some((link) => [link.a_id, link.b_id].includes(publicMemory.id)), 'fixture has a link to exercise delete cleanup');
+    assert.ok(db.listSuggestions().some((item) => [item.a_id, item.b_id].includes(publicMemory.id) && [item.a_id, item.b_id].includes(relatedMemory.id)), 'fixture has a suggestion to exercise delete cleanup');
+    const preview = db.previewBulkDeleteMemories([publicMemory.id, 999999, publicMemory.id]);
+    assert.deepEqual(preview.map((item) => item.id), [publicMemory.id], 'preview deduplicates IDs and returns only matching title/source metadata');
+    assert.throws(() => db.previewBulkDeleteMemories([0]), /positive whole numbers/);
+    const deleted = await db.bulkDeleteMemories([publicMemory.id]);
+    assert.equal(deleted.deleted, 1);
+    assert.equal(fs.statSync(deleted.backupPath).mode & 0o777, 0o600, 'the encrypted pre-delete backup is private to the user');
+    assert.equal(db.getMemory(publicMemory.id), null);
+    assert.equal(db.listLinks().some((link) => [link.a_id, link.b_id].includes(publicMemory.id)), false);
+    assert.equal(db.listSuggestions().some((item) => [item.a_id, item.b_id].includes(publicMemory.id)), false);
+    assert.equal(db.getBulkDeleteUndoStatus().available, true);
+    const undo = db.undoBulkDeleteMemories();
+    assert.equal(undo.restored, 1);
+    assert.equal(db.getMemory(publicMemory.id).title, 'Quartz bicycle');
+    assert.ok(db.listLinks().some((link) => [link.a_id, link.b_id].includes(publicMemory.id)), 'undo restores links');
+    assert.ok(db.listSuggestions().some((item) => [item.a_id, item.b_id].includes(publicMemory.id)), 'undo restores suggestions');
+    assert.ok(db.getMemoryEmbeddingVector(publicMemory.id), 'undo restores the deleted memory embedding');
+    assert.equal(db.getBulkDeleteUndoStatus().available, false);
+
     let reembedCalls = 0;
     db.configureEmbeddingProvider(async () => { reembedCalls++; if (reembedCalls === 2) throw new Error('synthetic pause'); return new Float32Array([0, 1]); }, 'synthetic-model-v2');
     await assert.rejects(db.reembedAllMemories(), /synthetic pause/);
     assert.equal(db.reembedStatus().staged, 1, 'completed rows remain staged so re-embedding resumes after interruption');
-    assert.equal(db.reembedStatus().oldEmbeddingCount, 2, 'old embeddings stay intact until the staged run can be swapped');
+    assert.equal(db.reembedStatus().oldEmbeddingCount, 3, 'old embeddings stay intact until the staged run can be swapped');
     db.configureEmbeddingProvider(async () => { reembedCalls++; return new Float32Array([0, 1]); }, 'synthetic-model-v2');
     const resumed = await db.reembedAllMemories();
-    assert.equal(resumed.done, 2);
-    assert.equal(reembedCalls, 3, 'resume skips the staged first row and computes only the remaining row');
+    assert.equal(resumed.done, 3);
+    assert.equal(db.reembedStatus().indexed, 3, 'post-swap status reports the live index count');
+    assert.equal(db.reembedStatus().total, 3, 'post-swap status keeps the corpus total');
+    assert.equal(db.reembedStatus().formatVersion, 'title-content-v1');
+    assert.equal(reembedCalls, 4, 'resume skips the staged first row and computes only the remaining rows');
     const junk = db.addMemory({ source: 'codex', title: 'Name', content: 'pasted junk' }, { event: false });
     const junkCandidate = db.listLowQualityCandidates().find((item) => item.id === junk.id);
     assert.ok(junkCandidate);
@@ -118,6 +144,26 @@ test('evaluation imports and runs against a synthetic temporary database; privat
     db.recordEvent({ kind: 'synthetic_failure', ok: false, error: 'invalid_auth' });
     db.recordEvent({ kind: 'synthetic_rate_limit', ok: false, error: 'rate_limited' });
     assert.equal(db.getRuntimeDatabaseStats().lastErrorCode, 'invalid_auth', 'rate-limit activity is not shown as the stale last error');
+
+    const notebookParts = [1, 2, 3].map((part) => db.addMemory({ source: 'codex', title: `Notebook (part ${part}/3)`, content: `Notebook chapter ${part} explains a synthetic retrieval fact.` }, { event: false }));
+    const documentSearch = await db.searchMemories('how does the notebook chapter work?', 'all', 5, 0, null, { minScore: null });
+    const notebookResult = documentSearch.find((item) => item.title.startsWith('Notebook'));
+    assert.ok(notebookResult, 'natural language FTS query finds matching document parts');
+    assert.equal(notebookResult.alsoParts, 2, 'search collapses matching parts into one document result');
+    const docDataset = db.saveEvaluationDataset('Multipart docs', [
+      { id: 'doc-hit', question: 'notebook chapter', type: 'direct', expected: 'Notebook' },
+    ]);
+    const docRun = await db.runEvaluationDataset(docDataset.id, { config: { minScore: 0.001 } });
+    assert.equal(docRun.records[0].rank, 1, 'base expected title resolves to any titled part');
+    assert.equal(docRun.records[0].docHit, true, 'matching a titled part through the base document title is reported as a doc hit');
+    assert.throws(() => db.saveEvaluationDataset('Multipart docs', [{ id: 'x', question: 'notebook', type: 'direct', expected: 'Notebook' }]), /already exists/);
+    assert.equal(db.findEvaluationDatasetByName('Multipart docs').questions, 1);
+    assert.equal(db.renameEvaluationDataset(docDataset.id, 'Renamed docs'), true);
+    assert.equal(db.findEvaluationDatasetByName('Renamed docs').name, 'Renamed docs');
+    assert.throws(() => db.deleteEvaluationDataset(docDataset.id, { confirmation: 'no' }), /Type DELETE/);
+    const deletedDataset = db.deleteEvaluationDataset(docDataset.id, { confirmation: 'DELETE' });
+    assert.equal(deletedDataset.keptRuns, 1, 'dataset deletion keeps its run metrics after typed confirmation');
+    assert.ok(db.listEvaluationRunSummaries().some((item) => item.datasetName === 'Renamed docs (deleted dataset)'));
   } finally {
     db.closeDatabaseForTest();
     os.homedir = originalHome;
