@@ -13,6 +13,8 @@ const paths = {
   close: <><path d="m6 6 12 12M18 6 6 18"/></>,
   check: <path d="m4 12 5 5L20 6"/>,
   chevron: <path d="m7 10 5 5 5-5"/>,
+  'chevron-left': <path d="m14 5-7 7 7 7"/>,
+  'chevron-right': <path d="m10 5 7 7-7 7"/>,
   more: <><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></>,
 };
 export function Icon({ name, size = 18, ...props }) { return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" focusable="false" {...props}>{paths[name] || paths.more}</svg>; }

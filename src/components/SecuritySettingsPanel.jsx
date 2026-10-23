@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { createPortal as reactCreatePortal } from 'react-dom';
 import { validateSecurityPasswordForm } from '../lib/security-password-validation.mjs';
 import { Card, IconButton, SectionHeader, StatusChip, Switch } from './ui/index.jsx';
+import { ErrorCodeMessage } from './ErrorCodeMessage.jsx';
 
 function createPortal(content) {
   return typeof document === 'undefined' ? content : reactCreatePortal(content, document.body);
@@ -78,7 +79,7 @@ export default function SecuritySettingsPanel({ initialMode = null } = {}) {
     {!status?.vaultSet && <p role="note">Set a master password first. Until then, the vault has no password protection.</p>}
     <p role="note">If you forget your master password and have no encrypted recovery file, the data cannot be recovered and will be lost.</p>
     <p role="note">Full-disk encryption (LUKS) is the OS-level protection and is recommended.</p>
-    {notice && <p role="status">{notice}</p>}{error && !mode && <p role="alert">{error}</p>}
+    {notice && <p role="status">{notice}</p>}{error && !mode && <ErrorCodeMessage error={error} where="security:settings" />}
     {mode && createPortal(<div className="connection-window-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setMode(null); }}><form className="security-password-modal" role="dialog" aria-modal="true" aria-labelledby="security-password-title" noValidate onSubmit={(event) => void submit(event)}><header><div><h2 id="security-password-title">{modeLabel}</h2><small>{mode === 'export' ? 'Verify your current master password before exporting.' : mode === 'restore' ? 'Enter the password used to encrypt this backup.' : mode === 'change' ? 'Your current password is verified before the key is re-wrapped.' : 'A timestamped safety backup is created before re-keying.'}</small></div><button type="button" aria-label="Close password dialog" disabled={busy} onClick={() => setMode(null)}>×</button></header>
       {mode === 'change' && <label>Current master password<input autoFocus type={visible ? 'text' : 'password'} autoComplete="current-password" value={oldPassword} onChange={(event) => setOldPassword(event.target.value)} disabled={busy} />{validation.errors.currentPassword && <small className="security-password-field-error" role="alert">{validation.errors.currentPassword}</small>}</label>}
       {['set', 'change'].includes(mode) && <label>New master password<input autoFocus={mode === 'set'} type={visible ? 'text' : 'password'} autoComplete="new-password" required value={password} onChange={(event) => setPassword(event.target.value)} disabled={busy} /><small className="security-password-counter">New password: {validation.newPasswordCharacters}/12 characters</small>{validation.errors.newPassword && <small className="security-password-field-error" role="alert">{validation.errors.newPassword}</small>}</label>}
@@ -86,7 +87,7 @@ export default function SecuritySettingsPanel({ initialMode = null } = {}) {
       {['set', 'change'].includes(mode) && <label>Confirm new password<input type={visible ? 'text' : 'password'} autoComplete="new-password" required value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} disabled={busy} />{validation.errors.confirmPassword && <small className="security-password-field-error" role="alert">{validation.errors.confirmPassword}</small>}</label>}
       {mode === 'delete-backups' && <label>Type DELETE OLD BACKUPS to confirm<input autoComplete="off" value={typedConfirmation} onChange={(event) => setTypedConfirmation(event.target.value)} disabled={busy} />{validation.errors.typedConfirmation && <small className="security-password-field-error" role="alert">{validation.errors.typedConfirmation}</small>}</label>}
       <IconButton type="button" className="security-password-toggle" icon="eye" label={visible ? 'Hide passwords' : 'Show passwords'} aria-pressed={visible} onClick={() => setVisible((value) => !value)}/>
-      {error && <p className="security-password-error" role="alert">{error}</p>}
+      {error && <ErrorCodeMessage error={error} where="security:password" />}
       <footer><button type="button" disabled={busy} onClick={() => setMode(null)}>Cancel</button><button type="submit" disabled={busy || !validation.canSubmit}>{busy ? 'Working…' : mode === 'export' ? 'Choose save location' : mode === 'restore' ? 'Choose backup file' : modeLabel}</button></footer>
     </form></div>)}
   </Card>;

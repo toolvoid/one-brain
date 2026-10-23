@@ -33,7 +33,8 @@
         const explicit = String(element.getAttribute?.('data-message-author-role') || element.getAttribute?.('data-role') || element.getAttribute?.('data-author') || '').toLowerCase();
         const ownLabel = `${element.getAttribute?.('aria-label') || ''} ${element.getAttribute?.('data-testid') || ''} ${element.getAttribute?.('class') || ''}`.toLowerCase();
         const roleValue = /^(user|human)$/.test(explicit) ? 'user' : /^(assistant|model|bot)$/.test(explicit) ? 'assistant' : '';
-        const role = roleValue || (/\b(user|human)(?:[-_ ]message|[-_ ]turn)?\b/.test(ownLabel) ? 'user' : /\b(assistant|model|bot)(?:[-_ ]message|[-_ ]turn)?\b/.test(ownLabel) ? 'assistant' : 'unknown');
+        const selectorRole = typeof selectors.getRole === 'function' ? selectors.getRole(element, selectorName, selector) : '';
+        const role = roleValue || (selectorRole === 'user' || selectorRole === 'assistant' ? selectorRole : /\b(user|human|question)(?:[-_ ]message|[-_ ]turn)?\b/.test(ownLabel) ? 'user' : /\b(assistant|model|bot|answer)(?:[-_ ]message|[-_ ]turn)?\b/.test(ownLabel) ? 'assistant' : 'unknown');
         if (!['user', 'assistant'].includes(role)) return null;
         const text = textOf(element);
         const timestamp = element.getAttribute?.('data-timestamp') || element.querySelector?.('time')?.dateTime || '';

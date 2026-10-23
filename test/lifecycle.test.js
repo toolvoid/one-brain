@@ -75,25 +75,33 @@ test('password lockout lifecycle events keep only escalation level and duration'
   assert.match(lines, /"event":"vault_lockout_ended"/);
 });
 
-test('renderer error lifecycle event keeps a redacted error and source location', (t) => {
+test('renderer error lifecycle event stores only its code, error name, and source location', (t) => {
   const directory = temporaryDirectory(t);
   const log = createLifecycleLog(directory);
   log.append('renderer_error', { name: 'TypeError', message: 'password=TOPSECRET token=ghp_123456789012345', source: 'sandbox_bundle', line: 2 });
   const entry = JSON.parse(log.tail(1)[0]);
-  assert.deepEqual([entry.name, entry.message, entry.source, entry.line], ['TypeError', 'password=[REDACTED] token=[REDACTED]', 'sandbox_bundle', 2]);
+  assert.deepEqual([entry.name, entry.source, entry.line], ['TypeError', 'sandbox_bundle', 2]);
+  assert.equal(entry.message, undefined);
+  assert.equal(entry.code, 'OB-SYS-000');
   assert.doesNotMatch(fs.readFileSync(log.filePath, 'utf8'), /TOPSECRET|ghp_/);
 });
 
-test('diagnostic logs redact provider keys, bearer tokens, access tokens, and pair codes', (t) => {
+test('lifecycle failures persist stable codes without storing arbitrary fields', (t) => {
+  const directory = temporaryDirectory(t);
+  const log = createLifecycleLog(directory);
+  log.append('render_process_gone', { window: 'main', reason: 'crashed', exitCode: 139, memoryText: 'private text' });
+  log.append('vault_lockout_started', { level: 2, durationMs: 30000, password: 'never stored' });
+  const records = log.tail(2).map((line) => JSON.parse(line));
+  assert.deepEqual(records.map((entry) => entry.code), ['OB-GRAPH-001', 'OB-VAULT-003']);
+  assert.doesNotMatch(fs.readFileSync(log.filePath, 'utf8'), /private text|never stored/);
+});
+
+test('diagnostic logs omit renderer error text that could contain memory text or secrets', (t) => {
   const directory = temporaryDirectory(t);
   const log = createLifecycleLog(directory);
   log.append('renderer_error', { name: 'Error', source: 'App.jsx', message: 'api_key=synthetic-provider-key token=synthetic-token Bearer synthetic-bearer pair code=123456' });
   const text = fs.readFileSync(log.filePath, 'utf8');
-  assert.match(text, /api_key=\[REDACTED\]/);
-  assert.match(text, /token=\[REDACTED\]/);
-  assert.match(text, /Bearer \[REDACTED\]/);
-  assert.match(text, /pair code=\[REDACTED\]/i);
-  assert.doesNotMatch(text, /synthetic-provider-key|synthetic-token|synthetic-bearer|123456/);
+  assert.doesNotMatch(text, /api_key|token|Bearer|pair code|synthetic-provider-key|synthetic-token|synthetic-bearer|123456/);
 });
 
 test('lifecycle log trims oversized files already present at startup', (t) => {

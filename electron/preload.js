@@ -1,5 +1,12 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
+function appError(code, details) {
+  return ipcRenderer.sendSync('errors:normalize', code, details);
+}
+function getErrorCodes() {
+  return ipcRenderer.sendSync('errors:list');
+}
+
 const INVOKE_CHANNELS = new Set([
   'lifecycle:tail', 'clipboard:write-text', 'graphics:get-settings', 'graphics:set-mode', 'graphics:try-hardware-again', 'graphics:report-renderer', 'graphics:context-failed', 'graphics:acknowledge-restart-notice',
   'memories:add', 'memories:viewed', 'imports:create', 'memories:import', 'imports:finish', 'imports:list', 'imports:undo',
@@ -49,11 +56,23 @@ for (const eventName of ['pointerdown', 'keydown', 'input', 'wheel', 'touchstart
   window.addEventListener(eventName, sendUserActivity, { capture: true, passive: true });
 }
 function invoke(channel, ...args) {
-  if (!INVOKE_CHANNELS.has(channel)) return Promise.reject(new Error('Preload IPC channel is not allowed.'));
-  return ipcRenderer.invoke(channel, ...args);
+  if (!INVOKE_CHANNELS.has(channel)) {
+    const normalized = appError('OB-SYS-001', { where: 'preload:invoke', errorName: 'Error' });
+    return Promise.reject(Object.assign(new Error(normalized.message), normalized));
+  }
+  return ipcRenderer.invoke(channel, ...args).then((result) => {
+    if (!result || typeof result !== 'object' || typeof result.error !== 'string' || !result.error) return result;
+    const normalized = appError(result.errorCode || result.code || result.error, { where: channel });
+    return { ...result, ...(result.code ? { errorCode: normalized.code } : { code: normalized.code }), title: normalized.title, message: normalized.message, fix: normalized.fix, severity: normalized.severity };
+  }).catch((error) => {
+    const normalized = appError(error?.code || error?.message || error, { where: channel, errorName: error?.name });
+    return Promise.reject(Object.assign(new Error(error?.message || normalized.message), { ...normalized, name: error?.name || 'Error' }));
+  });
 }
 
 contextBridge.exposeInMainWorld('brain', {
+  appError: (code, details) => appError(code, details),
+  getErrorCodes: () => getErrorCodes(),
   getLifecycleLog: () => invoke('lifecycle:tail'),
   copyText: (text) => invoke('clipboard:write-text', text),
   getGraphicsSettings: () => invoke('graphics:get-settings'),

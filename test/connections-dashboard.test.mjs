@@ -2,16 +2,16 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildConnectionRows, summarizeConnectionHealth, createConnectAllPlan, runConfirmedConnectAll, defaultWriteSourceForClient, getWriteSourceReview } from '../src/lib/connections-dashboard.mjs';
+import { buildConnectionRows, groupConnectionRows, summarizeConnectionHealth, createConnectAllPlan, runConfirmedConnectAll, defaultWriteSourceForClient, getWriteSourceReview } from '../src/lib/connections-dashboard.mjs';
 
 const labels = {
   mcp: ['Claude Desktop', 'Claude Code', 'Codex', 'Gemini CLI', 'VS Code Copilot'],
-  web: ['Claude web', 'ChatGPT web', 'Gemini web', 'DeepSeek web', 'Groq playground']
+  web: ['Claude web', 'ChatGPT web', 'Gemini web', 'DeepSeek web', 'Groq playground', 'Perplexity web']
 };
 
 test('dashboard has every requested connection row and maps states without claiming unsupported capabilities', () => {
   const mcp = ['claude-desktop', 'claude-code', 'codex', 'gemini', 'vscode'].map((id) => ({ id, status: 'found', tokenStatus: 'none' }));
-  const extensions = ['claude', 'chatgpt', 'gemini', 'deepseek', 'groq'].map((site) => ({ site, paired: false }));
+  const extensions = ['claude', 'chatgpt', 'gemini', 'deepseek', 'groq', 'perplexity'].map((site) => ({ site, paired: false }));
   const rows = buildConnectionRows({ mcp, extensions, quickContext: { enabled: false } });
   assert.deepEqual(rows.map((row) => row.name).sort(), [...labels.mcp, ...labels.web, 'ChatGPT desktop', 'Groq API', 'DeepSeek API'].sort());
   assert.ok(rows.filter((row) => row.type.includes('MCP')).every((row) => row.status === 'Not connected'));
@@ -22,6 +22,21 @@ test('dashboard has every requested connection row and maps states without claim
   assert.equal(rows.find((row) => row.id === 'ext:deepseek').work['Auto-insert'].supported, true);
   assert.equal(rows.find((row) => row.id === 'quick-context').work.Save.supported, false);
   assert.equal(rows.find((row) => row.id === 'quick-context').work['Auto-insert'].supported, false);
+});
+
+test('connection grouping exposes only the supported direct and web lists plus one inert built-in card', () => {
+  const rows = buildConnectionRows({
+    mcp: ['codex', 'claude-code', 'claude-desktop', 'vscode', 'gemini'].map((id) => ({ id, status: 'found', tokenStatus: 'none' })),
+    extensions: ['claude', 'chatgpt', 'gemini', 'deepseek', 'groq', 'perplexity'].map((site) => ({ site, paired: false }))
+  });
+  const groups = groupConnectionRows(rows);
+  assert.deepEqual(groups.map(({ title }) => title), ['Direct (MCP) apps', 'Web chatbots (browser extension)', 'Built-in chatbots']);
+  assert.deepEqual(groups[0].rows.map((row) => row.name).sort(), ['Claude Code', 'Claude Desktop', 'Codex', 'Gemini CLI', 'VS Code Copilot'].sort());
+  assert.deepEqual(groups[1].rows.map((row) => row.name).sort(), ['Claude web', 'ChatGPT web', 'Gemini web', 'DeepSeek web', 'Groq playground', 'Perplexity web'].sort());
+  assert.equal(groups[2].comingSoon, true);
+  assert.deepEqual(groups[2].rows, []);
+  assert.match(groups[2].description, /future release/);
+  assert.equal(groups.flatMap((group) => group.rows).some((row) => row.name === 'Grok'), false);
 });
 
 test('dashboard maps app not installed, restart, connected, selector failure, provider test and hotkey states', () => {
@@ -72,6 +87,14 @@ test('extension rows distinguish no evidence, degraded detection, broken require
   assert.equal(row('groq').healthStatus, 'busy');
   const summary = summarizeConnectionHealth(rows);
   assert.equal(summary.degraded, 2); assert.ok(summary.needAction >= 1);
+});
+
+test('Perplexity selector fallback reports a limited status with its manual-mode reason', () => {
+  const reason = 'Perplexity chat composer controls were not detected; manual context mode is active.';
+  const [row] = buildConnectionRows({ extensions: [{ site: 'perplexity', paired: true, status: 'approved', layoutStatus: { broken: true, reason }, health: { pingAt: new Date().toISOString(), selfCheck: { matched: { composer: 0 }, containersMatched: 0 } } }] }).filter((item) => item.site === 'perplexity');
+  assert.equal(row.status, 'Degraded');
+  assert.equal(row.reason, reason);
+  assert.equal(row.healthStatus, 'degraded');
 });
 
 test('a recent successful extension call remains healthy when the row carries a degraded message note', () => {

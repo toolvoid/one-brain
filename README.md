@@ -1,6 +1,29 @@
 # One Brain
 
-One Brain is a local desktop app for saving, searching, linking, and visualizing memories from six AI sources: ChatGPT, Claude, Codex, Gemini, Groq, and DeepSeek. Memory data is stored in SQLite; the graph shows AI anchors, individual memories, and their links.
+See the [error code reference](docs/ERRORS.md) for explanations and fixes for errors shown by One Brain.
+
+One Brain is a local-first desktop app for saving, searching, linking, and visualizing memories shared across AI tools. It is built with Electron, React, and Vite in plain JavaScript, and stores memory in an encrypted SQLite database on your computer. There is no cloud server.
+
+## Features
+
+- **One shared memory for your AI tools:** connect MCP clients such as Codex, use the memory proxy with API-based apps, or use the browser extension with Claude, ChatGPT, and Gemini. One Brain also includes a Chat view and a Quick Context hotkey.
+- **Explore connected memories:** a 3D node graph shows memories and their semantic links.
+- **Find relevant context:** hybrid search combines SQLite FTS5 full-text search with multilingual MiniLM embeddings and reciprocal rank fusion. A cosine relevance gate (0.25 cutoff) filters weak matches.
+- **Review and control sharing:** private memories are excluded from every outbound path. Chat offers an “Ask before sending” preview. Per-client permissions and tokens control access.
+- **See what is happening:** Connections health dashboard, activity charts and SQL in Insights, a RAM/CPU/latency Status panel, and a diagnostics log.
+
+## Retrieval evaluation
+
+The built-in retrieval evaluation currently reports:
+
+| Evaluation set | Questions | Hit@3 | Hit@5 | MRR | Negative false positives |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Synthetic | 25 | 90.5% | 100% | 0.894 | 0% (4 questions) |
+| Real memories | 12 | 91.7% | — | 0.917 | — |
+
+Before tuning, synthetic hit@3 was 71.4%, with a 100% false-positive rate on the negative questions. These sets are small, so the results are indicative rather than a broad performance guarantee. The project has 282 automated tests passing.
+
+One Brain is Linux-first. Wayland and software-rendering fallbacks are handled; Windows and macOS have not been tested.
 
 ## Run locally
 
@@ -35,15 +58,23 @@ npm run build:extension
 
 Load `extension/dist/chrome` as an unpacked extension in Chrome or `extension/dist/firefox` as a temporary/unpacked extension in Firefox. Keep `extension/keys/chrome.pem` private and backed up if you need to keep the same Chrome extension ID across rebuilds. After loading the extension, open its popup, choose a site, and pair it using the code shown in **Connections** in One Brain. Approve the new extension client in the app to finish pairing.
 
+Create store-ready Chrome and Firefox zip files (extension version 1.3.0) with no development key, tests, or fixtures:
+
+```sh
+npm run package:extension
+```
+
+The command prints the zip paths and sizes. Store submission notes and the privacy policy are in [`docs/extension-store-listing.md`](docs/extension-store-listing.md) and [`docs/privacy.md`](docs/privacy.md). The generated store screenshot is a layout reference; replace it with a real screenshot before submission.
+
 The dev script starts Vite and Electron. The Electron main process opens the SQLite database and starts the local MCP server.
 
 ## Security
 
-The SQLite database and its WAL/SHM files use SQLCipher. Its key is protected with Electron `safeStorage` on supported backends; the app disables database writes when storage is unavailable or reports the `basic_text` backend. On startup One Brain repairs user-data permissions to directories `0700` and files `0600`; token files and settings are also written owner-only. Local HTTP services bind to loopback and require authentication. Diagnostics and connection-activity records contain event metadata only, not memory text; renderer storage is limited to UI preferences such as model names and dismissed notices.
+The whole SQLite database is encrypted with AES-256. A master password derives a key-wrapping key using scrypt; the database key is wrapped rather than stored as plaintext. The app supports auto-lock, escalating lockout after failed unlock attempts, and an encrypted recovery file. On startup One Brain repairs user-data permissions to directories `0700` and files `0600`; token files and settings are also written owner-only. Local HTTP services bind to loopback and require authentication. Diagnostics and connection-activity records contain event metadata only, not memory text; renderer storage is limited to UI preferences such as model names and dismissed notices.
 
 Settings → Connections → Security has master-password, encrypted recovery/restore, vault-status and auto-lock controls. Auto-lock is ON by default at 15 minutes (choose 1, 5, 15, 30, or 60 minutes); OFF disables idle locking only. Screen-lock/suspend locking is a separate ON-by-default setting. User input and active MCP/proxy/extension requests reset the idle timer; a one-minute warning offers **Stay unlocked**. Lock now and `Ctrl/Cmd+Shift+L` remain available. Locked MCP, proxy and extension requests return HTTP 423. Re-keying makes a timestamped backup first; the old key is retained until explicitly deleted. The Security page warns that old pre-password backups may be read without the password and requires the master password plus typed confirmation to delete them. Forgetting the password without an encrypted recovery file means data loss. Full-disk encryption (LUKS on Linux) is the recommended OS-level protection.
 
-Electron renderer windows use context isolation, sandboxing, disabled Node integration, web security, strict CSP (no `unsafe-eval`), denied popups and cross-origin navigation, and denied permission requests. Every renderer IPC call is restricted to the trusted app frame; the preload exposes only named IPC channels. Diagnostics aggregate denied navigation, IPC, permission, authentication, rate-limit, and unlock events without recording request bodies or memory text. Provider API keys are encrypted at rest, masked in inputs, and are not returned to renderer state. Copying a saved key requires an explicit action and the master password; the key is copied directly by the main process and never sent to renderer state. Chat shows the exact public-memory snippets for review before sending (enabled by default); browser-extension insertion already requires review unless the user explicitly enables automatic insertion. API proxy clients have a separate **Allow automatic memory injection** setting, off by default, and successful/rejected injection counts are recorded without memory text. Private memories are excluded from chat, proxy, MCP, extension search, and Quick Context results.
+Electron renderer windows use context isolation, sandboxing, disabled Node integration, web security, strict CSP (no `unsafe-eval`), denied popups and cross-origin navigation, and denied permission requests. Every renderer IPC call is restricted to the trusted app frame; the preload exposes only named IPC channels. Diagnostics aggregate denied navigation, IPC, permission, authentication, rate-limit, and unlock events without recording request bodies or memory text. Provider API keys are encrypted at rest, masked in inputs, and are not returned to renderer state. Copying a saved key requires an explicit action and the master password; the key is copied directly by the main process and never sent to renderer state. Chat offers a preview of public memory context before sending; browser-extension insertion requires review unless the user explicitly enables automatic insertion. API proxy clients have a separate **Allow automatic memory injection** setting, off by default, and successful/rejected injection counts are recorded without memory text. Private memories are excluded from chat, proxy, MCP, extension search, and Quick Context results. Any text you choose to send to an online AI service is received by that provider. One Brain cannot guarantee protection if your computer is compromised.
 
 One Brain does not currently have a configured signed update-manifest publisher. Linux updates are installed through the package manager; the app does not silently download or install updates.
 

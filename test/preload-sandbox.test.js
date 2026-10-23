@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('node:module');
 const path = require('node:path');
+const { appError, getErrorCodes } = require('../electron/error-codes');
 
 test('sandboxed preload only requires electron and exposes allowlisted IPC methods', async (t) => {
   const preloadPath = path.join(__dirname, '../electron/preload.js');
@@ -18,6 +19,7 @@ test('sandboxed preload only requires electron and exposes allowlisted IPC metho
       on: (channel, listener) => { const set = handlers.get(channel) || new Set(); set.add(listener); handlers.set(channel, set); },
       removeListener: (channel, listener) => handlers.get(channel)?.delete(listener),
       send: (channel, ...args) => invocations.push([channel, ...args]),
+      sendSync: (channel, ...args) => channel === 'errors:normalize' ? appError(...args) : channel === 'errors:list' ? getErrorCodes() : undefined,
       invoke: (channel, ...args) => { invocations.push([channel, ...args]); if (failMemories && channel === 'memories:list') return Promise.reject(Object.assign(new Error('One Brain is locked'), { code: 'ONE_BRAIN_LOCKED', status: 423 })); return Promise.resolve(channel === 'security:startup-state' ? { ok: true, locked: false, epoch: 0 } : []); },
     },
   };
@@ -34,12 +36,14 @@ test('sandboxed preload only requires electron and exposes allowlisted IPC metho
     assert.deepEqual(required, ['electron']);
     assert.ok(exposed.brain);
     assert.equal(typeof exposed.brain.listMemories, 'function');
+    assert.equal(typeof exposed.brain.appError, 'function');
+    assert.ok(exposed.brain.getErrorCodes().some((entry) => entry.code === 'OB-SYS-000'));
     assert.equal(exposed.brain.invoke, undefined, 'renderer cannot choose arbitrary IPC channels');
     await exposed.brain.listMemories();
     assert.equal(invocations[0][0], 'memories:list');
     exposed.brain.onLocked(() => { lockedNotifications++; });
     failMemories = true;
-    await assert.rejects(exposed.brain.listMemories(), /One Brain is locked/);
+    await assert.rejects(exposed.brain.listMemories(), (error) => /Unlock One Brain before accessing memories/.test(error.message) && error.code === 'OB-VAULT-001' && error.title === 'Vault is locked');
     assert.equal(lockedNotifications, 0, 'a 423 response alone cannot switch the gate; main emits authoritative lock events');
     for (const listener of handlers.get('brain:locked')) listener({}, 1);
     assert.equal(lockedNotifications, 1);

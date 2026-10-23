@@ -2,7 +2,7 @@
 
 (() => {
   try { globalThis.__oneBrainContentCleanup?.(); } catch {}
-  const SITE = location.hostname === 'chatgpt.com' ? 'chatgpt' : location.hostname === 'claude.ai' ? 'claude' : location.hostname === 'gemini.google.com' ? 'gemini' : location.hostname === 'chat.deepseek.com' ? 'deepseek' : location.hostname === 'console.groq.com' && location.pathname.startsWith('/playground') ? 'groq' : null;
+  const SITE = location.hostname === 'chatgpt.com' ? 'chatgpt' : location.hostname === 'claude.ai' ? 'claude' : location.hostname === 'gemini.google.com' ? 'gemini' : location.hostname === 'chat.deepseek.com' ? 'deepseek' : location.hostname === 'console.groq.com' && location.pathname.startsWith('/playground') ? 'groq' : ['perplexity.ai', 'www.perplexity.ai'].includes(location.hostname) ? 'perplexity' : null;
   const API = globalThis.browser || globalThis.chrome;
   const adapter = SITE && globalThis.OneBrainAdapters?.[SITE];
   const editorTools = globalThis.OneBrainEditorInsertion;
@@ -61,7 +61,7 @@
   const insertedDrafts = new Set();
   const insertionGuard = insertionGuardModule.createInsertionGuard();
   let programmaticInsertUntil = 0, lastProcessedDraft = '', loopToastShown = false;
-  const sourceColors = { chatgpt: '#65a7ff', claude: '#d79a63', gemini: '#8c7bf0', groq: '#75c88a', deepseek: '#4ca8be', openai: '#65a7ff' };
+  const sourceColors = { chatgpt: '#65a7ff', claude: '#d79a63', gemini: '#8c7bf0', groq: '#75c88a', deepseek: '#4ca8be', perplexity: '#35c9f0', openai: '#65a7ff' };
 
   async function getChatKey() {
     if (chatKeyValue) return chatKeyValue;
@@ -218,14 +218,14 @@
       document.body.append(manualButton);
   });
   let lastLayoutBroken = null;
-  const CONTENT_SCRIPT_VERSION = '1.2.0-loopguard';
+  const CONTENT_SCRIPT_VERSION = '1.4.0';
   function checkAdapterLayout() {
     if (stopped) return false;
     const matched = adapter.selfCheck();
     const working = Boolean(matched?.input && matched?.send);
     if (lastLayoutBroken !== !working) {
       lastLayoutBroken = !working;
-      void askBackground({ type: 'adapter-self-check-report', site: SITE, matched });
+      void askBackground({ type: 'adapter-self-check-report', site: SITE, matched, reason: !working && SITE === 'perplexity' ? 'Perplexity composer controls were not detected; One Brain switched to manual context mode.' : undefined });
     }
     return layoutFallback.check(working);
   }
@@ -460,7 +460,7 @@
     const panel = modal;
     document.body.append(panel);
     const source = panel.querySelector('[data-source]');
-    for (const value of ['chatgpt', 'claude', 'gemini', 'codex', 'groq', 'deepseek']) { const option = document.createElement('option'); option.value = value; option.textContent = value; source.append(option); }
+    for (const value of ['chatgpt', 'claude', 'gemini', 'codex', 'groq', 'deepseek', 'perplexity']) { const option = document.createElement('option'); option.value = value; option.textContent = value; source.append(option); }
     source.value = SITE;
     const titleInput = panel.querySelector('[data-title]');
     titleInput.value = String(document.title || `Saved ${SITE} chat`).replace(/\s*[|–-]\s*(ChatGPT|Claude|Gemini).*$/i, '').slice(0, 160);

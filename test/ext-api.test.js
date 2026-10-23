@@ -109,6 +109,7 @@ test('pairing and extension requests enforce the paired origin and loopback host
   assert.equal(response.status, 403);
   const mismatch = await response.json();
   assert.equal(mismatch.reason, 'origin_mismatch');
+  assert.equal(mismatch.code, 'OB-EXT-001');
   assert.equal(mismatch.expectedOrigin, h.origin);
   assert.equal(mismatch.receivedOrigin, 'chrome-extension://otherextension');
   assert.equal(h.api.status().find((item) => item.site === 'chatgpt').health.authFailure, 'origin_mismatch');
@@ -122,6 +123,26 @@ test('pairing and extension requests enforce the paired origin and loopback host
   assert.equal(ping.paired, true);
   assert.equal(ping.approval, 'approved');
   assert.equal(response.headers.get('access-control-allow-origin'), h.origin);
+});
+
+test('a store-assigned Chrome extension origin can pair for Perplexity and an unpaired origin is rejected', async (t) => {
+  const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
+  const storeOrigin = 'chrome-extension://storeassignedid1234567890';
+  const code = h.api.createPairCode().code;
+  const paired = await h.request('/ext/pair', {
+    method: 'POST', originHeader: storeOrigin,
+    body: { code, site: 'perplexity', origin: storeOrigin, label: 'Store build' }
+  });
+  assert.equal(paired.status, 200);
+  const { token } = await paired.json();
+  assert.equal(h.api.status().find((item) => item.site === 'perplexity').origin, storeOrigin);
+  const allowed = await h.request('/ext/ping', { token, originHeader: storeOrigin });
+  assert.equal(allowed.status, 200);
+  const denied = await h.request('/ext/ping', { token, originHeader: 'chrome-extension://unpairedstoreid123456789' });
+  assert.equal(denied.status, 403);
+  const deniedBody = await denied.json();
+  assert.equal(deniedBody.reason, 'origin_mismatch');
+  assert.equal(deniedBody.code, 'OB-EXT-001');
 });
 
 test('extension ping records build, content-script, host-permission and origin health evidence', async (t) => {
@@ -138,9 +159,9 @@ test('extension ping records build, content-script, host-permission and origin h
   assert.equal(health.apiCompatible, true);
 });
 
-test('DeepSeek and Groq pairing tokens can authenticate their extension endpoints', async (t) => {
+test('DeepSeek, Groq, and Perplexity pairing tokens can authenticate their extension endpoints', async (t) => {
   const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
-  for (const site of ['deepseek', 'groq']) {
+  for (const site of ['deepseek', 'groq', 'perplexity']) {
     const token = await h.pair(site);
     h.profiles.get(`ext:${site}`).status = 'approved';
     const response = await h.request('/ext/ping', { site, token });
@@ -174,7 +195,9 @@ test('revoked extension tokens return a reason-coded 401', async (t) => {
   await h.api.revokeSite('chatgpt');
   const response = await h.request('/ext/ping', { token });
   assert.equal(response.status, 401);
-  assert.equal((await response.json()).reason, 'revoked');
+  const body = await response.json();
+  assert.equal(body.reason, 'revoked');
+  assert.equal(body.code, 'OB-EXT-006');
 });
 
 test('a valid token with no saved extension origin returns origin_mismatch', async (t) => {
@@ -183,7 +206,9 @@ test('a valid token with no saved extension origin returns origin_mismatch', asy
   fs.writeFileSync(path.join(h.directory, 'extension-origins.json'), '{}');
   const response = await h.request('/ext/ping', { token });
   assert.equal(response.status, 403);
-  assert.equal((await response.json()).reason, 'origin_mismatch');
+  const body = await response.json();
+  assert.equal(body.reason, 'origin_mismatch');
+  assert.equal(body.code, 'OB-EXT-001');
 });
 
 test('extension origin fallback authenticates requests when the browser omits Origin', async (t) => {
@@ -206,7 +231,9 @@ test('unknown tokens return reason-coded 401 and log only reason, client, and ha
   const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
   const response = await h.request('/ext/ping', { token: '9'.repeat(64) });
   assert.equal(response.status, 401);
-  assert.equal((await response.json()).reason, 'unknown_token');
+  const body = await response.json();
+  assert.equal(body.reason, 'unknown_token');
+  assert.equal(body.code, 'OB-EXT-005');
   assert.deepEqual(h.authFailures.at(-1), { type: 'extension_auth_failure', reason: 'unknown_token', client: 'ext:unknown', tokenHashPrefix: hashToken('9'.repeat(64)).slice(0, 6) });
 });
 
@@ -222,7 +249,9 @@ test('pending clients can ping but search and save receive pending_approval', as
   assert.equal((await response.json()).reason, 'pending_approval');
   response = await h.request('/ext/save', { method: 'POST', site: 'claude', token, body: { site: 'claude', kind: 'message', text: 'fixture text' } });
   assert.equal(response.status, 403);
-  assert.equal((await response.json()).reason, 'pending_approval');
+  const body = await response.json();
+  assert.equal(body.reason, 'pending_approval');
+  assert.equal(body.code, 'OB-EXT-003');
 });
 
 test('blocked clients ping with blocked approval and protected calls return blocked', async (t) => {
@@ -232,7 +261,9 @@ test('blocked clients ping with blocked approval and protected calls return bloc
   assert.equal((await ping.json()).approval, 'blocked');
   const response = await h.request('/ext/search', { method: 'POST', site: 'claude', token, body: { query: 'fixture' } });
   assert.equal(response.status, 403);
-  assert.equal((await response.json()).reason, 'blocked');
+  const body = await response.json();
+  assert.equal(body.reason, 'blocked');
+  assert.equal(body.code, 'OB-EXT-004');
 });
 
 test('re-pairing replaces the previous site token and saves its extension origin', async (t) => {
@@ -271,6 +302,27 @@ test('save forces the source from the paired site and search excludes private re
   assert.ok(h.events.every((event) => !JSON.stringify(event).includes('Synthetic fixture body')));
 });
 
+test('Perplexity extension token forces saved memories to the perplexity source', async (t) => {
+  const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
+  const token = await h.pair('perplexity');
+  const response = await h.request('/ext/save', { method: 'POST', site: 'perplexity', token, body: { site: 'perplexity', source: 'claude', title: 'Synthetic Perplexity save', text: 'Perplexity synthetic memory has enough useful text to pass the save filter.', kind: 'message' } });
+  const result = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(result.source, 'perplexity');
+  assert.equal(h.memories.at(-1).source, 'perplexity');
+});
+
+test('Perplexity selector fallback stores a clear limited reason without page text', async (t) => {
+  const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
+  const token = await h.pair('perplexity');
+  const response = await h.request('/ext/selfcheck', { method: 'POST', site: 'perplexity', token, body: { matched: { composer: 0, send: 0, messages: 0 }, reason: 'PRIVATE PAGE TEXT MUST NOT BE STORED' } });
+  assert.equal(response.status, 200);
+  const status = h.api.status().find((item) => item.site === 'perplexity');
+  assert.equal(status.layoutStatus.broken, true);
+  assert.match(status.layoutStatus.reason, /Perplexity chat composer controls were not detected; manual context mode is active/);
+  assert.doesNotMatch(JSON.stringify(status), /PRIVATE PAGE TEXT MUST NOT BE STORED/);
+});
+
 test('extension panel can mark an allowed memory never-suggest and search then excludes it', async (t) => {
   const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
   const token = await h.pair();
@@ -293,6 +345,7 @@ test('extension control limit is 120 per minute and is not an auth failure', asy
   assert.equal(response.status, 429);
   const body = await response.json();
   assert.equal(body.reason, 'rate_limited');
+  assert.equal(body.code, 'OB-EXT-002');
   assert.ok(Number(response.headers.get('retry-after')) > 0);
   assert.equal(h.authFailures.filter((entry) => entry.reason === 'rate_limited').length, 0);
   await new Promise((resolve) => setTimeout(resolve, 550));

@@ -17,7 +17,7 @@ const { passesRelevanceGate } = require('./relevance-gate');
 const { buildFtsQuery } = require('./fts-query');
 const { collapseDocumentParts, documentTitle, matchesDocumentTitle, normalizedDocumentTitle } = require('./document-results');
 const { createQueryEmbeddingCache } = require('./query-embedding-cache');
-const MEMORY_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
+const MEMORY_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek', 'perplexity'];
 
 let database;
 let databaseKey = null;
@@ -2014,7 +2014,7 @@ function normalizeClientName(client) {
 function getMcpClientProfile(clientName, identity = {}) {
   const db = getDatabase();
   const client = normalizeClientName(clientName);
-  const defaultSource = /^ext:(chatgpt|claude|gemini|deepseek|groq)$/.exec(client)?.[1] || /^chat:(chatgpt|claude|gemini|deepseek|groq)$/.exec(client)?.[1] || null;
+  const defaultSource = /^ext:(chatgpt|claude|gemini|deepseek|groq|perplexity)$/.exec(client)?.[1] || /^chat:(chatgpt|claude|gemini|deepseek|groq|perplexity)$/.exec(client)?.[1] || null;
   const created = db.prepare(`INSERT OR IGNORE INTO client_profiles (client, write_source, status, first_seen, last_seen)
     VALUES (?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`).run(client, defaultSource).changes > 0;
   db.prepare('UPDATE client_profiles SET last_seen = CURRENT_TIMESTAMP, verified = ?, reported_name = ? WHERE client = ?')
@@ -2248,7 +2248,7 @@ function importMemories(items, importId, markPrivate = false) {
       const source = String(item?.source || '');
       const title = item?.title == null ? null : String(item.title);
       const content = String(item?.content || '').trim();
-      if (!['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'].includes(source) || !content) {
+      if (!MEMORY_SOURCES.includes(source) || !content) {
         skipped += 1;
         continue;
       }

@@ -12,14 +12,14 @@ import { safeCreateWebGLRenderer } from '../lib/graph-renderer.mjs';
 import { graphFrameIntervalMs, shouldKeepGraphAnimating, shouldRenderGraphLabels, shouldUpdateLineBuffers, shouldUpdateNodeBuffers } from '../lib/graph-animation.mjs';
 import { isSoftwareRenderer, PERFORMANCE_MODE_EVENT, PERFORMANCE_NODE_LIMIT, readManualPerformanceMode, selectPerformanceNodes } from '../lib/graph-performance.mjs';
 
-const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
+const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek', 'perplexity'];
 const COLORS = {
   chatgpt: '#42d6c2', claude: '#f29a60', codex: '#70a9ff',
-  gemini: '#b18cff', groq: '#f2d66d', deepseek: '#ff7095'
+  gemini: '#b18cff', groq: '#f2d66d', deepseek: '#ff7095', perplexity: '#35c9f0'
 };
 const ANCHORS = {
   chatgpt: [12, 0, 0], claude: [0, 12, 0], codex: [0, 0, 12],
-  gemini: [-12, 0, 0], groq: [0, -12, 0], deepseek: [0, 0, -12]
+  gemini: [-12, 0, 0], groq: [0, -12, 0], deepseek: [0, 0, -12], perplexity: [9, 9, 9]
 };
 const HUB = new THREE.Vector3(0, 0, 0);
 const LINK_LINE_DRAW_DURATION = 900;
@@ -106,7 +106,7 @@ const LINE_FRAGMENT = `
   void main() { gl_FragColor = vec4(vColor, vAlpha); }
 `;
 
-const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], allLinks = links, counts = {}, linkCounts = {}, linkVisibility = {}, onLinkVisibilityChange = () => {}, fitRevision = 0, sidebarCollapsed = false, sidebarWidth = 360, dataReady = false, onMemoryClick = () => {} }, ref) {
+const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], allLinks = links, counts = {}, linkCounts = {}, linkVisibility = {}, onLinkVisibilityChange = () => {}, fitRevision = 0, sidebarCollapsed = false, sidebarWidth = 360, dataReady = false, onMemoryClick = () => {}, toolbar = null }, ref) {
   const hostRef = useRef(null);
   const [webglUnavailable, setWebglUnavailable] = useState(false);
   const initialLinkRevealDoneRef = useRef(false);
@@ -364,6 +364,13 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
     const legend = document.createElement('details');
     legend.className = 'brain-legend';
     legend.innerHTML = '<summary>Legend</summary><div><i class="brain-legend-structural"></i><span>Belongs to AI or hub</span></div><div><i class="brain-legend-link"></i><span>Linked memories</span></div>';
+    for (const source of SOURCES) {
+      const row = document.createElement('div');
+      const dot = document.createElement('i');
+      dot.style.cssText = `width:8px;height:8px;border-radius:50%;background:${COLORS[source]}`;
+      const label = document.createElement('span'); label.textContent = source;
+      row.append(dot, label); legend.append(row);
+    }
     host.appendChild(legend);
 
     function makeEdge(key, a, b, color, alpha, glow = 0, linkDetails = null) {
@@ -1063,6 +1070,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
   }, [linkVisibility]);
 
   return <div ref={hostRef} className="brain-graph" style={{ position: 'absolute', inset: 0, overflow: 'hidden' }}>
+    {toolbar && <div className="graph-toolbar">{toolbar}</div>}
     {webglUnavailable && <section aria-label="Memory graph" className="brain-graph-fallback" style={{ position: 'absolute', inset: '18px 12px 18px max(12px, min(360px, 92vw))', overflow: 'auto', padding: 18, border: '1px solid #263241', borderRadius: 12, color: '#e8edf4', background: '#0b0f16', font: '13px system-ui, sans-serif' }}>
       <h2 style={{ margin: '0 0 6px', fontSize: 16 }}>3D graph unavailable</h2>
       <p style={{ margin: '0 0 14px', color: '#9aa8b8' }}>This graphics driver could not create a WebGL context. Your memories remain available in the list.</p>

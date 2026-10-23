@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>One Brain Privacy Policy</title>
+  <style>
+    :root { color-scheme: dark; font: 16px/1.65 system-ui, sans-serif; background: #0d1218; color: #e6edf3; }
+    body { box-sizing: border-box; max-width: 780px; margin: 0 auto; padding: 48px 22px 72px; }
+    h1, h2 { line-height: 1.25; color: #f4f8fb; }
+    h1 { font-size: clamp(2rem, 6vw, 3rem); letter-spacing: -.04em; }
+    h2 { margin-top: 2.2em; font-size: 1.3rem; }
+    a { color: #75d9cb; }
+    li { margin: .55em 0; }
+    .updated { color: #a5b3c1; }
+    .mark { display: inline-grid; width: 38px; height: 38px; place-items: center; border: 1px solid #316d6d; border-radius: 12px; color: #70dfd0; background: #13252c; font-weight: 750; }
+    footer { margin-top: 3em; padding-top: 1em; border-top: 1px solid #27313b; color: #a5b3c1; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <div class="mark" aria-hidden="true">OB</div>
+  <h1>One Brain Privacy Policy</h1>
+  <p class="updated"><strong>Last updated:</strong> October 23, 2026</p>
+  <p>One Brain is a local-first desktop app and browser extension. It has no One Brain cloud server, analytics, or advertising.</p>
+
+  <h2>What is stored</h2>
+  <p>The browser extension stores its local app address, per-site pairing tokens, and your extension preferences in the browser's extension storage on your device. The One Brain desktop app stores memories in its encrypted local SQLite database. It also keeps local pairing information, client permissions, and app settings in its application data folder. The app can create an encrypted recovery file if you choose to export one.</p>
+
+  <h2>What is sent and where</h2>
+  <p>The browser extension communicates with the One Brain desktop app at <code>127.0.0.1</code> on your computer. Pairing, status checks, memory search, and saves use that local connection. One Brain does not upload your memories to a One Brain server.</p>
+  <p>On supported AI chat pages, the extension can inspect visible page content or the composer to provide features you request or enable. Private memories are excluded from extension results. Memory context is inserted according to your review and per-site settings. If you submit text through an online AI service, that service receives the text you submitted and handles it under its own privacy policy. One Brain does not control the provider's retention or use of that text.</p>
+
+  <h2>How to delete your data</h2>
+  <ol>
+    <li>In the extension popup, choose <strong>Unpair</strong> for each connected site. In One Brain, revoke or remove the extension client under <strong>Settings → Connections</strong>.</li>
+    <li>Remove the extension from your browser. This removes its browser-stored endpoint, tokens, and preferences.</li>
+    <li>To delete memories and the remaining local app data, use the app's memory/security controls or uninstall One Brain and remove its application data folder. Also delete any exported recovery files and backups you created. Removing the app does not delete messages held by an online AI provider.</li>
+  </ol>
+  <p>One Brain cannot guarantee protection if your computer or browser profile is compromised. Use your operating system's account and disk security features to protect local files.</p>
+
+  <h2>Changes and contact</h2>
+  <p>This policy may be updated with future releases. For privacy questions, use the contact information provided on the One Brain project page where you obtained the app.</p>
+  <footer>One Brain · Local-first memory for AI tools</footer>
+</body>
+</html>

@@ -23,6 +23,7 @@ function loadSecurityPanel() {
   const originalLoad = Module._load;
   Module._load = function(request, parent, isMain) {
     if (request === '../lib/security-password-validation.mjs' && parent?.filename === file) return { validateSecurityPasswordForm };
+    if (request === './ErrorCodeMessage.jsx' && parent?.filename === file) return { ErrorCodeMessage: ({ error }) => React.createElement('div', null, error) };
     if (request === './ui/index.jsx' && parent?.filename === file) {
       const uiFile = path.resolve(__dirname, '../src/components/ui/index.jsx');
       const uiSource = fs.readFileSync(uiFile, 'utf8');

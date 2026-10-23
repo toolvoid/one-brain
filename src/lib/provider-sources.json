@@ -3,5 +3,6 @@
   "gemini": "gemini",
   "groq": "groq",
   "deepseek": "deepseek",
-  "claude": "claude"
+  "claude": "claude",
+  "perplexity": "perplexity"
 }

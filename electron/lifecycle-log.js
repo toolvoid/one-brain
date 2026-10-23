@@ -2,6 +2,8 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { appError, ERROR_CODES } = require('./error-codes');
+const VALID_ERROR_CODES = new Set(ERROR_CODES.map((entry) => entry.code));
 
 const DEFAULT_MAX_BYTES = 200 * 1024;
 
@@ -16,6 +18,7 @@ function shortCaller(stack) {
 
 function safeDetails(event, details = {}) {
   const safe = {};
+  if (VALID_ERROR_CODES.has(String(details.code || ''))) safe.code = String(details.code);
   if (['navigation_denied', 'ipc_denied', 'permission_denied', 'auth_failed', 'rate_limited', 'vault_unlock_failed'].includes(event)) {
     if (Number.isFinite(Number(details.count))) safe.count = Math.max(1, Math.min(1_000_000, Math.floor(Number(details.count))));
     if (event === 'ipc_denied' && /^[a-z0-9:_-]{1,80}$/i.test(String(details.channel || ''))) safe.channel = String(details.channel);
@@ -41,13 +44,6 @@ function safeDetails(event, details = {}) {
   if (event === 'vault_operation_failed') {
     if (['set_password', 'change_password', 'export_recovery', 'restore_recovery', 'delete_old_backups'].includes(details.operation)) safe.operation = details.operation;
     if (/^[\w.-]{1,40}$/.test(String(details.name || ''))) safe.name = String(details.name);
-    if (typeof details.message === 'string') {
-      safe.message = details.message
-        .replace(/\b(password|passphrase|token|key|api[_ -]?key|secret|private[_ -]?key)\b\s*[:=]\s*[^\s,;]+/gi, '$1=[REDACTED]')
-        .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [REDACTED]')
-        .replace(/\b(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b/g, '[REDACTED]')
-        .slice(0, 200);
-    }
   }
   if (event === 'vault_locked' && ['idle', 'manual', 'suspend'].includes(details.reason)) {
     safe.reason = details.reason;
@@ -62,14 +58,6 @@ function safeDetails(event, details = {}) {
     if (/^[\w.$-]{1,60}$/.test(String(details.name || ''))) safe.name = String(details.name);
     if (/^[\w.-]{1,100}$/.test(String(details.source || ''))) safe.source = String(details.source);
     if (Number.isFinite(Number(details.line)) && Number(details.line) > 0) safe.line = Math.floor(Number(details.line));
-    if (typeof details.message === 'string') safe.message = details.message
-      .replace(/\b(pair(?:ing)?[\s_-]*code)\b\s*[:=]\s*[^\s,;&]+/gi, '$1=[REDACTED]')
-      .replace(/\b(pair(?:ing)?[\s_-]*code)\b\s+[^\s,;&]+/gi, '$1 [REDACTED]')
-      .replace(/\b(password|passphrase|token|key|api[_ -]?key|secret|private[_ -]?key)\b\s*[:=]\s*[^\s,;&]+/gi, '$1=[REDACTED]')
-      .replace(/\bBearer\s+[^\s,;&]+/gi, 'Bearer [REDACTED]')
-      .replace(/\b(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b/g, '[REDACTED]')
-      .replace(/\b[A-Fa-f0-9]{40,}\b/g, '[REDACTED]')
-      .slice(0, 200);
   }
   if (['user_data_permissions_fixed', 'user_data_permissions_failed'].includes(event) && Number.isFinite(Number(details.count))) safe.count = Math.max(0, Math.floor(Number(details.count)));
   if (['window_created', 'window_closed', 'window_unresponsive', 'window_shown', 'window_hidden', 'window_minimized', 'window_restored'].includes(event)) {
@@ -90,6 +78,22 @@ function safeRecord(value) {
   if (!/^[a-z0-9_-]{1,64}$/i.test(event)) return null;
   const timestamp = /^\d{4}-\d\d-\d\dT[^\s]{1,40}$/.test(String(value.timestamp || '')) ? String(value.timestamp).slice(0, 48) : '';
   return { timestamp, event, ...safeDetails(event, value) };
+}
+
+function errorCodeForEvent(event, details = {}) {
+  if (event === 'renderer_error') return appError('OB-SYS-000', { errorName: details.name, where: details.source || 'renderer' }).code;
+  if (['child_process_gone', 'render_process_gone'].includes(event) && Number(details.exitCode) === 139) return 'OB-GRAPH-001';
+  if (['child_process_gone', 'render_process_gone'].includes(event)) return 'OB-SYS-004';
+  if (event === 'vault_lockout_started') return 'OB-VAULT-003';
+  if (event === 'vault_unlock_failed') return 'OB-VAULT-002';
+  if (event === 'user_data_permissions_failed') return 'OB-SEC-001';
+  if (event === 'vault_operation_failed') return appError(details.operation === 'export_recovery' ? 'OB-VAULT-004' : details.message || details.name || 'OB-SYS-000').code;
+  if (event === 'did_fail_load') return 'OB-SYS-001';
+  if (event === 'permission_denied') return 'OB-SEC-001';
+  if (event === 'rate_limited') return 'OB-EXT-002';
+  if (event === 'graphics_software_fallback') return 'OB-GRAPH-002';
+  if (event === 'app_graceful_shutdown_failed' || event === 'window_unresponsive' || event === 'window_recovery_paused' || event === 'recovery_page_failed') return 'OB-SYS-004';
+  return '';
 }
 
 function createLifecycleLog(userDataPath, { fsImpl = fs, now = () => new Date(), maxBytes = DEFAULT_MAX_BYTES } = {}) {
@@ -114,7 +118,9 @@ function createLifecycleLog(userDataPath, { fsImpl = fs, now = () => new Date(),
   }
 
   function append(event, details = {}) {
-    const record = { timestamp: timestamp(), event: String(event || 'unknown').slice(0, 64), ...safeDetails(String(event || ''), details) };
+    const eventName = String(event || 'unknown').slice(0, 64);
+    const code = VALID_ERROR_CODES.has(String(details.code || '')) ? String(details.code) : errorCodeForEvent(eventName, details);
+    const record = { timestamp: timestamp(), event: eventName, ...safeDetails(eventName, { ...details, ...(code ? { code } : {}) }) };
     let line = `${JSON.stringify(record)}\n`;
     if (Buffer.byteLength(line) > fileLimit) line = `${JSON.stringify({ timestamp: record.timestamp, event: record.event })}\n`;
     try {
@@ -168,4 +174,4 @@ function instrumentAppExitCalls(app, lifecycle) {
   }
 }
 
-module.exports = { DEFAULT_MAX_BYTES, commandBasename, createLifecycleLog, instrumentAppExitCalls, safeDetails, safeRecord, shortCaller };
+module.exports = { DEFAULT_MAX_BYTES, commandBasename, createLifecycleLog, errorCodeForEvent, instrumentAppExitCalls, safeDetails, safeRecord, shortCaller };

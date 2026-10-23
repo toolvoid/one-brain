@@ -42,15 +42,19 @@ test('locked state blocks extension, proxy, and MCP requests before data callbac
     await ext.handle(request, extResponse);
     assert.equal(extResponse.status, 423);
     assert.equal(JSON.parse(extResponse.body).code, 'ONE_BRAIN_LOCKED');
+    assert.equal(JSON.parse(extResponse.body).errorCode, 'OB-VAULT-001');
 
     const proxyResponse = responseRecorder();
     await proxy.handle({ url: '/v1/openai/chat/completions', method: 'POST', headers: {} }, proxyResponse);
     assert.equal(proxyResponse.status, 423);
     assert.equal(JSON.parse(proxyResponse.body).code, 'ONE_BRAIN_LOCKED');
+    assert.equal(JSON.parse(proxyResponse.body).errorCode, 'OB-VAULT-001');
 
     const mcpResponse = await fetch(mcp.config.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     assert.equal(mcpResponse.status, 423);
-    assert.equal((await mcpResponse.json()).code, 'ONE_BRAIN_LOCKED');
+    const mcpBody = await mcpResponse.json();
+    assert.equal(mcpBody.code, 'ONE_BRAIN_LOCKED');
+    assert.equal(mcpBody.errorCode, 'OB-VAULT-001');
 
     assert.equal(dataCallbacks, 0);
     assert.equal(await lockController.unlock('correct-password'), true);

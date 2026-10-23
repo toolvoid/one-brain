@@ -12,6 +12,7 @@ const { INSTRUCTIONS } = require('./connectors');
 const { createMcpToolHandlers, mcpActivityMetadata } = require('./mcp-tools');
 const { listMemories } = require('./db');
 const lockController = require('./lock-controller');
+const { appError } = require('./error-codes');
 
 const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -156,6 +157,10 @@ function readBody(request) {
 }
 
 function sendJson(response, status, body) {
+  if (status >= 400 && body && typeof body === 'object') {
+    const normalized = appError(body.errorCode || body.code || body.reason || body.error);
+    body = { ...body, ...(body.code ? { errorCode: normalized.code } : { code: normalized.code }) };
+  }
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   response.end(JSON.stringify(body));
 }

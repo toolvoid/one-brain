@@ -11,6 +11,8 @@
     "build": "vite build",
     "bench": "node scripts/bench.js",
     "build:extension": "node scripts/build-extension.js",
+    "package:extension": "node scripts/package-extension.js",
+    "docs:errors": "node scripts/generate-error-docs.js",
     "pack": "npm run build && npm run build:extension && electron-builder --dir",
     "dist": "npm run build && npm run build:extension && electron-builder",
     "postinstall": "electron-builder install-app-deps"

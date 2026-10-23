@@ -8,6 +8,7 @@ const { processDisplayName } = require('./process-display-name');
 const { parseEvaluationCsv } = require('./evaluation-tool');
 const fs = require('node:fs');
 const { createLifecycleLog, instrumentAppExitCalls } = require('./lifecycle-log');
+const { appError, getErrorCodes, inferredCode } = require('./error-codes');
 const { createPasswordLockout } = require('./password-lockout');
 const userDataRoot = app.getPath('userData');
 const userDataPermissionFix = enforcePrivateTree(userDataRoot);
@@ -82,6 +83,8 @@ function initializeReadyElectronApis() {
   Menu.setApplicationMenu(null);
 }
 ipcMain.handle('lifecycle:tail', () => lifecycleLog.tail(50));
+ipcMain.on('errors:normalize', (event, code, details) => { event.returnValue = appError(code, details); });
+ipcMain.on('errors:list', (event) => { event.returnValue = getErrorCodes(); });
 const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
 const { initializeDatabase, getDatabaseStatus, getRuntimeDatabaseStats, setPerformanceRecorder, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, saveEvaluationDataset, listEvaluationDatasets, runEvaluationDataset, listEvaluationRunSummaries, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getMcpClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, getMemoryEmbeddingVector, getMemory, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, listRecentImports, listClients, removeLegacyClient, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, addMemory, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
 setPerformanceRecorder((name, duration) => performanceMetrics.record(name, duration));
@@ -898,7 +901,7 @@ app.whenReady().then(async () => {
     const labels = { chatgpt: 'ChatGPT web', claude: 'Claude web', gemini: 'Gemini web', deepseek: 'DeepSeek web', groq: 'Groq playground' };
     const providerClient = event.provider === 'groq' ? 'Groq API' : event.provider === 'deepseek' ? 'DeepSeek API' : null;
     const action = ['search', 'save'].includes(event.tool) ? event.tool : providerClient ? 'search' : 'test';
-    connectionActivity.add({ client: providerClient || labels[site] || 'One Brain', action, ok: Boolean(event.ok), reason: event.error === 'ONE_BRAIN_LOCKED' ? 'locked' : event.error === 'pending_approval' ? 'needs_approval' : event.error === 'unknown_token' ? 'not_paired' : event.error ? 'request_failed' : '' });
+    connectionActivity.add({ client: providerClient || labels[site] || 'One Brain', action, ok: Boolean(event.ok), reason: event.error === 'ONE_BRAIN_LOCKED' ? 'locked' : event.error === 'pending_approval' ? 'needs_approval' : event.error === 'unknown_token' ? 'not_paired' : event.error ? 'request_failed' : '', ...(event.error ? { code: inferredCode(event.error) } : {}) });
   };
   extensionApi = createExtApi({ userDataPath, authenticateClientToken, getClientTokenState, getClientProfile: getProxyClientProfile,
     authFailureLog: () => recordSecurityEvent('auth_failed'),

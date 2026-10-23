@@ -10,8 +10,9 @@ const lockController = require('./lock-controller');
 const { passesRelevanceGate } = require('./relevance-gate');
 const smartSave = require('../extension/src/smart-save');
 const { splitChatMessages, contentHash, looksSecret } = require('./ext-chat');
+const { appError } = require('./error-codes');
 
-const SITES = Object.freeze({ chatgpt: 'chatgpt', claude: 'claude', gemini: 'gemini', deepseek: 'deepseek', groq: 'groq' });
+const SITES = Object.freeze({ chatgpt: 'chatgpt', claude: 'claude', gemini: 'gemini', deepseek: 'deepseek', groq: 'groq', perplexity: 'perplexity' });
 const API_VERSION = '1.2.0';
 const MIN_EXTENSION_VERSION = '1.1.0';
 const BODY_LIMIT = 2 * 1024 * 1024;
@@ -35,6 +36,10 @@ function requestOrigin(req) {
 }
 
 function sendJson(res, status, body, corsOrigin = null) {
+  if (status >= 400 && body && typeof body === 'object') {
+    const normalized = appError(body.errorCode || body.code || body.reason || body.error);
+    body = { ...body, ...(body.code ? { errorCode: normalized.code } : { code: normalized.code }) };
+  }
   const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
   if (corsOrigin) {
     headers['Access-Control-Allow-Origin'] = corsOrigin;
@@ -134,7 +139,7 @@ function createExtApi(options) {
   function authFailure(res, { reason, client, token, status, message, origin, expectedOrigin, receivedOrigin }) {
     const tokenHashPrefix = token ? createHash('sha256').update(token).digest('hex').slice(0, 6) : null;
     try { authFailureLog({ type: 'extension_auth_failure', reason, client, tokenHashPrefix }); } catch {}
-    if (reason === 'origin_mismatch' && /^ext:(chatgpt|claude|gemini|deepseek|groq)$/.test(String(client || ''))) {
+    if (reason === 'origin_mismatch' && /^ext:(chatgpt|claude|gemini|deepseek|groq|perplexity)$/.test(String(client || ''))) {
       const site = String(client).slice(4), origins = readOrigins();
       origins[site] = { ...origins[site], health: { ...(origins[site]?.health || {}), authFailure: reason, authFailureAt: new Date(now()).toISOString(), expectedOrigin: expectedOrigin || origins[site]?.origin || null, receivedOrigin: receivedOrigin || origin || null } };
       saveOrigins(origins);
@@ -148,8 +153,8 @@ function createExtApi(options) {
     if (body.site !== site || !Array.isArray(body.messages) || body.messages.length > 1000) throw Object.assign(new Error('A valid site and message list are required.'), { status: 400 });
     const chatKey = String(body.chatKey || '');
     if (!/^[a-f\d]{64}$/i.test(chatKey)) throw Object.assign(new Error('A valid chat key is required.'), { status: 400 });
-    const source = String(body.source || site);
-    if (!['chatgpt', 'claude', 'gemini', 'codex', 'groq', 'deepseek'].includes(source)) throw Object.assign(new Error('Choose a valid memory source.'), { status: 400 });
+    const source = site === 'perplexity' ? 'perplexity' : String(body.source || site);
+    if (!['chatgpt', 'claude', 'gemini', 'codex', 'groq', 'deepseek', 'perplexity'].includes(source)) throw Object.assign(new Error('Choose a valid memory source.'), { status: 400 });
     const existing = typeof getExtensionChatSave === 'function' ? getExtensionChatSave(chatKey, client) : { saved: false, hashes: [], imports: [] };
     const include = body.include || (body.includeAssistant ? 'both' : 'my-messages');
     const split = ['exchange', 'topic', 'fixed', 'one'].includes(body.split) ? body.split : 'exchange';
@@ -232,7 +237,7 @@ function createExtApi(options) {
     const auth = /^Bearer (.+)$/i.exec(req.headers.authorization || '');
     const suppliedToken = auth?.[1] || null;
     const identity = suppliedToken ? authenticateClientToken(suppliedToken) : null;
-    if (!identity || !/^ext:(chatgpt|claude|gemini|deepseek|groq)$/.test(identity.client)) {
+    if (!identity || !/^ext:(chatgpt|claude|gemini|deepseek|groq|perplexity)$/.test(identity.client)) {
       const tokenState = suppliedToken ? getClientTokenState(suppliedToken) : null;
       const reason = tokenState?.revoked ? 'revoked' : 'unknown_token';
       return authFailure(res, { reason, client: tokenState?.client || identity?.client || 'ext:unknown', token: suppliedToken, status: 401,
@@ -299,7 +304,8 @@ function createExtApi(options) {
       const diag = body.diagnostics && typeof body.diagnostics === 'object' ? body.diagnostics : rawMatched;
       const safeDiagnostics = { containersMatched: Math.max(0, Math.min(1000, Number(diag.containersMatched ?? safeMatched.messages) || 0)), messagesByRole: { user: Math.max(0, Math.min(1000, Number(diag.messagesByRole?.user) || 0)), assistant: Math.max(0, Math.min(1000, Number(diag.messagesByRole?.assistant) || 0)) }, scrollableFound: Boolean(diag.scrollableFound), scrollableType: ['window', 'div', 'main', 'section', 'element'].includes(diag.scrollableType) ? diag.scrollableType : null, messageSelectors: Object.fromEntries(Object.entries(diag.messageSelectors || {}).slice(0, 20).map(([name, value]) => [String(name).slice(0, 40), typeof value === 'string' ? value.slice(0, 200) : null])), selectorNames: Object.fromEntries(Object.entries(diag.selectorNames || {}).slice(0, 100).filter(([id]) => /^[\w:-]{1,100}$/.test(id)).map(([id, name]) => [id, String(name).slice(0, 40)])) };
       const at = new Date(now()).toISOString();
-      latest[site] = { ...latest[site], layoutStatus: { broken: Number(safeMatched.composer ?? safeMatched.input ?? 0) < 1, matched: safeMatched, at },
+      const composerBroken = Number(safeMatched.composer ?? safeMatched.input ?? 0) < 1;
+      latest[site] = { ...latest[site], layoutStatus: { broken: composerBroken, matched: safeMatched, reason: site === 'perplexity' && composerBroken ? 'Perplexity chat composer controls were not detected; manual context mode is active.' : '', at },
         health: { ...(latest[site]?.health || {}), selfCheck: { matched: safeMatched, ...safeDiagnostics, at }, checkResultAt: at, tabContentScriptVersion: String(body.contentScriptVersion || '').slice(0, 80), rateLimited: false } };
       saveOrigins(latest);
       return sendJson(res, 200, { ok: true }, origin);

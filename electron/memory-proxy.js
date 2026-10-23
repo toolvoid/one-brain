@@ -8,6 +8,7 @@ const { createHash } = require('node:crypto');
 const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
 const lockController = require('./lock-controller');
 const { passesRelevanceGate } = require('./relevance-gate');
+const { appError } = require('./error-codes');
 
 const PROVIDERS = ['openai', 'groq', 'deepseek', 'gemini', 'openrouter', 'claude'];
 const PROVIDER_URLS = {
@@ -40,6 +41,10 @@ function writePrivate(file, data) {
 }
 
 function sendJson(response, status, body) {
+  if (status >= 400 && body && typeof body === 'object') {
+    const normalized = appError(body.errorCode || body.code || body.reason || body.error);
+    body = { ...body, ...(body.code ? { errorCode: normalized.code } : { code: normalized.code }) };
+  }
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   response.end(JSON.stringify(body));
 }

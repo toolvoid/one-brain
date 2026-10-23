@@ -2,7 +2,7 @@
 
 (() => {
   const api = globalThis.browser || globalThis.chrome;
-  const sites = ['chatgpt', 'claude', 'gemini', 'deepseek', 'groq'];
+  const sites = ['chatgpt', 'claude', 'gemini', 'deepseek', 'groq', 'perplexity'];
   const siteSelect = document.querySelector('#site');
   const codeInput = document.querySelector('#code');
   const endpointInput = document.querySelector('#endpoint');

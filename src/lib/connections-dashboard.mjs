@@ -3,15 +3,35 @@ export const CONNECTION_DEFINITIONS = [
     ['claude-desktop', 'Claude Desktop'], ['claude-code', 'Claude Code'], ['codex', 'Codex'], ['gemini', 'Gemini CLI'], ['vscode', 'VS Code Copilot']
   ].map(([id, name]) => ({ id, name, type: id === 'claude-desktop' ? 'Desktop app via MCP' : 'CLI via MCP', supports: ['Search', 'Save'] })),
   ...[
-    ['claude', 'Claude web'], ['chatgpt', 'ChatGPT web'], ['gemini', 'Gemini web'], ['deepseek', 'DeepSeek web'], ['groq', 'Groq playground']
+    ['claude', 'Claude web'], ['chatgpt', 'ChatGPT web'], ['gemini', 'Gemini web'], ['deepseek', 'DeepSeek web'], ['groq', 'Groq playground'], ['perplexity', 'Perplexity web']
   ].map(([id, name]) => ({ id: `ext:${id}`, site: id, name, type: 'Web via extension', supports: ['Search', 'Save', 'Auto-insert'] })),
   { id: 'quick-context', name: 'ChatGPT desktop', type: 'Manual only', supports: ['Search'], manual: true },
   { id: 'provider:groq', name: 'Groq API', provider: 'groq', type: 'API provider', supports: ['Search', 'Auto-insert'] },
   { id: 'provider:deepseek', name: 'DeepSeek API', provider: 'deepseek', type: 'API provider', supports: ['Search', 'Auto-insert'] }
 ];
 
+export const CONNECTION_GROUP_DEFINITIONS = Object.freeze([
+  { id: 'direct-mcp', title: 'Direct (MCP) apps', description: 'Detected from supported app config files on this computer. Connect One Brain, fix a bridge, or test the connection.' },
+  { id: 'web-extension', title: 'Web chatbots (browser extension)', description: 'Pair supported chat sites with the extension, then check its build and adapter health.' },
+  { id: 'built-in', title: 'Built-in chatbots', description: 'One Brain chat will be available here in a future release.', comingSoon: true }
+]);
+
+const DIRECT_CONNECTION_IDS = new Set(['codex', 'claude-code', 'claude-desktop', 'vscode', 'gemini']);
+const WEB_CONNECTION_SITES = new Set(['claude', 'chatgpt', 'gemini', 'deepseek', 'groq', 'perplexity']);
+
+export function groupConnectionRows(rows = []) {
+  return CONNECTION_GROUP_DEFINITIONS.map((group) => ({
+    ...group,
+    rows: group.id === 'direct-mcp'
+      ? rows.filter((row) => DIRECT_CONNECTION_IDS.has(row.id))
+      : group.id === 'web-extension'
+        ? rows.filter((row) => WEB_CONNECTION_SITES.has(row.site))
+        : []
+  }));
+}
+
 export function defaultWriteSourceForClient(client) {
-  return /^(?:ext|chat):(chatgpt|claude|gemini|deepseek|groq)$/.exec(String(client || ''))?.[1] || null;
+  return /^(?:ext|chat):(chatgpt|claude|gemini|deepseek|groq|perplexity)$/.exec(String(client || ''))?.[1] || null;
 }
 
 export function getWriteSourceReview(client, writeSource) {
@@ -25,7 +45,7 @@ const byId = (list, key, id) => list.find((item) => item[key] === id);
 export function buildConnectionRows({ mcp = [], clients = [], extensions = [], providers = {}, quickContext = {}, activity = [], counts: activityCounts = {}, selectors = {}, vaultLocked = false } = {}) {
   const rows = CONNECTION_DEFINITIONS.map((definition) => {
     let status = 'Not connected', reason = 'Not connected yet.', last = null;
-    let composerUnavailable = false;
+    let composerUnavailable = false, composerUnavailableReason = '';
     if (definition.type.includes('MCP')) {
       const item = byId(mcp, 'id', definition.id);
       const profile = clients.find((row) => row.verified && String(row.client || '').toLowerCase().replace(/[^a-z0-9]/g, '').includes(({ codex: 'codex', vscode: 'vscode', gemini: 'geminicli', 'claude-code': 'claudecode', 'claude-desktop': 'claudedesktop' })[definition.id]));
@@ -68,7 +88,7 @@ export function buildConnectionRows({ mcp = [], clients = [], extensions = [], p
         const effectiveRealFailure = !successfulUseIsCurrent && realFailure;
         const degraded = !requiredBroken && (composerMatched && (messageCount > 0 && messageCount < 2 || selfCheck.messageSelectors && Object.values(selfCheck.messageSelectors).every((value) => !value)) || selector?.messageBroken);
         if (busy) { status = 'Busy (rate limited)'; const retryAfter = h.retryAt ? Math.ceil((Number(h.retryAt) - Date.now()) / 1000) : Number(h.retryAfter) || 1; reason = `Busy: rate limited, retrying in ${Math.max(1, retryAfter)}s`; }
-        else if (requiredBroken || composerUnavailable) { status = 'Degraded'; reason = 'Extension is connected, but the chat box was not detected. Saving can still work; context insertion is unavailable.'; }
+        else if (requiredBroken || composerUnavailable) { status = 'Degraded'; reason = selector?.reason || item?.layoutStatus?.reason || 'Extension is connected, but the chat box was not detected. Saving can still work; context insertion is unavailable.'; composerUnavailableReason = reason; }
         else if (effectiveRealFailure) { status = 'Failing'; reason = h.authFailure === 'origin_mismatch' ? `Origin mismatch: expected ${h.expectedOrigin || 'unknown'}, received ${h.receivedOrigin || 'unknown'}.` : h.hostPermission === false ? 'Host permission is not granted.' : item.updateOneBrain || h.apiCompatible === false ? 'Extension and One Brain API versions are incompatible.' : reportedBuildBroken ? 'Extension reported a build without the loop guard.' : staleScript ? 'Reload this page.' : 'The last extension check failed.'; }
         else if (degraded) { status = 'Degraded'; reason = messageCount === 1 ? 'Message detection found 1 message: Save this chat may be incomplete, press Load full chat' : 'Message selectors need attention.'; }
         else if (successfulUseIsCurrent) { status = 'Paired'; reason = `Last ${newestSuccess.action} succeeded ${newestSuccess.time}.`; }
@@ -101,7 +121,7 @@ export function buildConnectionRows({ mcp = [], clients = [], extensions = [], p
     }
     const work = Object.fromEntries(['Search', 'Save', 'Auto-insert'].map((feature) => [feature, supported.has(feature)
       ? { supported: true, reason: '' }
-      : { supported: false, reason: definition.site && feature === 'Auto-insert' && composerUnavailable ? 'The chat box was not detected, so One Brain cannot insert context yet.' : definition.manual ? 'Quick context copies text for manual paste.' : definition.type.includes('MCP') ? 'MCP tools return results but do not insert into the client prompt.' : definition.type === 'API provider' && !(providers.providerKeyStatus || providers)[definition.provider] ? 'Provider key is missing.' : definition.type === 'API provider' && providers.enabled === false ? 'Memory injection is disabled in the local API proxy.' : definition.type === 'API provider' && providers.dryRun && feature === 'Auto-insert' ? 'Dry run leaves provider requests unchanged.' : definition.type === 'API provider' ? 'The provider API connection has no save_memory tool.' : 'This connection does not provide this action.' }]));
+      : { supported: false, reason: definition.site && feature === 'Auto-insert' && composerUnavailable ? (composerUnavailableReason || 'The chat box was not detected, so One Brain cannot insert context yet.') : definition.manual ? 'Quick context copies text for manual paste.' : definition.type.includes('MCP') ? 'MCP tools return results but do not insert into the client prompt.' : definition.type === 'API provider' && !(providers.providerKeyStatus || providers)[definition.provider] ? 'Provider key is missing.' : definition.type === 'API provider' && providers.enabled === false ? 'Memory injection is disabled in the local API proxy.' : definition.type === 'API provider' && providers.dryRun && feature === 'Auto-insert' ? 'Dry run leaves provider requests unchanged.' : definition.type === 'API provider' ? 'The provider API connection has no save_memory tool.' : 'This connection does not provide this action.' }]));
     const sourceHealth = itemHealthStatus(mcp, definition.id);
     const ext = definition.site ? byId(extensions, 'site', definition.site) : null;
     const mcpHealth = definition.type.includes('MCP') ? byId(mcp, 'id', definition.id)?.health || {} : null;

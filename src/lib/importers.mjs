@@ -187,6 +187,7 @@ function genericMessages(conversation, includeAssistant) {
 function inferImportSource(fileName, data = null) {
   const name = String(fileName || '').toLowerCase();
   const sample = Array.isArray(data) ? data[0] : data;
+  if (/perplexity/.test(name)) return 'perplexity';
   if (/deepseek/.test(name)) return 'deepseek';
   if (/groq/.test(name)) return 'groq';
   if (/claude|anthropic/.test(name) || Array.isArray(sample?.chat_messages)) return 'claude';
@@ -237,12 +238,12 @@ function applyLogFilter(parsed, skipLogText) {
 
 function filterPlainTranscript(text, includeAssistant) {
   const lines = String(text || '').replace(/\r\n?/g, '\n').split('\n');
-  const roleLine = /^(user|human|you|assistant|model|chatgpt|claude|gemini|deepseek|groq)\s*:\s?(.*)$/i;
+  const roleLine = /^(user|human|you|assistant|model|chatgpt|claude|gemini|deepseek|groq|perplexity)\s*:\s?(.*)$/i;
   const rows = lines.map((line) => ({ line, match: line.match(roleLine) }));
   if (!rows.some((row) => row.match)) return String(text || '');
   let currentRole = '';
   return rows.filter(({ match }) => {
-    if (match) currentRole = /^(assistant|model|chatgpt|claude|gemini|deepseek|groq)$/i.test(match[1]) ? 'assistant' : 'user';
+    if (match) currentRole = /^(assistant|model|chatgpt|claude|gemini|deepseek|groq|perplexity)$/i.test(match[1]) ? 'assistant' : 'user';
     return includeAssistant || currentRole !== 'assistant';
   }).map(({ line }) => line).join('\n').trim();
 }

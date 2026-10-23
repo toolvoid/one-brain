@@ -1,0 +1,18 @@
+.app-error-message { display:grid;gap:6px; padding:10px 12px; border:1px solid #6e4932; border-radius:8px; background:#251d19; color:#f4e5d8; font-size:12px; line-height:1.45; overflow-wrap:anywhere; }
+.app-error-message.severity-info { border-color:#34576a; background:#15232b; }
+.app-error-message.severity-warn { border-color:#6e5a32; background:#282316; }
+.app-error-heading { display:flex;align-items:center;gap:10px;flex-wrap:wrap; }
+.app-error-heading strong { color:#fff4e9; }
+.app-error-code { color:#8793a2;font:11px ui-monospace,SFMono-Regular,monospace; }
+.app-error-message p { margin:0; }
+.app-error-fix { color:#d9cfbf; }
+.app-error-actions { display:flex;align-items:center;gap:12px;flex-wrap:wrap; }
+.app-error-actions button { padding:3px 7px;border:1px solid #536274;border-radius:5px;background:#182230;color:#dce8f5;font:inherit;cursor:pointer; }
+.app-error-actions details p { margin:6px 0; }
+.error-code-help > input { box-sizing:border-box;width:100%;margin:8px 0;padding:8px;border:1px solid #354054;border-radius:6px;background:#111827;color:#edf2fb; }
+.error-code-list { display:grid;gap:6px;max-height:480px;overflow:auto; }
+.error-code-help-item { padding:8px;border:1px solid #2c394b;border-radius:7px;background:#101722;color:#cad6e4;font-size:11px; }
+.error-code-help-item summary { display:flex;align-items:center;gap:10px;cursor:pointer;list-style:none; }
+.error-code-help-item summary::-webkit-details-marker { display:none; }
+.error-code-help-item summary small { margin-left:auto;color:#8793a2;text-transform:capitalize; }
+.error-code-help-item p { margin:8px 0 0;line-height:1.5; }

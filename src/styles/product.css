@@ -37,13 +37,22 @@
 .app-topbar-status { position:static;margin-left:auto;flex:none; }
 .sidebar-header { display:flex!important;align-items:center!important;justify-content:space-between!important; }
 .sidebar-main-nav,.sidebar-utilities { display:none!important; }
-.memory-panel { top:50px!important;width:var(--sidebar-width,360px)!important;max-width:calc(100vw - 24px);padding:clamp(12px,1.4vw,20px)!important; }
+.memory-panel { top:50px!important;width:var(--sidebar-width,360px)!important;max-width:calc(100vw - 24px);padding:clamp(12px,1.4vw,20px)!important;transition:width 150ms ease,transform 150ms ease!important; }
+.memory-panel.is-collapsed { width:0!important;max-width:0!important;padding-left:0!important;padding-right:0!important;overflow:hidden!important;transform:translateX(-100%)!important;border-right:0!important; }
 .memory-panel.is-page { position:fixed!important;z-index:50!important;inset:50px 0 0!important;width:auto!important;max-width:none!important;transform:none!important;border-right:0!important;overflow:auto!important;background:var(--color-bg)!important; }
 .memory-panel.is-page .connect-view { width:min(100%,1440px);margin:0 auto; }
 .memory-panel.is-page .connections-dashboard,.memory-panel.is-page .clients-settings,.memory-panel.is-page .connection-activity { min-width:0; }
-.sidebar-resize-handle { position:absolute;z-index:7;top:0;right:-5px;bottom:0;width:10px;cursor:col-resize;touch-action:none; }
+.sidebar-resize-handle { position:absolute;z-index:7;top:0;right:-4px;bottom:0;width:8px;cursor:col-resize;touch-action:none;background:transparent; }
+.sidebar-resize-handle::after { content:"";position:absolute;top:0;bottom:0;left:3px;width:1px;background:var(--color-border);transition:width 150ms ease,background 150ms ease; }
+.sidebar-resize-handle:hover::after,.sidebar-resize-handle:focus-visible::after { left:2px;width:3px;background:var(--color-accent-strong); }
+.sidebar-header { min-width:0; }
+.sidebar-header>strong { min-width:0; }
+.sidebar-toggle-container { position:relative;display:flex;flex:none;align-items:center;justify-content:center; }
+.sidebar-toggle-button { box-sizing:border-box!important;width:32px!important;height:32px!important;min-height:32px!important;padding:0!important;border:1px solid var(--color-border)!important;border-radius:8px!important;color:var(--color-muted)!important; }
+.sidebar-toggle-button:hover { color:var(--color-text)!important; }
+.graph-toolbar { position:absolute;z-index:8;top:60px;left:12px;display:flex;align-items:center; }
+.brain-webgl,.brain-label-layer { transition:width 150ms ease,left 150ms ease; }
 .sidebar-resize-handle:focus-visible { outline:2px solid var(--color-accent-strong);outline-offset:-2px; }
-.sidebar-toggle { left:var(--sidebar-width,360px)!important; }
 .app-topbar nav button,.app-topbar-status button,.app-topbar-tools button { white-space:nowrap; }
 .app-topbar nav button:focus-visible,.app-topbar-status button:focus-visible,.app-topbar-tools button:focus-visible,.sidebar-resize-handle:focus-visible { outline:2px solid var(--color-accent-strong);outline-offset:2px; }
 .import-page-backdrop { position:fixed!important;z-index:40!important;inset:50px 0 0!important;display:block!important;overflow:auto!important;padding:clamp(16px,3vw,40px)!important;background:var(--color-bg)!important; }
@@ -68,11 +77,9 @@
   .vault-state { max-width:65px;overflow:hidden;text-overflow:ellipsis; }
   .app-topbar-status { gap:0; }
 }
-@media(max-width:900px) {
-  .sidebar-toggle { z-index:31;left:min(var(--sidebar-width,360px),calc(100vw - 28px))!important; }
-  .memory-app:has(.memory-panel.is-drawer.is-collapsed) .sidebar-toggle { left:0!important; }
+@media(max-width:720px) {
   .memory-panel.is-drawer { z-index:30!important;width:min(420px,calc(100vw - 24px))!important;max-width:calc(100vw - 24px)!important;box-shadow:var(--shadow-soft); }
-  .memory-panel.is-drawer.is-collapsed { transform:translateX(-110%)!important; }
+  .memory-panel.is-drawer.is-collapsed { width:0!important;max-width:0!important;transform:translateX(-100%)!important; }
   .memory-app:has(.memory-panel.is-drawer:not(.is-collapsed))::after { content:"";position:fixed;z-index:29;inset:50px 0 0;background:#0008; }
   .sidebar-resize-handle { display:none; }
   .chat-layout { grid-template-columns:minmax(0,1fr)!important;grid-template-rows:minmax(150px,35%) minmax(0,1fr); }

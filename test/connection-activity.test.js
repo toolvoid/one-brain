@@ -36,3 +36,13 @@ test('activity sanitizes arbitrary text even if the on-disk file contains inject
   const activity = createConnectionActivity(directory);
   assert.deepEqual(activity.list()[0], safeEvent({ client: 'Codex', action: 'search', ok: true }, '2026-10-12T10:00:00.000Z'));
 });
+
+test('connection activity persists only a valid error code with safe event metadata', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'one-brain-activity-code-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const activity = createConnectionActivity(directory, { now: () => '2026-10-12T10:00:00.000Z' });
+  const stored = activity.add({ client: 'Codex', action: 'search', ok: false, reason: 'unknown', code: 'OB-EXT-005', token: 'PRIVATE_TOKEN', memory: 'PRIVATE MEMORY' });
+  assert.equal(stored.code, 'OB-EXT-005');
+  assert.doesNotMatch(fs.readFileSync(path.join(directory, 'connection-activity.json'), 'utf8'), /PRIVATE_TOKEN|PRIVATE MEMORY/);
+  assert.equal(activity.add({ client: 'Codex', action: 'test', ok: false, code: 'OB-EXT-999' }).code, undefined);
+});

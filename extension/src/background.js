@@ -1,10 +1,10 @@
 'use strict';
 
 const ONE_BRAIN_API_DEFAULT = 'http://127.0.0.1:3738';
-const ONE_BRAIN_SITES = ['chatgpt', 'claude', 'gemini', 'deepseek', 'groq'];
+const ONE_BRAIN_SITES = ['chatgpt', 'claude', 'gemini', 'deepseek', 'groq', 'perplexity'];
 const ONE_BRAIN_MIN_API_VERSION = '1.1.0';
-const ONE_BRAIN_BUILD_ID = '1.2.0-loopguard';
-const CONTENT_SCRIPT_VERSION = '1.2.0-loopguard';
+const ONE_BRAIN_BUILD_ID = '1.4.0-loopguard';
+const CONTENT_SCRIPT_VERSION = '1.4.0';
 const statusCache = new Map(), statusInflight = new Map();
 const searchRequests = new Map();
 let healthPollStarted = false, healthPollDelay = 15_000, healthPollTimer = null;
@@ -64,7 +64,7 @@ async function fetchStatusFor(site) {
   if (!tokens[site]) return { site, paired: false, running: true, status: 'no-token' };
   try {
     let hostPermission = true;
-    if (extensionApi.permissions?.contains) { try { hostPermission = await extensionApi.permissions.contains({ origins: [`https://${({ chatgpt: 'chatgpt.com', claude: 'claude.ai', gemini: 'gemini.google.com', deepseek: 'chat.deepseek.com', groq: 'console.groq.com' })[site]}/*`] }); } catch { hostPermission = false; } }
+    if (extensionApi.permissions?.contains) { try { hostPermission = await extensionApi.permissions.contains({ origins: [{ chatgpt: 'https://chatgpt.com/*', claude: 'https://claude.ai/*', gemini: 'https://gemini.google.com/*', deepseek: 'https://chat.deepseek.com/*', groq: 'https://console.groq.com/playground*', perplexity: ['https://perplexity.ai/*', 'https://www.perplexity.ai/*'] }[site]].flat() }); } catch { hostPermission = false; } }
     const ping = await extensionRequest('/ext/ping', { token: tokens[site], headers: { 'X-One-Brain-Build-Id': ONE_BRAIN_BUILD_ID, 'X-One-Brain-Content-Script-Version': CONTENT_SCRIPT_VERSION, 'X-One-Brain-Host-Permission': hostPermission ? 'granted' : 'denied', 'X-One-Brain-Min-API-Version': ONE_BRAIN_MIN_API_VERSION } });
     const updateOneBrain = !versionAtLeast(ping.apiVersion, ONE_BRAIN_MIN_API_VERSION);
     const extensionVersion = extensionApi.runtime.getManifest?.().version || '0.0.0';
@@ -109,7 +109,7 @@ extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       await storageSet({ oneBrainSelfChecks: checks });
       const tokens = await storageGet('oneBrainTokens') || {};
       if (tokens[message.site]) {
-        try { await extensionRequest('/ext/selfcheck', { method: 'POST', token: tokens[message.site], body: { matched, diagnostics, contentScriptVersion: CONTENT_SCRIPT_VERSION } }); } catch {}
+        try { await extensionRequest('/ext/selfcheck', { method: 'POST', token: tokens[message.site], body: { matched, diagnostics, contentScriptVersion: CONTENT_SCRIPT_VERSION, reason: typeof message.reason === 'string' ? message.reason.slice(0, 180) : '' } }); } catch {}
       }
       return { ok: true };
     }
@@ -201,14 +201,14 @@ extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 async function pollRequestedChecks() {
   if (!extensionApi.tabs?.query || !extensionApi.tabs?.sendMessage) return false;
-  const supported = { chatgpt: '*://chatgpt.com/*', claude: '*://claude.ai/*', gemini: '*://gemini.google.com/*', deepseek: '*://chat.deepseek.com/*', groq: '*://console.groq.com/playground*' };
+  const supported = { chatgpt: '*://chatgpt.com/*', claude: '*://claude.ai/*', gemini: '*://gemini.google.com/*', deepseek: '*://chat.deepseek.com/*', groq: '*://console.groq.com/playground*', perplexity: ['*://perplexity.ai/*', '*://www.perplexity.ai/*'] };
   const tokens = await storageGet('oneBrainTokens') || {};
   let visibleTabs = [];
   try { visibleTabs = await extensionApi.tabs.query({ active: true, lastFocusedWindow: true }); } catch {}
-  if (!visibleTabs.some((tab) => Object.values(supported).some((pattern) => new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replaceAll('\\*', '.*')).test(tab.url || '')))) return false;
+  if (!visibleTabs.some((tab) => Object.values(supported).flat().some((pattern) => new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replaceAll('\\*', '.*')).test(tab.url || '')))) return false;
   for (const site of ONE_BRAIN_SITES) {
     if (!tokens[site]) continue;
-    const pattern = new RegExp(({ chatgpt: '^https://chatgpt\\.com/', claude: '^https://claude\\.ai/', gemini: '^https://gemini\\.google\\.com/', deepseek: '^https://chat\\.deepseek\\.com/', groq: '^https://console\\.groq\\.com/playground' })[site]);
+    const pattern = new RegExp(({ chatgpt: '^https://chatgpt\\.com/', claude: '^https://claude\\.ai/', gemini: '^https://gemini\\.google\\.com/', deepseek: '^https://chat\\.deepseek\\.com/', groq: '^https://console\\.groq\\.com/playground', perplexity: '^https://(?:www\\.)?perplexity\\.ai/' })[site]);
     const tabs = visibleTabs.filter((tab) => pattern.test(tab.url || ''));
     if (!tabs.length) continue;
     const state = await statusFor(site);
