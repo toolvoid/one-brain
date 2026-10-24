@@ -3,11 +3,12 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { createHash, createPrivateKey, createPublicKey, generateKeyPairSync } = require('node:crypto');
+const { generateIcons } = require('./generate-extension-assets');
 
 const ROOT = path.resolve(__dirname, '..');
-const EXTENSION_VERSION = '1.4.0';
+const EXTENSION_VERSION = '1.4.6';
 const hosts = ['http://127.0.0.1/*', 'https://chatgpt.com/*', 'https://claude.ai/*', 'https://gemini.google.com/*', 'https://chat.deepseek.com/*', 'https://console.groq.com/playground*', 'https://perplexity.ai/*', 'https://www.perplexity.ai/*'];
-const common = ['src/adapters/shared.js', 'src/chat-loader.js', 'src/context-blocks.js', 'src/background-message.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/smart-save.js', 'src/insertion-guard.js', 'src/manual-context.js', 'src/layout-fallback.js'];
+const common = ['src/adapters/shared.js', 'src/chat-loader.js', 'src/context-blocks.js', 'src/background-message.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/smart-save.js', 'src/insertion-guard.js', 'src/manual-context.js', 'src/layout-fallback.js', 'src/floating-layout.js', 'src/auto-save-guard.js'];
 const contentScripts = [
   { matches: ['https://chatgpt.com/*'], js: [...common, 'src/adapters/chatgpt.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
   { matches: ['https://claude.ai/*'], js: [...common, 'src/adapters/claude.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
@@ -55,7 +56,7 @@ function build(browser, { root = ROOT, store = false } = {}) {
     content_scripts: contentScripts
   };
   let extensionId = null;
-  manifest.background = browser === 'chrome' ? { service_worker: 'src/background.js' } : { scripts: ['src/background.js'] };
+  manifest.background = browser === 'chrome' ? { service_worker: 'src/background.js' } : { scripts: ['src/auto-save-guard.js', 'src/background.js'] };
   if (browser === 'chrome') {
     if (!store) {
       // Local development uses a stable ID; Chrome assigns the store ID to packaged builds.
@@ -76,9 +77,12 @@ function build(browser, { root = ROOT, store = false } = {}) {
 }
 
 if (require.main === module) {
-  const chrome = build('chrome');
-  build('firefox');
-  console.info(`Chrome extension ID: ${chrome.extensionId}`);
+  const store = process.argv.includes('--store');
+  generateIcons(ROOT).then(() => {
+    const chrome = build('chrome', { store });
+    build('firefox', { store });
+    if (!store) console.info(`Chrome extension ID: ${chrome.extensionId}`);
+  }).catch((error) => { console.error(error.message); process.exitCode = 1; });
 }
 
 module.exports = { build, chromeKey, EXTENSION_VERSION };

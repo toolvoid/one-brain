@@ -16,7 +16,9 @@
     };
     function getMessages(scope = document) {
       const candidates = [];
-      for (const [selectorName, group] of Object.entries(selectors.messageGroups || { messages: selectors.messages || [] })) {
+      if (typeof selectors.getMessageElements === 'function') {
+        try { for (const item of selectors.getMessageElements(scope) || []) candidates.push({ node: item.element, selectorName: item.role, selector: item.selector || '' }); } catch {}
+      } else for (const [selectorName, group] of Object.entries(selectors.messageGroups || { messages: selectors.messages || [] })) {
         for (const selector of group) {
           try { for (const node of scope.querySelectorAll(selector)) candidates.push({ node, selectorName, selector }); } catch {}
         }
@@ -34,9 +36,9 @@
         const ownLabel = `${element.getAttribute?.('aria-label') || ''} ${element.getAttribute?.('data-testid') || ''} ${element.getAttribute?.('class') || ''}`.toLowerCase();
         const roleValue = /^(user|human)$/.test(explicit) ? 'user' : /^(assistant|model|bot)$/.test(explicit) ? 'assistant' : '';
         const selectorRole = typeof selectors.getRole === 'function' ? selectors.getRole(element, selectorName, selector) : '';
-        const role = roleValue || (selectorRole === 'user' || selectorRole === 'assistant' ? selectorRole : /\b(user|human|question)(?:[-_ ]message|[-_ ]turn)?\b/.test(ownLabel) ? 'user' : /\b(assistant|model|bot|answer)(?:[-_ ]message|[-_ ]turn)?\b/.test(ownLabel) ? 'assistant' : 'unknown');
+        const role = roleValue || (selectorRole === 'user' || selectorRole === 'assistant' ? selectorRole : selectorName === 'user' || selectorName === 'assistant' ? selectorName : /\b(user|human|question)(?:[-_ ]message|[-_ ]turn)?\b/.test(ownLabel) ? 'user' : /\b(assistant|model|bot|answer)(?:[-_ ]message|[-_ ]turn)?\b/.test(ownLabel) ? 'assistant' : 'unknown');
         if (!['user', 'assistant'].includes(role)) return null;
-        const text = textOf(element);
+        const text = typeof selectors.getText === 'function' ? selectors.getText(element, role, textOf) : textOf(element);
         const timestamp = element.getAttribute?.('data-timestamp') || element.querySelector?.('time')?.dateTime || '';
         const numeric = Number(timestamp);
         const ts = numeric || (timestamp ? Date.parse(timestamp) : null) || null;
@@ -60,7 +62,7 @@
       found.forEach((message) => roleCounts[message.role]++);
       const scrollable = findScrollContainer(found, scope);
       return { required, messageSelectors, selectorNames: Object.fromEntries(found.map((item) => [item.id, item.selectorName])), containersMatched: found.length, messagesByRole: roleCounts, scrollableFound: Boolean(scrollable), scrollableType: scrollable ? (scrollable === root ? 'window' : scrollable.tagName?.toLowerCase() || 'element') : null,
-        input: required.composer || required.input || null, send: required.send || null, messages: Object.values(messageSelectors).find(Boolean) || null };
+        input: required.composer || required.input || null, send: required.send || null, messages: found.length ? 'custom' : Object.values(messageSelectors).find(Boolean) || null };
     }
     function findScrollContainer(messages = getMessages(), scope = document) {
       for (const message of messages) {
@@ -79,7 +81,7 @@
     }
     function findSendButton(scope = document) { const picked = typeof selectors.pickSend === 'function' ? selectors.pickSend(scope) : null; return visible(picked) ? picked : find(selectors.sendButton || selectors.send, scope); }
     const api = { site, selectors, getMessages, readRecentMessages: getMessages, findInput: input, getInputElement: input, readDraft, writeDraft, findSendButton, getSendButton: findSendButton,
-      getLoadOlderButton: (scope = document) => find(selectors.loadOlder, scope), findScrollContainer, readChatKey: () => `${site}:${String(root.location?.pathname || '').split('/').filter(Boolean).at(-1) || 'new'}`,
+      historyComplete: Boolean(selectors.historyComplete), getLoadOlderButton: (scope = document) => find(selectors.loadOlder, scope), findScrollContainer, readChatKey: () => `${site}:${String(root.location?.pathname || '').split('/').filter(Boolean).at(-1) || 'new'}`,
       getLastAssistantMessage: (scope = document) => getMessages(scope).filter((item) => item.role === 'assistant').at(-1) || null, selfCheck, extractText: textOf,
       observe(callback, scope = document.body) { const observer = new MutationObserver(callback); if (scope) observer.observe(scope, { childList: true, subtree: true }); return () => observer.disconnect(); } };
     return Object.freeze(api);

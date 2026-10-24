@@ -13,7 +13,9 @@
   const manualContext = globalThis.OneBrainManualContext;
   const layoutFallbackModule = globalThis.OneBrainLayoutFallback;
   const chatLoader = globalThis.OneBrainChatLoader;
-  if (!SITE || !API || !adapter || !editorTools || !searchIntent || !backgroundMessage || !smartSave || !insertionGuardModule || !manualContext || !layoutFallbackModule || !chatLoader) return;
+  const floatingLayout = globalThis.OneBrainFloatingLayout;
+  const autoSaveGuard = globalThis.OneBrainAutoSaveGuard;
+  if (!SITE || !API || !adapter || !editorTools || !searchIntent || !backgroundMessage || !smartSave || !insertionGuardModule || !manualContext || !layoutFallbackModule || !chatLoader || !floatingLayout || !autoSaveGuard) return;
   const timers = new Set();
   const eventController = new AbortController();
   let stopped = false, staleToastShown = false, adapterCleanup = () => {};
@@ -49,7 +51,7 @@
   }
   globalThis.__oneBrainContentCleanup = () => stopContentScript(false);
   const askBackground = backgroundMessage.createBackgroundMessenger(API.runtime, () => stopContentScript(true));
-  const DEFAULTS = { enabled: true, showButtons: true, suggestOnSend: false, autoSaveMessages: false, memoryMode: 'off', memoryPhrases: searchIntent.DEFAULT_MEMORY_PHRASES, insertWithoutAsking: false, tokenBudget: 1500, contextFormat: 'context' };
+  const DEFAULTS = { enabled: true, showButtons: true, suggestOnSend: false, autoSaveMessages: false, smartSaveEnabled: true, autoSaveFinishedReplies: autoSaveGuard.DEFAULT_AUTO_SAVE_FINISHED_REPLIES, memoryMode: 'off', memoryPhrases: searchIntent.DEFAULT_MEMORY_PHRASES, insertWithoutAsking: false, tokenBudget: 1500, contextFormat: 'context' };
   let config = { ...DEFAULTS };
   let modal = null;
   let lastInsertedBlock = '';
@@ -82,17 +84,17 @@
     node._hideTimer = scheduleTimeout(() => node.remove(), 3800);
   }
 
-  function toastWithUndo(message, undo) {
+  function toastWithUndo(message, undo, { duration = 3000, successMessage = 'Insertion undone.' } = {}) {
     if (stopped) return null;
     let node = document.querySelector('.one-brain-extension-toast');
     if (!node) { node = document.createElement('div'); node.className = 'one-brain-extension-toast one-brain-extension-ui'; document.body.append(node); }
     node.replaceChildren(document.createTextNode(message));
     const button = document.createElement('button'); button.type = 'button'; button.textContent = 'Undo';
-    button.addEventListener('click', () => { clearScheduledTimeout(node._hideTimer); if (undo()) toast('Insertion undone.'); else toast('Draft changed; insertion was left as-is.', true); });
+    button.addEventListener('click', async () => { clearScheduledTimeout(node._hideTimer); button.disabled = true; try { const result = await undo(); if (result === true || result?.ok) toast(successMessage); else toast('Could not undo this save.', true); } catch { toast('Could not undo this save.', true); } });
     node.append(' ', button);
     node.dataset.error = 'false';
     clearScheduledTimeout(node._hideTimer);
-    node._hideTimer = scheduleTimeout(() => node.remove(), 3000);
+    node._hideTimer = scheduleTimeout(() => node.remove(), duration);
   }
 
   function readText(element) {
@@ -128,6 +130,7 @@
   function renderInputButton() {
     const editor = adapter.getInputElement();
     const buttons = [...document.querySelectorAll('.one-brain-add-memory')];
+    if (SITE === 'perplexity') { buttons.forEach((button) => button.remove()); return; }
     for (const button of buttons) if (!config.enabled || !config.showButtons || button._oneBrainEditor !== editor) button.remove();
     if (!config.enabled || !config.showButtons || !editor?.isConnected || buttons.some((button) => button._oneBrainEditor === editor && button.isConnected)) return;
     const button = createButton('Add memory', () => { void openSuggestions('manual'); }, 'one-brain-add-memory');
@@ -141,15 +144,36 @@
 
   function refreshButtons() {
     menu.hidden = !config.enabled || !config.showButtons;
+    if (smartSaveToggle) smartSaveToggle.checked = config.smartSaveEnabled !== false;
     if (!config.enabled || !config.showButtons) document.querySelectorAll('.one-brain-extension-save').forEach((button) => button.remove());
     else for (const message of adapter.getMessages()) {
       if (message.role !== 'assistant' || !message.element?.isConnected || message.element.querySelector('.one-brain-extension-save')) continue;
-      message.element.append(createButton('Save', () => { const text=cleanOutgoingText(readText(message.element)); const check=smartSave.scoreMessage(text); if(!check.keep){toast('This message did not pass the Smart save filters.',true);return;} openConfirmation({ kind: 'message', text: check.text }); }));
+      messageActionRow(message).append(createButton('Save', async () => {
+        try {
+          const latestSettings = await askBackground({ type: 'get-settings', site: SITE });
+          if (typeof latestSettings?.smartSaveEnabled === 'boolean') config.smartSaveEnabled = latestSettings.smartSaveEnabled;
+        } catch {}
+        if (smartSaveToggle) smartSaveToggle.checked = config.smartSaveEnabled !== false;
+        const text = cleanOutgoingText(message.text || readText(message.element));
+        const check = smartSave.scoreMessage(text);
+        if (config.smartSaveEnabled !== false && !check.keep) { toast('Smart save is on for this site. Turn it off in One Brain settings to save this message.', true); return; }
+        openConfirmation({ kind: 'message', text: check.text, skipSmartFilter: config.smartSaveEnabled === false });
+      }));
     }
     renderInputButton();
   }
 
-  function openConfirmation({ kind, text, messages = [] }) {
+  function messageActionRow(message) {
+    const buttons = [...(message.element.querySelectorAll?.('button') || [])].filter((button) => !button.closest?.('.one-brain-extension-ui'));
+    const anchor = buttons.find((button) => button.getAttribute('aria-label') === 'Helpful') || buttons.at(-1);
+    for (let node = anchor?.parentElement; node && message.element.contains(node); node = node.parentElement) {
+      const count = [...node.querySelectorAll('button')].filter((button) => !button.closest?.('.one-brain-extension-ui')).length;
+      if (count >= 2 && !node.querySelector('.prose h2')) return node;
+    }
+    return message.element;
+  }
+
+  function openConfirmation({ kind, text, messages = [], skipSmartFilter = false }) {
     if (!text.trim()) { toast('There is no text to save.', true); return; }
     modal?.remove();
     modal = document.createElement('section');
@@ -165,7 +189,7 @@
       const saveButton = modal.querySelector('[data-save]');
       saveButton.disabled = true;
       try {
-        const result = await askBackground({ type: 'save', site: SITE, kind, title: modal.querySelector('input').value, text, messages });
+        const result = await askBackground({ type: 'save', site: SITE, kind, title: modal.querySelector('input').value, text, messages, skipSmartFilter });
         if (!result?.ok) throw new Error(result?.error || 'Could not save to One Brain.');
         modal.remove(); modal = null; toast('Saved to One Brain.');
       } catch (error) { saveButton.disabled = false; toast(error?.message || 'Could not save to One Brain.', true); }
@@ -210,24 +234,43 @@
     document.body.append(panel); queryInput.focus();
   }
 
-  let manualButton = null;
+  let manualButton = null, launcherActions = null, launcherExpanded = false, smartSaveToggle = null;
   const layoutFallback = layoutFallbackModule.createLayoutFallback(() => {
       if (stopped) return;
       toast("One Brain couldn't detect this site's chat composer or send button. Saving chats may still work; context insertion may be unavailable.", true);
       manualButton = createButton('Manual context', () => { void openManualContext(); }, 'one-brain-manual-context');
-      document.body.append(manualButton);
+      launcherActions?.append(manualButton);
   });
-  let lastLayoutBroken = null;
-  const CONTENT_SCRIPT_VERSION = '1.4.0';
+  let lastLayoutBroken = null, layoutWarningTimer = null;
+  const CONTENT_SCRIPT_VERSION = '1.4.6';
+  function reportAdapterLayout(matched, broken) {
+    void askBackground({ type: 'adapter-self-check-report', site: SITE, matched, reason: broken ? 'Chat composer controls were not detected; context insertion may be unavailable.' : undefined });
+  }
   function checkAdapterLayout() {
     if (stopped) return false;
     const matched = adapter.selfCheck();
-    const working = Boolean(matched?.input && matched?.send);
-    if (lastLayoutBroken !== !working) {
-      lastLayoutBroken = !working;
-      void askBackground({ type: 'adapter-self-check-report', site: SITE, matched, reason: !working && SITE === 'perplexity' ? 'Perplexity composer controls were not detected; One Brain switched to manual context mode.' : undefined });
+    const generating = Boolean(document.querySelector('button[aria-label*="Stop" i],button[title*="Stop" i],[data-testid*="stop" i]'));
+    const working = Boolean(matched?.input && (matched?.send || generating));
+    if (working) {
+      clearScheduledTimeout(layoutWarningTimer); layoutWarningTimer = null;
+      if (matched?.send && lastLayoutBroken !== false) { lastLayoutBroken = false; reportAdapterLayout(matched, false); }
+      else if (generating && !matched?.send && lastLayoutBroken === true) lastLayoutBroken = null;
+      layoutFallback.check(true);
+      return true;
     }
-    return layoutFallback.check(working);
+    if (layoutWarningTimer == null && lastLayoutBroken !== true) {
+      layoutWarningTimer = scheduleTimeout(() => {
+        layoutWarningTimer = null;
+        if (stopped) return;
+        const latest = adapter.selfCheck();
+        const stillMissing = Boolean(!latest?.input || !latest?.send) && !document.querySelector('button[aria-label*="Stop" i],button[title*="Stop" i],[data-testid*="stop" i]');
+        if (!stillMissing) return;
+        lastLayoutBroken = true;
+        reportAdapterLayout(latest, true);
+        layoutFallback.check(false);
+      }, 1500);
+    }
+    return false;
   }
   const extensionRuntime = globalThis.browser?.runtime || globalThis.chrome?.runtime;
   extensionRuntime?.onMessage?.addListener?.((message, _sender, sendResponse) => {
@@ -375,6 +418,7 @@
     try { config = { ...DEFAULTS, ...(await askBackground({ type: 'get-settings', site: SITE }) || {}) }; }
     catch { config = { ...DEFAULTS, enabled: false, showButtons: false }; }
     refreshButtons();
+    scheduleAutoSaveFinishedReply();
   }
 
   async function loadChatState() {
@@ -424,15 +468,85 @@
     return /\b(?:api[_ -]?key|(?:(?:access|refresh|auth)[_ -]?)?token|password|passwd|secret|client[_ -]?secret)\s*[:=]\s*\S+|\b(?:sk-[A-Za-z0-9_-]{12,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|sk_live_[A-Za-z0-9]{12,})\b|\bAuthorization\s*:\s*Bearer\s+\S+|\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{12,})\b|-----BEGIN [A-Z ]*PRIVATE KEY-----|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\b/i.test(String(text || ''));
   }
 
+  const attemptedAutoSaveHashes = new Set();
+  const inflightAutoSaveHashes = new Set();
+  let autoReplyTimer = null, autoReplyCandidate = '', lockedAutoSaveNoticeShown = false;
+  function replyIsGenerating() {
+    return !!document.querySelector('button[aria-label*="Stop" i],button[title*="Stop" i],[data-testid*="stop" i]');
+  }
+  function latestExchange() {
+    const messages = adapter.getMessages().map(({ role, text, element }) => ({ role, text: cleanOutgoingText(text ?? readText(element)) }))
+      .filter((message) => message.text && ['user', 'assistant'].includes(message.role));
+    const assistantIndex = messages.length - 1;
+    if (assistantIndex < 1 || messages[assistantIndex].role !== 'assistant') return null;
+    let userIndex = assistantIndex - 1;
+    while (userIndex >= 0 && messages[userIndex].role !== 'user') userIndex--;
+    return userIndex >= 0 ? [messages[userIndex], messages[assistantIndex]] : null;
+  }
+  async function sha256(value) {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+    return [...new Uint8Array(digest)].map((part) => part.toString(16).padStart(2, '0')).join('');
+  }
+  function titleFromExchange(text) {
+    const cleaned = String(text || '').split(/\r?\n/).map((line) => line.trim())
+      .filter((line) => line && !/^\d{1,2}:\d{2}\s?(?:AM|PM)$/i.test(line) && !/^(?:sources?|\w[\w .'-]{2,50}·(?:January|February|March|April|May|June|July|August|September|October|November|December)\b)/i.test(line));
+    const heading = cleaned.find((line) => /^#{1,6}\s+/.test(line));
+    return (heading ? heading.replace(/^#{1,6}\s+/, '') : (cleaned[0] || 'Saved chat').split(/(?<=[.!?])\s/)[0]).slice(0, 160);
+  }
+  async function autoSaveFinishedReply(exchange, fingerprint) {
+    if (attemptedAutoSaveHashes.has(fingerprint) || inflightAutoSaveHashes.has(fingerprint)) return;
+    inflightAutoSaveHashes.add(fingerprint);
+    try {
+      let messages = exchange.map((message) => ({ ...message }));
+      if (messages.some((message) => looksLikeSecret(message.text) || looksLikeLog(message.text))) { attemptedAutoSaveHashes.add(fingerprint); return; }
+      if (config.smartSaveEnabled !== false) {
+        messages = smartSave.prepareSmartSave(messages, { includeAssistant: true }).kept;
+        if (messages.length < 2) { attemptedAutoSaveHashes.add(fingerprint); return; }
+      }
+      const result = await askBackground({ type: 'auto-save-finished-reply', site: SITE, hash: fingerprint, payload: {
+        chatKey: await getChatKey(), title: titleFromExchange(exchange[0].text), source: SITE,
+        messages: messages.map(({ role, text }, index) => ({ id: `${fingerprint}:${index}`, role, text })),
+      } });
+      attemptedAutoSaveHashes.add(fingerprint);
+      if (result?.locked) {
+        if (!lockedAutoSaveNoticeShown) { lockedAutoSaveNoticeShown = true; toast('One Brain is locked. Unlock it before automatic saving can continue.'); }
+        return;
+      }
+      if (!result?.ok || result.duplicate || !(Number(result.inserted) > 0) || !result.importId) return;
+      toastWithUndo('Saved to One Brain', async () => {
+        const undone = await askBackground({ type: 'undo-chat-save', site: SITE, importId: result.importId, hash: fingerprint });
+        return undone?.ok === true;
+      }, { duration: 10_000, successMessage: 'Save undone.' });
+    } catch {
+      attemptedAutoSaveHashes.add(fingerprint);
+    } finally { inflightAutoSaveHashes.delete(fingerprint); }
+  }
+  function scheduleAutoSaveFinishedReply() {
+    if (!config.enabled || config.autoSaveFinishedReplies !== true || replyIsGenerating()) { clearScheduledTimeout(autoReplyTimer); autoReplyTimer = null; autoReplyCandidate = ''; return; }
+    const exchange = latestExchange();
+    if (!exchange) { autoReplyCandidate = ''; return; }
+    const signature = JSON.stringify(exchange.map(({ role, text }) => [role, text]));
+    if (signature === autoReplyCandidate) return;
+    clearScheduledTimeout(autoReplyTimer); autoReplyTimer = null;
+    autoReplyCandidate = signature;
+    autoReplyTimer = scheduleTimeout(() => {
+      autoReplyTimer = null;
+      if (!config.enabled || config.autoSaveFinishedReplies !== true || replyIsGenerating()) { autoReplyCandidate = ''; return; }
+      const latest = latestExchange();
+      if (!latest || JSON.stringify(latest.map(({ role, text }) => [role, text])) !== signature) { autoReplyCandidate = ''; scheduleAutoSaveFinishedReply(); return; }
+      void sha256(signature).then((fingerprint) => autoSaveFinishedReply(latest, fingerprint)).catch(() => {});
+    }, 2000);
+  }
+
   async function loadFullChat(panel, status, cancelState) {
     const progress = panel.querySelector('[data-load-progress]');
     const initial = adapter.getMessages();
     const scroller = adapter.findScrollContainer?.(initial) || null;
-    if (!scroller) { progress.textContent = `${initial.length} messages found. No scrollable history area detected; scroll up manually and try again.`; status.textContent = ''; return; }
+    if (!scroller) { progress.textContent = 'Nothing more to load.'; status.textContent = ''; return; }
     progress.textContent = 'Scrolling through chat history…';
-    const result = await chatLoader.loadFullChat({ scroller, collect: readChatMessages, cancelled: () => cancelState.cancelled, wait: (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(1, ms))), progress: (count) => { progress.textContent = `${count} messages loaded`; } });
+    const result = await chatLoader.loadFullChat({ scroller, collect: readChatMessages, cancelled: () => cancelState.cancelled, wait: (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(1, ms))), maxSteps: SITE === 'perplexity' ? 30 : 300, mode: SITE === 'perplexity' ? 'scroll-to-top-stable' : 'history', stableMs: 1500, progress: (count) => { progress.textContent = `${count} messages loaded`; } });
     loadedChatMessages = result.messages.map(({ element, ...message }) => message);
-    progress.textContent = result.cancelled ? `${result.messages.length} messages loaded · cancelled` : `${result.messages.length} messages loaded`;
+    progress.textContent = result.cancelled ? `${result.messages.length} messages loaded · cancelled` : result.nothingMoreToLoad ? 'Nothing more to load.' : `${result.messages.length} messages loaded`;
     status.textContent = '';
   }
 
@@ -459,6 +573,7 @@
       <footer><button type="button" data-cancel>Cancel</button><button type="button" data-preview-button>Preview</button><button type="button" data-save hidden>Save</button><button type="button" data-only-new hidden>Save only new messages</button></footer></div>`;
     const panel = modal;
     document.body.append(panel);
+    panel.querySelector('[data-save-mode]').value = 'all';
     const source = panel.querySelector('[data-source]');
     for (const value of ['chatgpt', 'claude', 'gemini', 'codex', 'groq', 'deepseek', 'perplexity']) { const option = document.createElement('option'); option.value = value; option.textContent = value; source.append(option); }
     source.value = SITE;
@@ -471,7 +586,8 @@
       const messageStatus = panel.querySelector('[data-message-status]');
       const yours = list.filter((message) => message.role === 'user').length, assistant = list.filter((message) => message.role === 'assistant').length;
       const longChat = (adapter.findScrollContainer?.(adapter.getMessages())?.scrollHeight || 0) > 2500;
-      messageStatus.textContent = list.length ? `${list.length} messages detected: ${yours} yours, ${assistant} assistant${list.length === 1 || (longChat && list.length < 4) ? '. Press Load full chat or scroll to the top first.' : '.'}` : 'No readable chat messages detected. Press Load full chat or scroll to the top first.';
+      const historyHint = adapter.historyComplete ? ' Perplexity exposes the messages currently in this thread.' : ' Press Load full chat or scroll to the top first.';
+      messageStatus.textContent = list.length ? `${list.length} messages detected: ${yours} yours, ${assistant} assistant${list.length === 1 || (longChat && list.length < 4) ? `.${historyHint}` : '.'}` : `No readable chat messages detected.${historyHint}`;
       startsAt.replaceChildren(); picks.replaceChildren();
       list.forEach((message, index) => {
         const hiddenText = looksLikeSecret(message.text) ? '[secret-looking text hidden]' : message.text.split(/\r?\n/, 1)[0].slice(0, 100);
@@ -555,11 +671,11 @@
   }
 
   const menu = document.createElement('button');
-  menu.type = 'button'; menu.className = 'one-brain-extension-ui one-brain-extension-menu'; menu.textContent = 'Save this chat';
-  menu.addEventListener('click', () => { void openChatSaveDialog(); });
+  menu.type = 'button'; menu.className = 'one-brain-extension-ui one-brain-extension-menu'; menu.textContent = 'Save whole chat';
+  menu.addEventListener('click', () => { launcherExpanded = false; launcher.dataset.expanded = 'false'; launcherActions.hidden = true; launcherButton.setAttribute('aria-expanded', 'false'); void openChatSaveDialog(); });
   const removeContext = document.createElement('button');
   removeContext.type = 'button'; removeContext.className = 'one-brain-extension-ui one-brain-remove-context'; removeContext.textContent = 'Remove context';
-  removeContext.addEventListener('click', () => { const editor = adapter.getInputElement(); if (!editor) return; const cleaned = editorTools.stripContextBlocks(editorTools.editorText(editor)); if (cleaned !== editorTools.editorText(editor)) { programmaticInsertUntil = Date.now() + 500; editorTools.replaceEditor(editor, cleaned); lastInsertedBlock = ''; toast('Context removed from this draft.'); } });
+  removeContext.addEventListener('click', () => { launcherExpanded = false; launcher.dataset.expanded = 'false'; launcherActions.hidden = true; launcherButton.setAttribute('aria-expanded', 'false'); const editor = adapter.getInputElement(); if (!editor) return; const cleaned = editorTools.stripContextBlocks(editorTools.editorText(editor)); if (cleaned !== editorTools.editorText(editor)) { programmaticInsertUntil = Date.now() + 500; editorTools.replaceEditor(editor, cleaned); lastInsertedBlock = ''; toast('Context removed from this draft.'); } });
   const chatMemoryToggle = document.createElement('button'); chatMemoryToggle.type = 'button'; chatMemoryToggle.className = 'one-brain-extension-ui one-brain-chat-toggle';
   chatMemoryToggle.addEventListener('click', async () => {
     const previous = chatState.enabled; chatState.enabled = !previous;
@@ -567,9 +683,31 @@
     catch { chatState.enabled = previous; refreshMenuLabels(); toast('Could not update this chat’s memory setting.', true); }
   });
   function refreshMenuLabels() { chatMemoryToggle.textContent = `Memory for this chat: ${chatState.enabled ? 'on' : 'off'}`; }
-  document.documentElement.append(chatMemoryToggle);
-  document.documentElement.append(menu);
-  document.documentElement.append(removeContext);
+  const launcher = document.createElement('aside'); launcher.className = 'one-brain-extension-ui one-brain-extension-launcher'; launcher.dataset.expanded = 'false';
+  launcherActions = document.createElement('div'); launcherActions.className = 'one-brain-launcher-actions'; launcherActions.hidden = true;
+  const launcherButton = document.createElement('button'); launcherButton.type = 'button'; launcherButton.className = 'one-brain-launcher-toggle'; launcherButton.textContent = 'One Brain'; launcherButton.setAttribute('aria-expanded', 'false'); launcherButton.title = 'Open One Brain actions';
+  launcherButton.addEventListener('click', () => { launcherExpanded = !launcherExpanded; launcher.dataset.expanded = String(launcherExpanded); launcherActions.hidden = !launcherExpanded; launcherButton.setAttribute('aria-expanded', String(launcherExpanded)); positionLauncher(); });
+  const addMemoryButton = createButton('Add memory', () => { launcherExpanded = false; launcher.dataset.expanded = 'false'; launcherActions.hidden = true; launcherButton.setAttribute('aria-expanded', 'false'); void openSuggestions('manual'); }, 'one-brain-manual-context');
+  smartSaveToggle = document.createElement('input'); smartSaveToggle.type = 'checkbox'; smartSaveToggle.checked = config.smartSaveEnabled !== false;
+  const smartSaveLabel = document.createElement('label'); smartSaveLabel.className = 'one-brain-smart-save-toggle'; smartSaveLabel.append(smartSaveToggle, document.createTextNode('Smart save filter (important only)'));
+  smartSaveToggle.addEventListener('change', async () => {
+    const previous = config.smartSaveEnabled !== false;
+    const next = smartSaveToggle.checked;
+    config.smartSaveEnabled = next;
+    const result = await askBackground({ type: 'set-site-settings', site: SITE, settings: { ...config, smartSaveEnabled: next } }).catch(() => null);
+    if (!result?.ok) { config.smartSaveEnabled = previous; smartSaveToggle.checked = previous; toast('Could not update this site’s Smart save setting.', true); }
+  });
+  launcherActions.append(menu, addMemoryButton, smartSaveLabel, chatMemoryToggle, removeContext);
+  launcher.append(launcherActions, launcherButton);
+  document.documentElement.append(launcher);
+  function positionLauncher() { floatingLayout.positionAboveComposer(launcher, adapter.getInputElement(), window.innerHeight, 12, window.innerWidth); launcher.style.right = '16px'; }
+  window.addEventListener('resize', positionLauncher, { signal: eventController.signal });
+  window.addEventListener('scroll', positionLauncher, { capture: true, signal: eventController.signal });
+  let composerResizeObserver = null;
+  if (typeof ResizeObserver === 'function') { composerResizeObserver = new ResizeObserver(positionLauncher); const composer = adapter.getInputElement(); if (composer) composerResizeObserver.observe(composer); }
+  const originalAdapterCleanup = adapterCleanup;
+  adapterCleanup = () => { originalAdapterCleanup?.(); composerResizeObserver?.disconnect(); };
+  positionLauncher();
   document.addEventListener('keydown', sendIntent, { capture: true, signal: eventController.signal });
   document.addEventListener('click', sendIntent, { capture: true, signal: eventController.signal });
   document.addEventListener('input', scheduleIntentSearch, { capture: true, signal: eventController.signal });
@@ -577,7 +715,7 @@
 
   runtimeMessageListener = (message, _sender, sendResponse) => {
     if (message?.type === 'adapter-self-check') { sendResponse({ site: SITE, matched: adapter.selfCheck() }); return false; }
-    if (message?.type === 'settings-changed' && message.site === SITE) { config = { ...DEFAULTS, ...message.settings }; refreshButtons(); }
+    if (message?.type === 'settings-changed' && message.site === SITE) { config = { ...DEFAULTS, ...message.settings }; refreshButtons(); scheduleAutoSaveFinishedReply(); }
     return false;
   };
   API.runtime.onMessage.addListener(runtimeMessageListener);
@@ -586,13 +724,14 @@
     if (area !== 'local' || !changes.oneBrainSettings) return;
     config = { ...DEFAULTS, ...(changes.oneBrainSettings.newValue?.[SITE] || {}) };
     refreshButtons();
+    scheduleAutoSaveFinishedReply();
   };
   API.storage.onChanged.addListener(storageChangedListener);
 
   void loadConfig();
   void loadChatState();
-  const cleanupContentObserver = adapter.observe(() => { if (stopped) return; refreshButtons(); confirmSentMessages(); void syncChatRoute(); });
-  const cleanupLayoutObserver = adapter.observe(() => { checkAdapterLayout(); });
-  adapterCleanup = () => { cleanupContentObserver?.(); cleanupLayoutObserver?.(); };
+  const cleanupContentObserver = adapter.observe(() => { if (stopped) return; refreshButtons(); confirmSentMessages(); scheduleAutoSaveFinishedReply(); void syncChatRoute(); });
+  const cleanupLayoutObserver = adapter.observe(() => { checkAdapterLayout(); positionLauncher(); });
+  adapterCleanup = () => { cleanupContentObserver?.(); cleanupLayoutObserver?.(); composerResizeObserver?.disconnect(); };
   checkAdapterLayout();
 })();

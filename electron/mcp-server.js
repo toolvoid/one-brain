@@ -14,7 +14,7 @@ const { listMemories } = require('./db');
 const lockController = require('./lock-controller');
 const { appError } = require('./error-codes');
 
-const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek'];
+const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek', 'perplexity', 'built-in'];
 const MAX_BODY_BYTES = 1024 * 1024;
 const mcpSessions = new Map();
 
@@ -126,7 +126,7 @@ function createMcpServer(identity, dependencies = {}) {
   }, (args, profile) => tools.save_memory(args, profile));
 
   registerTrackedTool('list_sources', {
-    description: 'List the six AI memory sources with their memory counts.',
+    description: 'List the available AI memory sources with their memory counts.',
     inputSchema: {}
   }, async (_args, profile) => {
     const counts = countBySourceForClient(profile);

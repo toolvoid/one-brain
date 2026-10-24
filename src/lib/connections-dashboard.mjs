@@ -11,20 +11,31 @@ export const CONNECTION_DEFINITIONS = [
 ];
 
 export const CONNECTION_GROUP_DEFINITIONS = Object.freeze([
-  { id: 'direct-mcp', title: 'Direct (MCP) apps', description: 'Detected from supported app config files on this computer. Connect One Brain, fix a bridge, or test the connection.' },
-  { id: 'web-extension', title: 'Web chatbots (browser extension)', description: 'Pair supported chat sites with the extension, then check its build and adapter health.' },
-  { id: 'built-in', title: 'Built-in chatbots', description: 'One Brain chat will be available here in a future release.', comingSoon: true }
+  { id: 'apps-tools', title: 'Apps and tools (MCP / proxy)', description: 'Desktop and CLI apps connect through MCP; API tools use the local memory proxy.' },
+  { id: 'browser-extension', title: 'Browser AIs (extension)', description: 'Supported browser chat pages connect through the One Brain extension.' },
+  { id: 'built-in', title: 'Built-in chat (inside One Brain)', description: 'Uses the existing Chat view and locally saved provider keys.' }
 ]);
 
-const DIRECT_CONNECTION_IDS = new Set(['codex', 'claude-code', 'claude-desktop', 'vscode', 'gemini']);
+const APP_TOOL_IDS = new Set(['codex', 'claude-code', 'claude-desktop', 'vscode', 'gemini', 'quick-context', 'provider:groq', 'provider:deepseek']);
 const WEB_CONNECTION_SITES = new Set(['claude', 'chatgpt', 'gemini', 'deepseek', 'groq', 'perplexity']);
 
-export function groupConnectionRows(rows = []) {
+export function builtInChatStatus(providerSettings = {}) {
+  const statuses = providerSettings.providerKeyStatus || {};
+  const savedProviders = Object.entries(statuses).filter(([, hasKey]) => hasKey).map(([provider]) => provider);
+  let provider = 'openai';
+  try { provider = globalThis.localStorage?.getItem('onebrain-chat-provider') || provider; } catch {}
+  let model = '';
+  try { model = globalThis.localStorage?.getItem(`onebrain-chat-model:${provider}`) || ''; } catch {}
+  return { providers: savedProviders, hasKey: Boolean(statuses[provider]), provider, model };
+}
+
+export function groupConnectionRows(rows = [], chatStatus = null) {
   return CONNECTION_GROUP_DEFINITIONS.map((group) => ({
     ...group,
-    rows: group.id === 'direct-mcp'
-      ? rows.filter((row) => DIRECT_CONNECTION_IDS.has(row.id))
-      : group.id === 'web-extension'
+    ...(group.id === 'built-in' ? { chatStatus } : {}),
+    rows: group.id === 'apps-tools'
+      ? rows.filter((row) => APP_TOOL_IDS.has(row.id))
+      : group.id === 'browser-extension'
         ? rows.filter((row) => WEB_CONNECTION_SITES.has(row.site))
         : []
   }));

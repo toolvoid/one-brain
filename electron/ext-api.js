@@ -351,7 +351,7 @@ function createExtApi(options) {
       const title = String(body.title || `Saved from ${site}`).trim().slice(0, 200) || `Saved from ${site}`;
       const cleanText = contextBlocks.stripContextBlocks(body.text).trim();
       const scored = smartSave.scoreMessage(cleanText);
-      if (!cleanText || looksSecret(cleanText) || scored.reason === 'filtered') return sendJson(res, 400, { error: 'This text cannot be saved.' }, origin);
+      if (!cleanText || looksSecret(cleanText) || scored.reason === 'filtered' || (scored.reason === 'low importance' && body.skipSmartFilter !== true)) return sendJson(res, 400, { error: 'This text cannot be saved.' }, origin);
       const memory = addMemory({ source: site, title, content: cleanText }, { handAdded: true });
       if (memory?.id != null) emitAdded(memory.id);
       log(identity.client, { ok: true, count: memory?.id == null ? 0 : 1, latency: now() - started }, memory?.id == null ? [] : [memory.id], 'save');

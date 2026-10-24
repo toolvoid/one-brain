@@ -31,6 +31,35 @@ test('cancel stops further collection and still restores original scroll positio
   assert.equal(result.cancelled, true); assert.equal(collected, 2); assert.equal(scroller.scrollTop, 420);
 });
 
+test('Perplexity history scrolls to the top, waits for a stable message count, and restores position', async () => {
+  const all = Array.from({ length: 8 }, (_value, index) => ({ id: `turn-${index}`, role: index % 2 ? 'assistant' : 'user', text: `Synthetic message ${index}` }));
+  let top = 600, waited = 0;
+  const scroller = { clientHeight: 200, scrollHeight: 1000, get scrollTop() { return top; }, set scrollTop(value) { top = value; } };
+  const collect = () => top <= 0 ? all : all.slice(4);
+  const result = await loader.loadFullChat({ scroller, collect, mode: 'scroll-to-top-stable', stableMs: 1500, maxSteps: 30, wait: async (ms) => { waited += ms; } });
+  assert.equal(result.scrollableFound, true);
+  assert.equal(result.messages.length, 8);
+  assert.ok(result.steps <= 30);
+  assert.ok(waited >= 1500);
+  assert.equal(scroller.scrollTop, 600);
+  assert.equal(result.nothingMoreToLoad, false);
+});
+
+test('Perplexity load-full reports no scrollable history as nothing more to load', async () => {
+  const result = await loader.loadFullChat({ scroller: { clientHeight: 300, scrollHeight: 300, scrollTop: 0 }, collect: () => [{ id: 'one', role: 'user', text: 'Synthetic message' }], mode: 'scroll-to-top-stable', wait: async () => {} });
+  assert.equal(result.nothingMoreToLoad, true);
+  assert.equal(result.steps, 0);
+});
+
+test('Perplexity load-full honors Cancel while scrolling', async () => {
+  let top = 500, waits = 0;
+  const scroller = { clientHeight: 200, scrollHeight: 1200, get scrollTop() { return top; }, set scrollTop(value) { top = value; } };
+  const result = await loader.loadFullChat({ scroller, collect: () => [{ id: `at-${top}`, role: 'user', text: `Synthetic at ${top}` }], mode: 'scroll-to-top-stable', maxSteps: 30, cancelled: () => waits >= 2, wait: async () => { waits++; } });
+  assert.equal(result.cancelled, true);
+  assert.equal(scroller.scrollTop, 500);
+  assert.ok(result.steps < 30);
+});
+
 test('fallback ids use role, first 200 characters and occurrence, without collapsing repeated turns', () => {
   const rows = loader.normalize([{ role: 'user', text: 'same' }, { role: 'user', text: 'same' }, { role: 'assistant', text: 'same' }]);
   assert.equal(new Set(rows.map((row) => row.id)).size, 3);

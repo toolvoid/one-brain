@@ -2,6 +2,9 @@ process.umask(0o077);
 const { enforcePrivateTree, cleanupSensitiveTemps } = require('./private-files');
 const { app, powerMonitor } = require('electron');
 const path = require('path');
+const appIconPath = app.isPackaged
+  ? path.join(process.resourcesPath, 'one-brain', 'icon.png')
+  : path.join(__dirname, '..', 'build', 'icon.png');
 const os = require('node:os');
 const { createPerformanceMetrics } = require('./performance-metrics');
 const { processDisplayName } = require('./process-display-name');
@@ -9,6 +12,7 @@ const { parseEvaluationCsv } = require('./evaluation-tool');
 const fs = require('node:fs');
 const { createLifecycleLog, instrumentAppExitCalls } = require('./lifecycle-log');
 const { appError, getErrorCodes, inferredCode } = require('./error-codes');
+const { scoreMessage: scoreSmartSaveMessage } = require('../extension/src/smart-save');
 const { createPasswordLockout } = require('./password-lockout');
 const userDataRoot = app.getPath('userData');
 const userDataPermissionFix = enforcePrivateTree(userDataRoot);
@@ -85,7 +89,6 @@ function initializeReadyElectronApis() {
 ipcMain.handle('lifecycle:tail', () => lifecycleLog.tail(50));
 ipcMain.on('errors:normalize', (event, code, details) => { event.returnValue = appError(code, details); });
 ipcMain.on('errors:list', (event) => { event.returnValue = getErrorCodes(); });
-const PROVIDER_SOURCES = require('../src/lib/provider-sources.json');
 const { initializeDatabase, getDatabaseStatus, getRuntimeDatabaseStats, setPerformanceRecorder, getInsights, resetRetrievalCounts, recordMemoryViews, runAnalyticsSql, listEvaluationCases, addEvaluationCase, updateEvaluationCase, deleteEvaluationCase, listRecentEvaluationQueries, getEvaluationHistory, updateEvaluationNote, runRetrievalEvaluation, getEvaluationRunResults, saveEvaluationDataset, listEvaluationDatasets, runEvaluationDataset, listEvaluationRunSummaries, storeClientTokenHash, revokeClientToken, listClientTokenStates, authenticateClientToken, getClientTokenState, getProxyClientProfile, getMcpClientProfile, getChatGrant, saveChatGrant, listChats, createChat, updateChat, appendChatMessage, deleteChat, searchMemoriesForClient, getMemoryForClient, getMemoryEmbeddingVector, getMemory, recordProxyEvent, getPendingMemories, addPendingMemory, setPendingMemorySource, approvePendingMemory, rejectPendingMemory, listRecentImports, listClients, removeLegacyClient, approveClient, updateClientGrant, updateClientProfile, setMemoryPrivate, setMemoryNoSuggest, setMemorySource, addMemory, createImport, getExtensionChatSave, undoExtensionChatSave, importMemories, finishImport, getLegacyCleanupStatus, getConnectionHealthState, setConnectionHealthState, cleanupLegacyJunk, deleteMemory, deleteConversationParts, countConversationParts, listMemories, searchMemories, configureEmbeddingProvider, countBySource, listLinks, createLink, deleteLink, listSuggestions, acceptSuggestion, joinAllSuggestions, rejectSuggestion, listRejected, restoreRejected, dismissSuggestions } = require('./db');
 setPerformanceRecorder((name, duration) => performanceMetrics.record(name, duration));
 const { startMcpServer } = require('./mcp-server');
@@ -345,7 +348,7 @@ function persistQuickContextSettings(settings) {
 function createQuickContextWindow() {
   if (quickContextWindow && !quickContextWindow.isDestroyed()) { quickContextWindow.show(); quickContextWindow.focus(); return; }
   quickContextWindow = new BrowserWindow({ width: 470, height: 570, minWidth: 390, minHeight: 420, alwaysOnTop: true, skipTaskbar: true,
-    title: 'Quick context', autoHideMenuBar: true,
+    title: 'One Brain — Quick context', icon: appIconPath, autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true } });
   attachWindowLifecycle(quickContextWindow, 'quick-context');
   quickContextWindow.loadFile(path.join(__dirname, 'quick-context.html'));
@@ -742,8 +745,14 @@ ipcMain.handle('chat:preview-memory', async (_event, chatId, text) => {
   const messages = [...chat.messages.filter((item) => item.role === 'user' || item.role === 'assistant').map(({ role, content }) => ({ role, content })), { role: 'user', content: String(text || '').slice(0, 20_000) }];
   return memoryProxy.previewChatMemories(chat.provider, messages, profile);
 });
-ipcMain.handle('chat:save-memory', (_event, source, title, content) => {
-  const memory = addMemory({ source, title, content }, { handAdded: true });
+ipcMain.handle('chat:save-memory', (_event, _source, title, content) => {
+  const keepLines = String(content || '').replace(/\r\n?/g, '\n').split(/\n+|(?<=[.!?])\s+/)
+    .map((line) => scoreSmartSaveMessage(line, { importance: 'Normal' }))
+    .filter((result) => result.keep)
+    .map((result) => result.text);
+  const durableContent = keepLines.join(' ').slice(0, 1200);
+  if (!durableContent) throw new Error('This message did not contain a clear decision, fact, or preference to save.');
+  const memory = addMemory({ source: 'built-in', title, content: durableContent }, { handAdded: true });
   for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send('brain:changed', { type: 'add', id: memory.id });
   return memory;
 });
@@ -763,7 +772,7 @@ ipcMain.handle('chat:send', async (event, payload) => {
     const result = await memoryProxy.chatCompletion({ provider: chat.provider, model, messages, useMemory,
       profile, signal: controller.signal, suggestMemories, chatId: chat.id,
       approvedMemories: Array.isArray(payload.approvedMemories) ? payload.approvedMemories.slice(0, 10) : [],
-      saveBackSource: chat.memory_source || PROVIDER_SOURCES[chat.provider] || null,
+      saveBackSource: 'built-in',
       onChunk: (chunk) => { if (!event.sender.isDestroyed()) event.sender.send('chat:chunk', { requestId, chunk }); } });
     appendChatMessage({ chat_id: chatId, role: 'assistant', content: result.answer, model, memory_ids: result.memoryIds });
     return { ...result, chat: listChats().find((item) => item.id === Number(chatId)) };
@@ -795,6 +804,8 @@ function createWindow() {
     height: 800,
     minWidth: 900,
     minHeight: 600,
+    title: 'One Brain',
+    icon: appIconPath,
     backgroundColor: '#101214',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),

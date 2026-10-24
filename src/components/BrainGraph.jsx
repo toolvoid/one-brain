@@ -12,14 +12,14 @@ import { safeCreateWebGLRenderer } from '../lib/graph-renderer.mjs';
 import { graphFrameIntervalMs, shouldKeepGraphAnimating, shouldRenderGraphLabels, shouldUpdateLineBuffers, shouldUpdateNodeBuffers } from '../lib/graph-animation.mjs';
 import { isSoftwareRenderer, PERFORMANCE_MODE_EVENT, PERFORMANCE_NODE_LIMIT, readManualPerformanceMode, selectPerformanceNodes } from '../lib/graph-performance.mjs';
 
-const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek', 'perplexity'];
+const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek', 'perplexity', 'built-in'];
 const COLORS = {
   chatgpt: '#42d6c2', claude: '#f29a60', codex: '#70a9ff',
-  gemini: '#b18cff', groq: '#f2d66d', deepseek: '#ff7095', perplexity: '#35c9f0'
+  gemini: '#b18cff', groq: '#f2d66d', deepseek: '#ff7095', perplexity: '#35c9f0', 'built-in': '#d995ff'
 };
 const ANCHORS = {
   chatgpt: [12, 0, 0], claude: [0, 12, 0], codex: [0, 0, 12],
-  gemini: [-12, 0, 0], groq: [0, -12, 0], deepseek: [0, 0, -12], perplexity: [9, 9, 9]
+  gemini: [-12, 0, 0], groq: [0, -12, 0], deepseek: [0, 0, -12], perplexity: [9, 9, 9], 'built-in': [-9, 9, 9]
 };
 const HUB = new THREE.Vector3(0, 0, 0);
 const LINK_LINE_DRAW_DURATION = 900;
@@ -987,7 +987,7 @@ const BrainGraph = forwardRef(function BrainGraph({ memories = [], links = [], a
       .brain-performance-count { position:absolute;z-index:5;left:14px;top:14px;padding:5px 8px;border:1px solid rgba(240,191,99,.28);border-radius:6px;color:#f0bf63;background:rgba(11,16,32,.9);font:10px/1.2 system-ui,sans-serif; }
       .brain-fit-button { position:absolute;z-index:5;right:18px;bottom:18px;padding:7px 12px;border:1px solid rgba(190,210,238,.24);border-radius:7px;color:#dce8f8;background:rgba(12,19,32,.86);font:11px/1 system-ui,sans-serif;cursor:pointer; }
       .brain-fit-button:hover { background:rgba(35,48,68,.96); }
-      .brain-links-control { position:absolute;z-index:6;right:18px;top:18px;font:12px/1.4 system-ui,sans-serif; }
+      .brain-links-control { position:absolute;z-index:6;right:18px;top:66px;font:12px/1.4 system-ui,sans-serif; }
       .brain-links-button { padding:7px 11px;border:1px solid rgba(190,210,238,.24);border-radius:7px;color:#dce8f8;background:rgba(11,16,32,.94);font:inherit;cursor:pointer; }
       .brain-links-popover { position:absolute;top:calc(100% + 6px);right:0;width:250px;padding:11px;border:1px solid rgba(190,210,238,.25);border-radius:9px;color:#e5e7eb;background:#111827; }
       .brain-links-popover[hidden] { display:none; }

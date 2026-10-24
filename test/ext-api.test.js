@@ -293,7 +293,7 @@ test('save forces the source from the paired site and search excludes private re
   assert.doesNotMatch(JSON.stringify(result), /OB_PRIVATE_MARKER_EXTENSION/);
   assert.equal(typeof result.memories[0].score, 'number');
   assert.deepEqual(h.retrieved, [1]);
-  response = await h.request('/ext/save', { method: 'POST', token, body: { site: 'chatgpt', source: 'gemini', title: 'Synthetic save', text: 'Synthetic fixture saved body longer than forty characters.', kind: 'message' } });
+  response = await h.request('/ext/save', { method: 'POST', token, body: { site: 'chatgpt', source: 'gemini', title: 'Synthetic save', text: 'I decided to keep this synthetic project setting for later memory searches.', kind: 'message' } });
   result = await response.json();
   assert.equal(result.source, 'chatgpt');
   assert.equal(h.memories.at(-1).source, 'chatgpt');
@@ -305,7 +305,7 @@ test('save forces the source from the paired site and search excludes private re
 test('Perplexity extension token forces saved memories to the perplexity source', async (t) => {
   const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
   const token = await h.pair('perplexity');
-  const response = await h.request('/ext/save', { method: 'POST', site: 'perplexity', token, body: { site: 'perplexity', source: 'claude', title: 'Synthetic Perplexity save', text: 'Perplexity synthetic memory has enough useful text to pass the save filter.', kind: 'message' } });
+  const response = await h.request('/ext/save', { method: 'POST', site: 'perplexity', token, body: { site: 'perplexity', source: 'claude', title: 'Synthetic Perplexity save', text: 'I prefer keeping this synthetic Perplexity memory in my local project setup.', kind: 'message' } });
   const result = await response.json();
   assert.equal(response.status, 200);
   assert.equal(result.source, 'perplexity');
@@ -419,4 +419,21 @@ test('chat save filters synthetic messages, offers only-new, deduplicates, and u
   assert.equal(h.memories.some((item) => item.importId === importId), false);
   assert.ok(h.events.every((event) => event.query === ''));
   assert.ok(h.events.every((event) => !JSON.stringify(event).includes('synthetic-secret')));
+});
+
+test('Perplexity chat saves are source-pinned and repeated saves hit the duplicate guard', async (t) => {
+  const h = await harness(); t.after(() => { h.server.close(); fs.rmSync(h.directory, { recursive: true, force: true }); });
+  const token = await h.pair('perplexity');
+  const body = {
+    site: 'perplexity', chatKey: 'a'.repeat(64), source: 'claude', title: 'Synthetic Perplexity chat',
+    include: 'my-messages', split: 'one', messages: [{ id: 'prompt', role: 'user', text: 'I decided to use a local memory store for this synthetic Perplexity test.' }],
+    options: { skipLogs: true, skipSecrets: true }
+  };
+  let response = await h.request('/ext/save-chat', { method: 'POST', site: 'perplexity', token, body });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).source, 'perplexity');
+  assert.equal(h.memories.at(-1).source, 'perplexity');
+  response = await h.request('/ext/save-chat', { method: 'POST', site: 'perplexity', token, body });
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).code, 'chat_already_saved');
 });

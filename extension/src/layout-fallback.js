@@ -4,7 +4,7 @@
     let manual = false, notified = false;
     return Object.freeze({
       check(available) {
-        if (available) return true;
+        if (available) { manual = false; notified = false; return true; }
         manual = true;
         if (!notified) { notified = true; onUnavailable(); }
         return false;

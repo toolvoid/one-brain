@@ -24,18 +24,19 @@ test('dashboard has every requested connection row and maps states without claim
   assert.equal(rows.find((row) => row.id === 'quick-context').work['Auto-insert'].supported, false);
 });
 
-test('connection grouping exposes only the supported direct and web lists plus one inert built-in card', () => {
+test('connection grouping exposes apps and tools, browser AIs, and the existing built-in chat card', () => {
   const rows = buildConnectionRows({
     mcp: ['codex', 'claude-code', 'claude-desktop', 'vscode', 'gemini'].map((id) => ({ id, status: 'found', tokenStatus: 'none' })),
     extensions: ['claude', 'chatgpt', 'gemini', 'deepseek', 'groq', 'perplexity'].map((site) => ({ site, paired: false }))
   });
   const groups = groupConnectionRows(rows);
-  assert.deepEqual(groups.map(({ title }) => title), ['Direct (MCP) apps', 'Web chatbots (browser extension)', 'Built-in chatbots']);
-  assert.deepEqual(groups[0].rows.map((row) => row.name).sort(), ['Claude Code', 'Claude Desktop', 'Codex', 'Gemini CLI', 'VS Code Copilot'].sort());
+  assert.deepEqual(groups.map(({ title }) => title), ['Apps and tools (MCP / proxy)', 'Browser AIs (extension)', 'Built-in chat (inside One Brain)']);
+  assert.deepEqual(groups[0].rows.map((row) => row.name).sort(), ['Claude Code', 'Claude Desktop', 'Codex', 'Gemini CLI', 'VS Code Copilot', 'ChatGPT desktop', 'Groq API', 'DeepSeek API'].sort());
   assert.deepEqual(groups[1].rows.map((row) => row.name).sort(), ['Claude web', 'ChatGPT web', 'Gemini web', 'DeepSeek web', 'Groq playground', 'Perplexity web'].sort());
-  assert.equal(groups[2].comingSoon, true);
+  assert.equal(groups[2].chatStatus, null);
   assert.deepEqual(groups[2].rows, []);
-  assert.match(groups[2].description, /future release/);
+  assert.match(groups[2].description, /existing Chat view/);
+  assert.ok(groups.every((group) => group.description.trim().length > 0 && !group.description.includes('\n')));
   assert.equal(groups.flatMap((group) => group.rows).some((row) => row.name === 'Grok'), false);
 });
 

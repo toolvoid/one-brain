@@ -1,0 +1,64 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: windows-latest
+            platform: win
+          - os: macos-latest
+            platform: mac
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build:extension:store
+      - run: npm run build
+      - name: Build Linux AppImage
+        if: matrix.platform == 'linux'
+        run: npx electron-builder --linux AppImage --x64 --publish never
+      - name: Build Windows installer
+        if: matrix.platform == 'win'
+        run: npx electron-builder --win nsis --x64 --publish never
+      - name: Build macOS x64 and arm64 disk images
+        if: matrix.platform == 'mac'
+        run: |
+          npx electron-builder --mac dmg --x64 --publish never
+          npx electron-builder --mac dmg --arm64 --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: One-Brain-${{ matrix.platform }}
+          path: release/One-Brain-*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: One-Brain-*
+          path: release
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/One-Brain-*
+          generate_release_notes: true

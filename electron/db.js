@@ -17,7 +17,7 @@ const { passesRelevanceGate } = require('./relevance-gate');
 const { buildFtsQuery } = require('./fts-query');
 const { collapseDocumentParts, documentTitle, matchesDocumentTitle, normalizedDocumentTitle } = require('./document-results');
 const { createQueryEmbeddingCache } = require('./query-embedding-cache');
-const MEMORY_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek', 'perplexity'];
+const MEMORY_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek', 'perplexity', 'built-in'];
 
 let database;
 let databaseKey = null;

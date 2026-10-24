@@ -16,6 +16,7 @@ test('Chrome manifest key and extension ID remain stable across builds', (t) => 
 
   const first = build('chrome', { root });
   const firstManifest = JSON.parse(fs.readFileSync(path.join(first.directory, 'manifest.json'), 'utf8'));
+  assert.equal(firstManifest.version, '1.4.6');
   assert.deepEqual(firstManifest.permissions, ['storage']);
   assert.ok(firstManifest.host_permissions.includes('https://chat.deepseek.com/*'));
   assert.ok(firstManifest.host_permissions.includes('https://console.groq.com/playground*'));

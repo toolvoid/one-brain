@@ -1,15 +1,21 @@
 'use strict';
 
+if (!globalThis.OneBrainAutoSaveGuard && typeof importScripts === 'function') {
+  try { importScripts('auto-save-guard.js'); } catch {}
+}
+
 const ONE_BRAIN_API_DEFAULT = 'http://127.0.0.1:3738';
 const ONE_BRAIN_SITES = ['chatgpt', 'claude', 'gemini', 'deepseek', 'groq', 'perplexity'];
 const ONE_BRAIN_MIN_API_VERSION = '1.1.0';
-const ONE_BRAIN_BUILD_ID = '1.4.0-loopguard';
-const CONTENT_SCRIPT_VERSION = '1.4.0';
+const ONE_BRAIN_BUILD_ID = '1.4.6-loopguard';
+const CONTENT_SCRIPT_VERSION = '1.4.6';
 const statusCache = new Map(), statusInflight = new Map();
 const searchRequests = new Map();
 let healthPollStarted = false, healthPollDelay = 15_000, healthPollTimer = null;
 const ONE_BRAIN_DEFAULT_PHRASES = ['remember', 'do you remember', 'last time', 'earlier', 'previously', 'about me', 'my memory', 'one brain', 'yaad', 'yaad hai', 'pichli baar', 'pehle', 'mere baare mein', 'meri memory', 'maine bataya tha', 'mera project', 'mera naam'];
 const extensionApi = globalThis.browser || globalThis.chrome;
+const autoSaveGuardApi = globalThis.OneBrainAutoSaveGuard;
+const autoSaveGuards = new Map(), autoSaveGuardLoads = new Map();
 
 function versionAtLeast(value, minimum) {
   const a = String(value || '').split('.').map((part) => Number(part) || 0), b = String(minimum || '').split('.').map((part) => Number(part) || 0);
@@ -46,7 +52,19 @@ async function extensionRequest(path, { token, method = 'GET', body, endpoint, t
 
 async function settingsFor(site) {
   const all = await storageGet('oneBrainSettings') || {};
-  return { enabled: true, showButtons: true, suggestOnSend: false, autoSaveMessages: false, memoryMode: 'off', memoryPhrases: ONE_BRAIN_DEFAULT_PHRASES, insertWithoutAsking: false, tokenBudget: 1500, contextFormat: 'context', ...(all[site] || {}) };
+  return { enabled: true, showButtons: true, suggestOnSend: false, autoSaveMessages: false, smartSaveEnabled: true, autoSaveFinishedReplies: autoSaveGuardApi?.DEFAULT_AUTO_SAVE_FINISHED_REPLIES === true, memoryMode: 'off', memoryPhrases: ONE_BRAIN_DEFAULT_PHRASES, insertWithoutAsking: false, tokenBudget: 1500, contextFormat: 'context', ...(all[site] || {}) };
+}
+
+async function autoSaveGuardFor(site) {
+  if (autoSaveGuards.has(site)) return autoSaveGuards.get(site);
+  if (!autoSaveGuardLoads.has(site)) autoSaveGuardLoads.set(site, (async () => {
+    const stored = await storageGet('oneBrainAutoSavedReplyHashes') || {};
+    const persist = async (_hash, values) => { const latest = await storageGet('oneBrainAutoSavedReplyHashes') || {}; latest[site] = values.slice(-1000); await storageSet({ oneBrainAutoSavedReplyHashes: latest }); };
+    const guard = autoSaveGuardApi.createDuplicateGuard(stored[site] || [], persist, persist);
+    autoSaveGuards.set(site, guard);
+    return guard;
+  })());
+  try { return await autoSaveGuardLoads.get(site); } finally { autoSaveGuardLoads.delete(site); }
 }
 
 async function statusFor(site) {
@@ -115,7 +133,8 @@ extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
     if (message?.type === 'set-site-settings' && ONE_BRAIN_SITES.includes(message.site)) {
       const all = await storageGet('oneBrainSettings') || {};
-      all[message.site] = { ...await settingsFor(message.site), ...(message.settings || {}), enabled: Boolean(message.settings?.enabled), showButtons: Boolean(message.settings?.showButtons), memoryMode: ['off', 'ask', 'auto'].includes(message.settings?.memoryMode) ? message.settings.memoryMode : 'off', memoryPhrases: Array.isArray(message.settings?.memoryPhrases) ? message.settings.memoryPhrases.map((item) => String(item).trim().slice(0, 60)).filter(Boolean).slice(0, 60) : ONE_BRAIN_DEFAULT_PHRASES, insertWithoutAsking: Boolean(message.settings?.insertWithoutAsking), tokenBudget: Math.max(100, Math.min(1500, Number(message.settings?.tokenBudget) || 1500)), contextFormat: message.settings?.contextFormat === 'bullet' ? 'bullet' : 'context' };
+      const current = await settingsFor(message.site);
+      all[message.site] = { ...current, ...(message.settings || {}), enabled: Boolean(message.settings?.enabled), showButtons: Boolean(message.settings?.showButtons), smartSaveEnabled: typeof message.settings?.smartSaveEnabled === 'boolean' ? message.settings.smartSaveEnabled : current.smartSaveEnabled, autoSaveFinishedReplies: typeof message.settings?.autoSaveFinishedReplies === 'boolean' ? message.settings.autoSaveFinishedReplies : current.autoSaveFinishedReplies, memoryMode: ['off', 'ask', 'auto'].includes(message.settings?.memoryMode) ? message.settings.memoryMode : 'off', memoryPhrases: Array.isArray(message.settings?.memoryPhrases) ? message.settings.memoryPhrases.map((item) => String(item).trim().slice(0, 60)).filter(Boolean).slice(0, 60) : ONE_BRAIN_DEFAULT_PHRASES, insertWithoutAsking: Boolean(message.settings?.insertWithoutAsking), tokenBudget: Math.max(100, Math.min(1500, Number(message.settings?.tokenBudget) || 1500)), contextFormat: message.settings?.contextFormat === 'bullet' ? 'bullet' : 'context' };
       await storageSet({ oneBrainSettings: all });
       return { ok: true };
     }
@@ -148,7 +167,7 @@ extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       const path = message.kind === 'chat' ? '/ext/save-chat' : '/ext/save';
       const body = message.kind === 'chat'
         ? { site: message.site, title: message.title, messages: message.messages || [], includeAssistant: false }
-        : { site: message.site, title: message.title, text: String(message.text || ''), kind: 'message' };
+        : { site: message.site, title: message.title, text: String(message.text || ''), kind: 'message', skipSmartFilter: message.skipSmartFilter === true };
       return { ok: true, ...(await extensionRequest(path, { method: 'POST', token: tokens[message.site], body })) };
     }
     if (message?.type === 'search-memories' && ONE_BRAIN_SITES.includes(message.site)) {
@@ -186,7 +205,19 @@ extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === 'undo-chat-save' && ONE_BRAIN_SITES.includes(message.site)) {
       const tokens = await storageGet('oneBrainTokens') || {};
       if (!tokens[message.site]) throw new Error('Pair this site with One Brain first.');
-      return { ok: true, ...(await extensionRequest('/ext/undo-chat', { method: 'POST', token: tokens[message.site], body: { importId: Number(message.importId) } })) };
+      const result = await extensionRequest('/ext/undo-chat', { method: 'POST', token: tokens[message.site], body: { importId: Number(message.importId) } });
+      if (message.hash && /^[a-f\d]{64}$/i.test(String(message.hash))) await (await autoSaveGuardFor(message.site)).forget(message.hash);
+      return { ok: true, ...result };
+    }
+    if (message?.type === 'auto-save-finished-reply' && ONE_BRAIN_SITES.includes(message.site)) {
+      const settings = await settingsFor(message.site);
+      if (!settings.autoSaveFinishedReplies) return { ok: false, disabled: true };
+      const tokens = await storageGet('oneBrainTokens') || {};
+      if (!tokens[message.site]) return { ok: false, error: 'Pair this site with One Brain first.' };
+      if (!/^[a-f\d]{64}$/i.test(String(message.hash || ''))) return { ok: false, error: 'Invalid auto-save fingerprint.' };
+      const payload = { ...(message.payload || {}), site: message.site, source: message.site, include: 'both', split: 'exchange', onlyNew: true, options: { skipLogs: true, skipSecrets: true, markPrivate: true } };
+      const guard = await autoSaveGuardFor(message.site);
+      return guard.run(message.hash, async () => ({ ok: true, ...(await extensionRequest('/ext/save-chat', { method: 'POST', token: tokens[message.site], body: payload, timeoutMs: 60000 })) }));
     }
     if (message?.type === 'auto-save-sent-message' && ONE_BRAIN_SITES.includes(message.site)) {
       const tokens = await storageGet('oneBrainTokens') || {};

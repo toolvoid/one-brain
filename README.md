@@ -6,11 +6,21 @@ One Brain is a local-first desktop app for saving, searching, linking, and visua
 
 ## Features
 
-- **One shared memory for your AI tools:** connect MCP clients such as Codex, use the memory proxy with API-based apps, or use the browser extension with Claude, ChatGPT, and Gemini. One Brain also includes a Chat view and a Quick Context hotkey.
+- **One shared memory for your AI tools:** connect MCP clients such as Codex, use the memory proxy with API-based apps, or use the browser extension with Claude, ChatGPT, Gemini, DeepSeek, Groq, and Perplexity. One Brain also includes a Chat view and a Quick Context hotkey.
 - **Explore connected memories:** a 3D node graph shows memories and their semantic links.
 - **Find relevant context:** hybrid search combines SQLite FTS5 full-text search with multilingual MiniLM embeddings and reciprocal rank fusion. A cosine relevance gate (0.25 cutoff) filters weak matches.
 - **Review and control sharing:** private memories are excluded from every outbound path. Chat offers an “Ask before sending” preview. Per-client permissions and tokens control access.
 - **See what is happening:** Connections health dashboard, activity charts and SQL in Insights, a RAM/CPU/latency Status panel, and a diagnostics log.
+
+## Skills demonstrated
+
+- **Import/capture → data ingestion:** [`src/lib/importers.mjs`](src/lib/importers.mjs) parses imports and caps each batch at 3,000 items.
+- **Embeddings/retrieval/RAG → LLM application design:** [`electron/db.js`](electron/db.js) combines full-text and vector rankings with reciprocal rank fusion using `k = 60`; [`electron/memory-proxy.js`](electron/memory-proxy.js) supplies retrieved memories to chat completions.
+- **MCP server → tool/protocol integration:** [`electron/mcp-server.js`](electron/mcp-server.js) registers seven MCP tools over Streamable HTTP.
+- **SQL analytics → SQL and data analysis:** [`electron/sql-worker.js`](electron/sql-worker.js) accepts one read-only `SELECT`/`WITH` query, returns at most 200 rows, and enforces a 3-second timeout.
+- **Evaluation/monitoring → model evaluation:** [`electron/db.js`](electron/db.js) runs retrieval evaluations; the 25-question synthetic set reports 90.5% hit@3 (see [evaluation results](#retrieval-evaluation)).
+- **Graph view → data visualization:** [`src/components/BrainGraph.jsx`](src/components/BrainGraph.jsx) visualizes memories across eight source categories, including built-in chat.
+- **Local encrypted storage → security/privacy:** [`electron/db.js`](electron/db.js) opens the local database through SQLCipher; [`electron/security-vault.js`](electron/security-vault.js) wraps the 32-byte database key with AES-256-GCM and derives its wrapping key with scrypt.
 
 ## Retrieval evaluation
 
@@ -58,7 +68,7 @@ npm run build:extension
 
 Load `extension/dist/chrome` as an unpacked extension in Chrome or `extension/dist/firefox` as a temporary/unpacked extension in Firefox. Keep `extension/keys/chrome.pem` private and backed up if you need to keep the same Chrome extension ID across rebuilds. After loading the extension, open its popup, choose a site, and pair it using the code shown in **Connections** in One Brain. Approve the new extension client in the app to finish pairing.
 
-Create store-ready Chrome and Firefox zip files (extension version 1.3.0) with no development key, tests, or fixtures:
+Create store-ready Chrome and Firefox zip files (extension version 1.4.1) with no development key, tests, or fixtures:
 
 ```sh
 npm run package:extension

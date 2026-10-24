@@ -3,15 +3,17 @@
   "version": "1.2.0",
   "description": "A local desktop app for saving and searching AI memories.",
   "author": "One Brain",
-  "desktopName": "one-brain",
+  "desktopName": "One Brain",
   "private": true,
   "main": "electron/main.js",
   "scripts": {
     "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
     "build": "vite build",
     "bench": "node scripts/bench.js",
-    "build:extension": "node scripts/build-extension.js",
-    "package:extension": "node scripts/package-extension.js",
+    "icons:generate": "node scripts/generate-app-icons.js",
+    "build:extension": "npm run icons:generate && node scripts/build-extension.js",
+    "build:extension:store": "npm run icons:generate && node scripts/build-extension.js --store",
+    "package:extension": "npm run icons:generate && node scripts/package-extension.js",
     "docs:errors": "node scripts/generate-error-docs.js",
     "pack": "npm run build && npm run build:extension && electron-builder --dir",
     "dist": "npm run build && npm run build:extension && electron-builder",
@@ -30,26 +32,96 @@
     "concurrently": "^10.0.5",
     "electron": "^44.6.0",
     "electron-builder": "^26.15.3",
+    "jsdom": "^26.1.0",
+    "sharp": "^0.35.5",
     "vite": "^8.3.3",
     "wait-on": "^9.5.1"
   },
   "build": {
     "appId": "com.onebrain.desktop",
     "productName": "One Brain",
-    "directories": { "output": "release" },
-    "files": ["!test/**", "!extension/**", "!scripts/**", "!README.md", "!AGENTS.md"],
+    "artifactName": "One-Brain-${version}-${os}-${arch}.${ext}",
+    "npmRebuild": true,
+    "asarUnpack": [
+      "**/*.node"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "!test/**",
+      "!extension/**",
+      {
+        "from": "extension/src",
+        "to": "extension/src",
+        "filter": [
+          "context-blocks.js",
+          "editor-insertion.js",
+          "smart-save.js"
+        ]
+      },
+      "!scripts/**",
+      "!README.md",
+      "!AGENTS.md"
+    ],
     "extraResources": [
-      { "from": "scripts/mcp-stdio.js", "to": "one-brain/scripts/mcp-stdio.js" },
-      { "from": "scripts/mcp-stdio-port.js", "to": "one-brain/scripts/mcp-stdio-port.js" },
-      { "from": "extension/dist", "to": "one-brain/extension" }
+      {
+        "from": "scripts/mcp-stdio.js",
+        "to": "one-brain/scripts/mcp-stdio.js"
+      },
+      {
+        "from": "scripts/mcp-stdio-port.js",
+        "to": "one-brain/scripts/mcp-stdio-port.js"
+      },
+      {
+        "from": "build/icon.png",
+        "to": "one-brain/icon.png"
+      },
+      {
+        "from": "extension/dist",
+        "to": "one-brain/extension"
+      }
     ],
     "electronFuses": {
       "runAsNode": true,
       "enableNodeCliInspectArguments": false,
       "enableNodeOptionsEnvironmentVariable": false
     },
-    "linux": { "target": ["AppImage"], "category": "Utility", "syncDesktopName": true },
-    "mac": { "target": ["dmg", "zip"] },
-    "win": { "target": ["nsis"] }
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png",
+      "category": "Utility",
+      "syncDesktopName": true
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.icns"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    }
   }
 }

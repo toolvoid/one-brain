@@ -19,9 +19,13 @@ function cosine(a, b) {
   return aa && bb ? dot / Math.sqrt(aa * bb) : -1;
 }
 function titleFor(text, fallback) {
-  const heading = String(text).split(/\r?\n/).find((line) => /^\s{0,3}#{1,6}\s+/.test(line));
-  const candidate = (heading ? heading.replace(/^\s{0,3}#{1,6}\s+/, '') : String(text).trim().split(/(?<=[.!?])\s|\n/, 1)[0]).trim();
-  return (candidate.slice(0, 60) || fallback || 'Saved chat');
+  const timeOnly = /^\d{1,2}:\d{2}\s?(?:AM|PM)$/i;
+  const sourceChip = (value) => String(value || '').length <= 140 && (/\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:,?\s+\d{4})?\b/i.test(value) && /[·|]/.test(value) || /^(?:www\.)?[\w-]+\.(?:com|org|net|in|co\.uk)(?:\s|$)/i.test(String(value || '').trim()));
+  const lines = String(text).split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !timeOnly.test(line) && !sourceChip(line));
+  const heading = lines.find((line) => /^\s{0,3}#{1,6}\s+/.test(line));
+  const candidate = (heading ? heading.replace(/^\s{0,3}#{1,6}\s+/, '') : lines.join(' ').split(/(?<=[.!?])\s+/, 1)[0] || '').trim();
+  const safeFallback = !timeOnly.test(String(fallback || '').trim()) && !sourceChip(fallback) ? fallback : 'Saved chat';
+  return candidate.slice(0, 60) || safeFallback || 'Saved chat';
 }
 function timestampValue(value) { return Number(value) || (value ? Date.parse(value) : 0) || 0; }
 function sentenceChunks(text, size = 1200, importerChunkText = null) {

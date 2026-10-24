@@ -6,14 +6,15 @@ import SecuritySettingsPanel from './components/SecuritySettingsPanel.jsx';
 import { ErrorCodeHelp, ErrorCodeMessage } from './components/ErrorCodeMessage.jsx';
 import { Button, Card, Field, Icon, IconButton, KPIStat, SectionHeader, Select, StatusChip, Switch } from './components/ui/index.jsx';
 import { MAX_IMPORT_ITEMS, isLogLikeChunk, parseImportText, parseImportFile, inferImportSource } from './lib/importers.mjs';
+import '../extension/src/context-blocks.js';
 import '../extension/src/smart-save.js';
-import { fallbackMemoryTitle, heuristicMemoryTitle, isChatModel, memorySourceForProvider } from './lib/chat-models.mjs';
+import { fallbackMemoryTitle, heuristicMemoryTitle, isChatModel } from './lib/chat-models.mjs';
 import { DEFAULT_LINK_VISIBILITY, graphLinkCounts, visibleGraphLinks } from './lib/graph-links.mjs';
 import { JOIN_ALL_MIN } from './lib/link-constants.json';
 import { runLinkMutation } from './lib/link-actions.mjs';
 import { multilineKeyAction } from './lib/multiline-key-action.mjs';
 import { clampSidebarWidth, cleanMemoryTitle, layoutMode, readSidebarWidth, writeSidebarWidth } from './lib/responsive-layout.mjs';
-import { buildConnectionRows, groupConnectionRows, summarizeConnectionHealth, createConnectAllPlan, runConfirmedConnectAll, defaultWriteSourceForClient, getWriteSourceReview } from './lib/connections-dashboard.mjs';
+import { buildConnectionRows, builtInChatStatus, groupConnectionRows, summarizeConnectionHealth, createConnectAllPlan, runConfirmedConnectAll, defaultWriteSourceForClient, getWriteSourceReview } from './lib/connections-dashboard.mjs';
 import { PERFORMANCE_MODE_EVENT, readManualPerformanceMode, writeManualPerformanceMode } from './lib/graph-performance.mjs';
 import { calibrationCutoffs, recommendCutoff, rrfSweepConfigs } from './lib/evaluation-tuning.mjs';
 import { evaluationTypeRows } from './lib/evaluation-display.mjs';
@@ -22,11 +23,11 @@ import { activityKpis, filterActivityRange, groupDailySeries, linkCategorySegmen
 import { SidebarToggle } from './lib/sidebar-toggle.mjs';
 import './insights.css';
 
-const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek', 'perplexity'];
+const SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek', 'perplexity', 'built-in'];
 const defaultWriteSource = (client) => defaultWriteSourceForClient(client) || 'codex';
 const SOURCE_COLORS = {
   chatgpt: '#42d6c2', claude: '#f29a60', codex: '#70a9ff',
-  gemini: '#b18cff', groq: '#f2d66d', deepseek: '#ff7095', perplexity: '#35c9f0'
+  gemini: '#b18cff', groq: '#f2d66d', deepseek: '#ff7095', perplexity: '#35c9f0', 'built-in': '#d995ff'
 };
 const EMPTY_COUNTS = Object.fromEntries(SOURCES.map((source) => [source, 0]));
 const PAGE_SIZE = 50;
@@ -595,7 +596,7 @@ function ProviderKeysPanel({ clients }) {
   </section>;
 }
 
-function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContext, activity, counts, mcpConfig, onRefresh, onConnect, onDisconnect, onTest, onConnectAll, onRotateAll, initialTab = 'connections' }) {
+function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContext, activity, counts, mcpConfig, onRefresh, onConnect, onDisconnect, onTest, onConnectAll, onRotateAll, onOpenChat, initialTab = 'connections' }) {
   const [tab, setTab] = useState(initialTab);
   const [filter, setFilter] = useState('');
   const [notice, setNotice] = useState('');
@@ -604,8 +605,9 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
   const [selectedConnection, setSelectedConnection] = useState(null);
   const [dismissedRows, setDismissedRows] = useState(() => new Set());
   const [statusFilter, setStatusFilter] = useState('all');
+  const chatStatus = builtInChatStatus(providers);
   const rows = buildConnectionRows({ mcp, clients, extensions, providers, quickContext, activity, counts });
-  const connectionGroups = groupConnectionRows(rows);
+  const connectionGroups = groupConnectionRows(rows, chatStatus);
   const screenRows = connectionGroups.flatMap((group) => group.rows);
   const health = summarizeConnectionHealth(screenRows);
   const connectedCount = screenRows.filter((row) => row.healthy && row.status !== 'Degraded').length;
@@ -617,7 +619,7 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
     if (statusFilter === 'setup') return ['not_set_up', 'not_installed', 'manual_only', 'not_checked'].includes(row.healthStatus);
     return true;
   });
-  const visibleGroups = groupConnectionRows(visibleRows);
+  const visibleGroups = groupConnectionRows(visibleRows, chatStatus);
   useEffect(() => { setTab(initialTab); }, [initialTab]);
   const filteredActivity = activity.filter((event) => !filter || event.client === filter);
   const seenSuccessfulChecks = new Set();
@@ -656,11 +658,16 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
     if (hours < 24) return `${hours} hr ago`;
     return `${Math.floor(hours / 24)} days ago`;
   };
+  async function generatePairCode(siteName = '') {
+    try {
+      setPairCode(await window.brain.createExtensionPairCode());
+      setNotice(siteName ? `Pair ${siteName} with this one-time code.` : 'A new one-time pairing code is ready.');
+    } catch (error) { setNotice(error.message || 'Could not create a pairing code.'); }
+  }
   async function connect(row) {
     if (row.type.includes('MCP')) return onConnect(row.id);
     if (row.site) {
-      try { setPairCode(await window.brain.createExtensionPairCode()); setNotice(`Pair ${row.name} with this one-time code.`); }
-      catch (error) { setNotice(error.message || 'Could not create a pairing code.'); }
+      await generatePairCode(row.name);
       return;
     }
     setNotice(row.manual ? 'Configure the Quick context shortcut in the settings below.' : 'Add the provider key in the settings below.');
@@ -746,7 +753,7 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
     return `${connected} connected · ${limited} limited · ${groupHealth.needAction} need attention · ${groupHealth.notSetUp} not set up`;
   }
   return <section className="connections-dashboard">
-    <header className="connections-header"><div><h2>Connections</h2><p>Connection status, capabilities and recent usage.</p></div><button type="button" onClick={() => void onRefresh()}>Refresh</button></header>
+    <header className="connections-header"><div><h2>Connections</h2><p>Connection status, capabilities and recent usage.</p></div><div><button type="button" onClick={() => void generatePairCode()}>New pairing code</button><button type="button" onClick={() => void onRefresh()}>Refresh</button></div></header>
     <div className="connection-health"><strong>{connectedCount} connected · {limitedCount} limited · {health.needAction} need attention · {health.notSetUp} not set up</strong><small>Limited means the connection works, but a feature such as context insertion needs attention. Set up only the apps you use.</small></div>
     <nav className="connection-tabs"><button type="button" aria-pressed={tab === 'connections'} onClick={() => setTab('connections')}>Connections</button><button type="button" aria-pressed={tab === 'activity'} onClick={() => setTab('activity')}>Activity log</button><button type="button" aria-pressed={tab === 'security'} onClick={() => setTab('security')}>Security</button><button type="button" onClick={() => void onConnectAll()}>Connect all detected</button><button type="button" onClick={() => void testAll()}>Test all</button></nav>
     {notice && (isErrorNotice(notice) ? <ErrorCodeMessage error={notice} where="connections:check" fallbackCode="OB-CONN-001" /> : <p className="connection-notice" role="status">{notice}</p>)}
@@ -755,8 +762,8 @@ function ConnectionsDashboard({ mcp, clients, extensions, providers, quickContex
     {tab === 'security' ? <PanelErrorBoundary><SecuritySettingsPanel /></PanelErrorBoundary> : tab === 'connections' ? <>
       <nav className="connection-filters" aria-label="Filter connections">{[['all', 'All', screenRows.length], ['connected', 'Connected', connectedCount], ['attention', 'Needs attention', limitedCount + health.needAction], ['setup', 'Not set up', health.notSetUp]].map(([value, label, count]) => <button type="button" key={value} aria-pressed={statusFilter === value} onClick={() => setStatusFilter(value)}>{label} <span>{count}</span></button>)}</nav>
       <div className="connection-groups">{visibleGroups.map((group) => <section className="connection-group" key={group.id} aria-labelledby={`connection-group-${group.id}`}>
-        <header className="connection-group-heading"><div><h3 id={`connection-group-${group.id}`}>{group.title}</h3><p>{group.description}</p></div>{!group.comingSoon && <small>{groupCounts(group.rows)}</small>}</header>
-        {group.comingSoon ? <article className="connection-coming-soon-card"><strong>Coming soon</strong></article> : <div className="connection-compact-list">{group.rows.map(renderConnectionRow)}{group.rows.length === 0 && <p className="empty-note">No connections in this group match the current filter.</p>}</div>}
+        <header className="connection-group-heading"><div><h3 id={`connection-group-${group.id}`}>{group.title}</h3><p>{group.description}</p></div>{group.id !== 'built-in' && <small>{groupCounts(group.rows)}</small>}</header>
+        {group.id === 'built-in' ? <article className="connection-built-in-card"><div className="connection-built-in-details"><strong>Last selected: {group.chatStatus?.provider || 'openai'} · {group.chatStatus?.model || 'Model not selected'}</strong><small>Providers with saved keys: {group.chatStatus?.providers?.length ? group.chatStatus.providers.join(', ') : 'None'}</small></div><button type="button" className="connection-primary-action" onClick={onOpenChat}>Open Chat</button></article> : <div className="connection-compact-list">{group.rows.map(renderConnectionRow)}{group.rows.length === 0 && <p className="empty-note">No connections in this group match the current filter.</p>}</div>}
       </section>)}</div>{visibleRows.length === 0 && <p className="empty-note">No connections match this filter.</p>}
     </> : <section className="connection-activity"><header><div><h3>Recent activity</h3><small>Repeated successful checks are grouped by service.</small></div><label>Filter by client<select value={filter} onChange={(event) => setFilter(event.target.value)}><option value="">All clients</option>{[...new Set(activity.map((event) => event.client))].sort().map((client) => <option key={client}>{client}</option>)}</select></label><button type="button" onClick={async () => { await window.brain.clearConnectionActivity(); await onRefresh(); }}>Clear log</button></header>{visibleActivity.map((event) => <article key={`${event.time}-${event.client}-${event.action}`}><time>{new Date(event.time).toLocaleString()}</time><strong>{event.client}</strong><span>{event.action}</span><span>{event.ok ? 'OK' : 'Fail'}</span><small>{event.reason || '—'}{event.probe ? ` · probe ${event.duration} ms` : ''}</small></article>)}{visibleActivity.length === 0 && <p className="empty-note">No connection activity yet.</p>}</section>}
     {selectedConnection && createPortal(<div className="connection-window-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedConnection(null); }}><section className="connection-detail-window" role="dialog" aria-modal="true" aria-labelledby="connection-detail-title"><header><div><h2 id="connection-detail-title">{selectedConnection.name}</h2><small>{selectedConnection.type}</small></div><button type="button" aria-label="Close connection details" onClick={() => setSelectedConnection(null)}>×</button></header><div className="connection-detail-status"><span className={`connection-status ${selectedConnection.status.toLowerCase().replaceAll(' ', '-')}`}>{selectedConnection.status}</span><p>{selectedConnection.reason || 'No issues reported.'}</p></div><section className="connection-detail-works"><h3>Works</h3>{['Search', 'Save', 'Auto-insert'].map((feature) => <div key={feature}><strong>{selectedConnection.work[feature].supported ? '✓' : '—'} {feature}</strong>{!selectedConnection.work[feature].supported && <small>{selectedConnection.work[feature].reason || 'Not supported'}</small>}</div>)}</section><div className="connection-detail-activity"><strong>Last activity</strong><span>{selectedConnection.lastActivity ? `${selectedConnection.lastActivity.action} ${relative(selectedConnection.lastActivity.time)}` : 'No activity yet'}</span><strong>Today</strong><span>{selectedConnection.counts.searches} searches · {selectedConnection.counts.saves} saves</span></div><footer><button type="button" onClick={() => void connect(selectedConnection)}>Reconnect</button><button type="button" onClick={() => void onDisconnect(selectedConnection)}>Disconnect</button><button type="button" onClick={() => void testOne(selectedConnection)}>Test connection</button>{selectedConnection.type.includes('MCP') && <><button type="button" onClick={async () => { if (window.confirm(`Rotate ${selectedConnection.name}'s token? Its current token will stop working.`)) { await window.brain.rotateConnectorToken(selectedConnection.id); await onRefresh(); } }}>Rotate token</button><button type="button" onClick={async () => { if (window.confirm(`Revoke ${selectedConnection.name}'s token?`)) { await window.brain.revokeConnectorToken(selectedConnection.id); await onRefresh(); } }}>Revoke</button></>}{selectedConnection.site && <button type="button" onClick={() => void openSite(selectedConnection)}>Open site</button>}</footer></section></div>, document.body)}
@@ -891,13 +898,13 @@ function relativeDate(value) {
 }
 
 const CHAT_PROVIDERS = ['openai', 'groq', 'deepseek', 'gemini', 'openrouter', 'claude'];
-const CHAT_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek', 'perplexity'];
+const CHAT_SOURCES = ['chatgpt', 'claude', 'codex', 'gemini', 'groq', 'deepseek', 'perplexity', 'built-in'];
 
 function ChatView({ onBack, onManageProviders, onOpenMemory, memoryTitles }) {
   const [settings, setSettings] = useState(null);
   const [chats, setChats] = useState([]);
   const [activeId, setActiveId] = useState(null);
-  const [provider, setProvider] = useState('openai');
+  const [provider, setProvider] = useState(() => localStorage.getItem('onebrain-chat-provider') || 'openai');
   const [model, setModel] = useState('');
   const [models, setModels] = useState([]);
   const [modelLoading, setModelLoading] = useState(false);
@@ -933,7 +940,6 @@ function ChatView({ onBack, onManageProviders, onOpenMemory, memoryTitles }) {
   const modelRequestRef = useRef(0);
   const titleRequestRef = useRef(0);
   const titleEditedRef = useRef(false);
-  const [changingSaveSource, setChangingSaveSource] = useState(false);
   const activeChat = chats.find((chat) => chat.id === activeId) || null;
   const availableProviders = CHAT_PROVIDERS.filter((item) => settings?.providerKeyStatus?.[item]);
   const visibleModels = models.filter((id) => (showAllModels || isChatModel(id)) && id.toLowerCase().includes(modelQuery.toLowerCase()));
@@ -954,12 +960,15 @@ function ChatView({ onBack, onManageProviders, onOpenMemory, memoryTitles }) {
     if (!nextProvider) return;
     const request = ++modelRequestRef.current;
     setProvider(nextProvider); setModelError(''); setModels([]); setModelsUpdatedAt(null); setModelLoading(true);
+    localStorage.setItem('onebrain-chat-provider', nextProvider);
     const remembered = localStorage.getItem(`onebrain-chat-model:${nextProvider}`) || '';
     try {
       const result = await window.brain.listChatModels(nextProvider, refresh);
       if (request !== modelRequestRef.current) return;
       setModels(result.ids); setModelsUpdatedAt(result.updatedAt);
-      setModel(preferred && result.ids.includes(preferred) ? preferred : remembered && result.ids.includes(remembered) ? remembered : result.ids.find(isChatModel) || result.ids[0] || '');
+      const selectedModel = preferred && result.ids.includes(preferred) ? preferred : remembered && result.ids.includes(remembered) ? remembered : result.ids.find(isChatModel) || result.ids[0] || '';
+      setModel(selectedModel);
+      if (selectedModel) localStorage.setItem(`onebrain-chat-model:${nextProvider}`, selectedModel);
       setModelLoading(false);
     } catch (reason) { if (request === modelRequestRef.current) { setModelError(reason.message || 'Could not load models.'); setModel(preferred || remembered); setModelLoading(false); } }
   }
@@ -1003,7 +1012,7 @@ function ChatView({ onBack, onManageProviders, onOpenMemory, memoryTitles }) {
       messages: [...chat.messages.slice(0, -1), { ...chat.messages.at(-1), content: `${chat.messages.at(-1)?.content || ''}${chunk}` }] } : chat));
   }), [activeId]);
 
-  function selectNewModel(value) { setActiveId(null); setModel(value); localStorage.setItem(`onebrain-chat-model:${provider}`, value); }
+  function selectNewModel(value) { setActiveId(null); setModel(value); localStorage.setItem('onebrain-chat-provider', provider); localStorage.setItem(`onebrain-chat-model:${provider}`, value); }
   async function createNewChat() {
     if (!provider || !model.trim()) { setModelError('Choose or enter a model first.'); return; }
     let grant = await window.brain.getChatGrant(provider);
@@ -1030,11 +1039,13 @@ function ChatView({ onBack, onManageProviders, onOpenMemory, memoryTitles }) {
   }
   async function selectChat(chat) {
     setActiveId(chat.id); setProvider(chat.provider); setModel(chat.model); setError('');
+    localStorage.setItem('onebrain-chat-provider', chat.provider);
     localStorage.setItem(`onebrain-chat-model:${chat.provider}`, chat.model);
     void loadModels(chat.provider, false, chat.model);
   }
   async function changeModel(value) {
     setModel(value); localStorage.setItem(`onebrain-chat-model:${provider}`, value);
+    localStorage.setItem('onebrain-chat-provider', provider);
     if (activeChat) { await window.brain.updateChat(activeChat.id, { model: value }); await refreshChats(activeChat.id); }
   }
   async function toggleMemory(value) {
@@ -1106,11 +1117,9 @@ function ChatView({ onBack, onManageProviders, onOpenMemory, memoryTitles }) {
   async function openSaveMemory(message, chat) {
     const request = ++titleRequestRef.current;
     titleEditedRef.current = false;
-    const source = chat.memory_source || memorySourceForProvider(chat.provider);
     const heuristic = heuristicMemoryTitle(message.content);
     const fallback = fallbackMemoryTitle(message.content);
-    setSaveEditor({ chatId: chat.id, provider: chat.provider, model: message.model || chat.model, source });
-    setChangingSaveSource(!source);
+    setSaveEditor({ chatId: chat.id, provider: chat.provider, model: message.model || chat.model, source: 'built-in' });
     setSaveContent(message.content);
     setSaveTitle(heuristic || fallback);
     if (heuristic) return;
@@ -1121,15 +1130,6 @@ function ChatView({ onBack, onManageProviders, onOpenMemory, memoryTitles }) {
       if (titleRequestRef.current === request && !titleEditedRef.current) setSaveTitle(fallback);
     }
   }
-  async function chooseSaveSource(source) {
-    if (!saveEditor || !SOURCES.includes(source)) return;
-    try {
-      await window.brain.updateChat(saveEditor.chatId, { memory_source: source });
-      setChats((current) => current.map((chat) => chat.id === saveEditor.chatId ? { ...chat, memory_source: source } : chat));
-      setSaveEditor((current) => current ? { ...current, source } : current);
-      setChangingSaveSource(false);
-    } catch (reason) { setError(reason.message || 'Could not save this chat source.'); }
-  }
   const newChatModelControl = modelLoading ? <span className="model-loading">Loading models…</span> : models.length > 0 && !modelError
     ? <AccessiblePicker label="model" value={model} options={visibleModels} searchable renderOption={(item) => item} onChange={selectNewModel} />
     : <input aria-label="Model name" value={model} onChange={(event) => selectNewModel(event.target.value)} placeholder="Type a model id" />;
@@ -1137,11 +1137,11 @@ function ChatView({ onBack, onManageProviders, onOpenMemory, memoryTitles }) {
     <header className="chat-topbar"><button className="back-button" type="button" onClick={onBack}>‹</button><div><h1>Chat</h1><p>Conversations are stored locally in your encrypted database.</p></div></header>
     <div className="chat-layout"><aside className="chat-list"><button className="chat-create chat-new-button" type="button" onClick={() => { setActiveId(null); setError(''); }}>＋ New chat</button>
       <div className="chat-list-items"><ChannelNotice channel="saved chats" loading={chatLoading} error={chatLoadError} onRetry={() => void refreshChats()} />{!chatLoading && !chatLoadError && chats.map((chat) => <article className={chat.id === activeId ? 'is-active' : ''} key={chat.id}><button type="button" className="chat-select" title={chat.title} onClick={() => void selectChat(chat)}><small>{chat.provider}</small><strong>{chat.title}</strong></button><button type="button" title="Rename chat" onClick={() => void renameChat(chat)}>✎</button><button type="button" title="Delete chat" onClick={() => void removeChat(chat)}>×</button></article>)}{!chatLoading && !chatLoadError && chats.length === 0 && <p className="empty-note">No chats yet.</p>}</div></aside>
-      <section className="chat-conversation">{activeChat ? <><header className="chat-controls"><div><span className="chat-provider-badge">{activeChat.provider}</span><input aria-label="Chat title" value={activeChat.title} onChange={(event) => { setChats((items) => items.map((item) => item.id === activeChat.id ? { ...item, title: event.target.value } : item)); }} onBlur={() => void window.brain.updateChat(activeChat.id, { title: activeChat.title })} /></div><label className="chat-toggle"><input type="checkbox" checked={Boolean(activeChat.use_memory)} onChange={(event) => void toggleMemory(event.target.checked)} />Use memory</label><label className="chat-toggle"><input type="checkbox" checked={Boolean(activeChat.suggest_memories)} onChange={async (event) => { await window.brain.updateChat(activeChat.id, { suggest_memories: event.target.checked }); await refreshChats(activeChat.id); }} />Suggest memories after answers</label><label className="chat-model-inline">Model{models.length && !modelError ? <AccessiblePicker label="model" value={activeChat.model} options={visibleModels} searchable renderOption={(item) => item} onChange={(item) => void changeModel(item)} /> : <input aria-label="Model name" value={model} onChange={(event) => setModel(event.target.value)} onBlur={() => void changeModel(model)} />}</label><label className="chat-toggle"><input type="checkbox" checked={showAllModels} onChange={(event) => setShowAllModels(event.target.checked)} />Show all models</label><div className="model-refresh"><button type="button" onClick={() => void loadModels(activeChat.provider, true)}>Refresh</button><small>{modelsUpdatedAt ? `Updated ${new Date(modelsUpdatedAt).toLocaleString()}` : ''}</small></div><button type="button" className="chat-manage-keys" onClick={() => setProviderSettingsOpen(true)}>Provider settings</button></header><div className="chat-messages">{activeChat.messages.map((message) => <article className={`chat-message ${message.role}`} key={message.id}><div className="chat-message-head"><strong>{message.role === 'assistant' ? activeChat.provider : 'You'}</strong>{message.model && <small>{message.model}</small>}</div><p>{message.content}</p><div className="chat-message-actions"><button type="button" onClick={() => void openSaveMemory(message, activeChat)}>Save</button>{message.role === 'assistant' && <details><summary>Memories used ({message.memory_ids?.length || 0})</summary><ul>{message.memory_ids.map((memoryId) => <li key={memoryId}><button type="button" onClick={() => onOpenMemory(memoryId)}>{memoryTitles[memoryId] || `Memory #${memoryId}`}</button></li>)}</ul></details>}</div></article>)}{activeChat.messages.length === 0 && <p className="chat-empty">Send a message to start this conversation.</p>}</div>{error && <ErrorCodeMessage className="chat-error-line" error={error} where="chat:request" />}<form className="chat-compose" onSubmit={(event) => void send(event)}><textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (multilineKeyAction(event, { mode: 'send', busy, value: draft }) === 'send') { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows="3" placeholder="Message" disabled={busy} /><div><small>Sent to {activeChat.provider} using the selected model.</small>{busy && <button type="button" onClick={() => void stop()}>Stop</button>}<button type="submit" disabled={busy || !draft.trim()}>Send</button></div></form></> : <><header className="chat-controls new-chat-controls"><div className="new-chat-provider"><span className="chat-provider-badge">New chat</span><AccessiblePicker label="provider" value={provider} options={CHAT_PROVIDERS} renderOption={(item) => <span className={settings?.providerKeyStatus?.[item] ? 'provider-option saved' : 'provider-option missing'}>{item[0].toUpperCase() + item.slice(1)} <small>{settings?.providerKeyStatus?.[item] ? 'key saved' : 'add key'}</small></span>} onChange={(nextProvider) => { setModelError(''); setModels([]); clearProviderKeyDraft(); setProvider(nextProvider); if (settings?.providerKeyStatus?.[nextProvider]) void loadModels(nextProvider); }} />{!settings?.providerKeyStatus?.[provider] && <button type="button" onClick={() => setProviderSettingsOpen(true)}>Add key</button>}</div><label className="chat-model-inline">Model{newChatModelControl}</label>{models.length > 0 && !modelError && <><label className="chat-toggle"><input type="checkbox" checked={showAllModels} onChange={(event) => setShowAllModels(event.target.checked)} />Show all models</label><div className="model-refresh"><button type="button" onClick={() => void loadModels(provider, true)}>Refresh</button><small>{modelsUpdatedAt ? `Updated ${new Date(modelsUpdatedAt).toLocaleString()}` : ''}</small></div></>}{modelError && <ErrorCodeMessage error={modelError} where="chat:models" fallbackCode="OB-PROXY-003" />}<button type="button" className="chat-create" onClick={() => void createNewChat()} disabled={!settings?.providerKeyStatus?.[provider] || modelLoading || !model.trim()}>Start conversation</button><button type="button" className="chat-manage-keys" onClick={() => setProviderSettingsOpen(true)}>Provider settings</button></header>{error && <ErrorCodeMessage className="chat-error-line" error={error} where="chat:request" />}<div className="chat-empty">{chatLoading ? 'Loading saved chats…' : chatLoadError ? 'Could not load saved chats. Retry from the chat list.' : 'Choose a provider and model, then start a conversation.'}</div></>}</section></div>
+      <section className="chat-conversation">{activeChat ? <><header className="chat-controls"><div><span className="chat-provider-badge">{activeChat.provider}</span><input aria-label="Chat title" value={activeChat.title} onChange={(event) => { setChats((items) => items.map((item) => item.id === activeChat.id ? { ...item, title: event.target.value } : item)); }} onBlur={() => void window.brain.updateChat(activeChat.id, { title: activeChat.title })} /></div><label className="chat-toggle"><input type="checkbox" checked={Boolean(activeChat.use_memory)} onChange={(event) => void toggleMemory(event.target.checked)} />Use memory</label><label className="chat-toggle"><input type="checkbox" checked={Boolean(activeChat.suggest_memories)} onChange={async (event) => { await window.brain.updateChat(activeChat.id, { suggest_memories: event.target.checked }); await refreshChats(activeChat.id); }} />Suggest memories after answers</label><label className="chat-model-inline">Model{models.length > 0 && !modelError ? <AccessiblePicker label="model" value={activeChat.model} options={visibleModels} searchable renderOption={(item) => item} onChange={(item) => void changeModel(item)} /> : <input aria-label="Model name" value={model} onChange={(event) => setModel(event.target.value)} onBlur={() => void changeModel(model)} />}</label><label className="chat-toggle"><input type="checkbox" checked={showAllModels} onChange={(event) => setShowAllModels(event.target.checked)} />Show all models</label><div className="model-refresh"><button type="button" onClick={() => void loadModels(activeChat.provider, true)}>Refresh</button><small>{modelsUpdatedAt ? `Updated ${new Date(modelsUpdatedAt).toLocaleString()}` : ''}</small></div><button type="button" className="chat-manage-keys" onClick={() => setProviderSettingsOpen(true)}>Provider settings</button></header><div className="chat-messages">{activeChat.messages.map((message) => <article className={`chat-message ${message.role}`} key={message.id}><div className="chat-message-head"><strong>{message.role === 'assistant' ? activeChat.provider : 'You'}</strong>{message.model && <small>{message.model}</small>}</div><p>{message.content}</p><div className="chat-message-actions"><button type="button" onClick={() => void openSaveMemory(message, activeChat)}>Save</button>{message.role === 'assistant' && <details><summary>Memories used ({message.memory_ids?.length || 0})</summary><ul>{message.memory_ids.map((memoryId) => <li key={memoryId}><button type="button" onClick={() => onOpenMemory(memoryId)}>{memoryTitles[memoryId] || `Memory #${memoryId}`}</button></li>)}</ul></details>}</div></article>)}{activeChat.messages.length === 0 && <p className="chat-empty">Send a message to start this conversation.</p>}</div>{error && <ErrorCodeMessage className="chat-error-line" error={error} where="chat:request" />}<form className="chat-compose" onSubmit={(event) => void send(event)}><textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (multilineKeyAction(event, { mode: 'send', busy, value: draft }) === 'send') { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows="3" placeholder="Message" disabled={busy} /><div><small>Sent to {activeChat.provider} using the selected model.</small>{busy && <button type="button" onClick={() => void stop()}>Stop</button>}<button type="submit" disabled={busy || !draft.trim()}>Send</button></div></form></> : <><header className="chat-controls new-chat-controls"><div className="new-chat-provider"><span className="chat-provider-badge">New chat</span><AccessiblePicker label="provider" value={provider} options={CHAT_PROVIDERS} renderOption={(item) => <span className={settings?.providerKeyStatus?.[item] ? 'provider-option saved' : 'provider-option missing'}>{item[0].toUpperCase() + item.slice(1)} <small>{settings?.providerKeyStatus?.[item] ? 'key saved' : 'add key'}</small></span>} onChange={(nextProvider) => { setModelError(''); setModels([]); clearProviderKeyDraft(); setProvider(nextProvider); setModel(localStorage.getItem(`onebrain-chat-model:${nextProvider}`) || ''); localStorage.setItem('onebrain-chat-provider', nextProvider); if (settings?.providerKeyStatus?.[nextProvider]) void loadModels(nextProvider); }} />{!settings?.providerKeyStatus?.[provider] && <button type="button" onClick={() => setProviderSettingsOpen(true)}>Add key</button>}</div><label className="chat-model-inline">Model{newChatModelControl}</label>{models.length > 0 && !modelError && <><label className="chat-toggle"><input type="checkbox" checked={showAllModels} onChange={(event) => setShowAllModels(event.target.checked)} />Show all models</label><div className="model-refresh"><button type="button" onClick={() => void loadModels(provider, true)}>Refresh</button><small>{modelsUpdatedAt ? `Updated ${new Date(modelsUpdatedAt).toLocaleString()}` : ''}</small></div></>}{modelError && <ErrorCodeMessage error={modelError} where="chat:models" fallbackCode="OB-PROXY-003" />}<button type="button" className="chat-create" onClick={() => void createNewChat()} disabled={!settings?.providerKeyStatus?.[provider] || modelLoading || !model.trim()}>Start conversation</button><button type="button" className="chat-manage-keys" onClick={() => setProviderSettingsOpen(true)}>Provider settings</button></header>{error && <ErrorCodeMessage className="chat-error-line" error={error} where="chat:request" />}<div className="chat-empty">{chatLoading ? 'Loading saved chats…' : chatLoadError ? 'Could not load saved chats. Retry from the chat list.' : 'Choose a provider and model, then start a conversation.'}</div></>}</section></div>
     {grantProvider && <div className="modal-backdrop"><section className="chat-grant-modal"><header><h2>Allow {grantProvider} to read memories?</h2><button type="button" onClick={() => setGrantProvider('')}>×</button></header><p>Memory text you select here may be sent to {grantProvider} when you use memory in Chat. Private memories are never sent.</p>{CHAT_SOURCES.map((source) => <label className="chat-toggle" key={source}><input type="checkbox" checked={grantSources.includes(source)} onChange={(event) => setGrantSources((items) => event.target.checked ? [...items, source] : items.filter((item) => item !== source))} />{source}</label>)}<footer><button type="button" onClick={() => setGrantProvider('')}>Cancel</button><button type="button" disabled={savingGrant} onClick={() => void saveGrant()}>{savingGrant ? 'Saving…' : 'Save permissions'}</button></footer></section></div>}
-    {providerSettingsOpen && <div className="modal-backdrop"><section className="chat-grant-modal" role="dialog" aria-modal="true" aria-label="Provider settings"><header><h2>Provider settings</h2><button type="button" onClick={() => setProviderSettingsOpen(false)}>×</button></header><label>Provider<AccessiblePicker label="provider" value={provider} options={CHAT_PROVIDERS} renderOption={(item) => <span className="provider-option">{item[0].toUpperCase() + item.slice(1)}</span>} onChange={(item) => { setProvider(item); clearProviderKeyDraft(); setModelError(''); }} /></label><label>{settings?.providerKeyStatus?.[provider] ? `Replace ${provider} key` : `Add ${provider} key`}<input ref={providerKeyInput} type="password" autoComplete="new-password" onChange={(event) => { providerKeyDraft.current = event.target.value; setHasProviderKeyDraft(Boolean(event.target.value)); }} placeholder="Provider API key" /></label>{modelError && <ErrorCodeMessage error={modelError} where="chat:models" fallbackCode="OB-PROXY-003" />}<footer><button type="button" onClick={() => setProviderSettingsOpen(false)}>Close</button><button type="button" disabled={!hasProviderKeyDraft || savingProviderKey} onClick={async () => { if (await saveChatProviderKey()) setProviderSettingsOpen(false); }}>{savingProviderKey ? 'Saving…' : 'Save key'}</button></footer></section></div>}
+    {providerSettingsOpen && <div className="modal-backdrop"><section className="chat-grant-modal" role="dialog" aria-modal="true" aria-label="Provider settings"><header><h2>Provider settings</h2><button type="button" onClick={() => setProviderSettingsOpen(false)}>×</button></header><label>Provider<AccessiblePicker label="provider" value={provider} options={CHAT_PROVIDERS} renderOption={(item) => <span className="provider-option">{item[0].toUpperCase() + item.slice(1)}</span>} onChange={(item) => { setProvider(item); setModel(localStorage.getItem(`onebrain-chat-model:${item}`) || ''); localStorage.setItem('onebrain-chat-provider', item); clearProviderKeyDraft(); setModelError(''); }} /></label><label>{settings?.providerKeyStatus?.[provider] ? `Replace ${provider} key` : `Add ${provider} key`}<input ref={providerKeyInput} type="password" autoComplete="new-password" onChange={(event) => { providerKeyDraft.current = event.target.value; setHasProviderKeyDraft(Boolean(event.target.value)); }} placeholder="Provider API key" /></label>{modelError && <ErrorCodeMessage error={modelError} where="chat:models" fallbackCode="OB-PROXY-003" />}<footer><button type="button" onClick={() => setProviderSettingsOpen(false)}>Close</button><button type="button" disabled={!hasProviderKeyDraft || savingProviderKey} onClick={async () => { if (await saveChatProviderKey()) setProviderSettingsOpen(false); }}>{savingProviderKey ? 'Saving…' : 'Save key'}</button></footer></section></div>}
     {pendingMemorySend && <div className="modal-backdrop"><section className="chat-grant-modal" role="dialog" aria-modal="true" aria-label="Review memory snippets before sending"><header><h2>Review memories for {pendingMemorySend.provider}</h2><button type="button" onClick={() => setPendingMemorySend(null)}>×</button></header><p>Only checked snippets below will be sent with this message. Private memories are excluded.</p>{pendingMemorySend.snippets.map((item) => <label className="chat-memory-preview" key={item.id}><input type="checkbox" checked={pendingMemorySend.selectedIds.includes(item.id)} onChange={(event) => setPendingMemorySend((current) => ({ ...current, selectedIds: event.target.checked ? [...current.selectedIds, item.id] : current.selectedIds.filter((id) => id !== item.id) }))} /><span><strong>{item.title} · {item.source}</strong><pre>{item.snippet}</pre></span></label>)}<label className="chat-toggle"><input type="checkbox" checked={Boolean(pendingMemorySend.rememberForChat)} onChange={(event) => setPendingMemorySend((current) => ({ ...current, rememberForChat: event.target.checked }))} />Remember for this chat</label><label className="chat-toggle"><input type="checkbox" checked={Boolean(pendingMemorySend.alwaysForProvider)} onChange={(event) => setPendingMemorySend((current) => ({ ...current, alwaysForProvider: event.target.checked }))} />Always send without asking for this provider</label><footer><button type="button" onClick={() => setPendingMemorySend(null)}>Cancel</button><button type="button" onClick={() => void confirmMemorySend()}>Send selected snippets</button></footer></section></div>}
-    {saveEditor && <div className="modal-backdrop"><form className="chat-grant-modal" onSubmit={(event) => { event.preventDefault(); void saveMemory(); }}><header><h2>Save as memory</h2><button type="button" onClick={() => { titleRequestRef.current++; setSaveEditor(null); }}>×</button></header><div className="chat-save-source"><strong>Source <span className="chat-provider-badge">{saveEditor.source || 'Choose source'}</span></strong><button type="button" className="chat-source-change" onClick={() => setChangingSaveSource((value) => !value)}>Change</button></div>{changingSaveSource && <label>Memory source<select aria-label="memory source" value={saveEditor.source || ''} onChange={(event) => void chooseSaveSource(event.target.value)}><option value="">Choose source</option>{CHAT_SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label>}<label>Title<input value={saveTitle} onChange={(event) => { titleEditedRef.current = true; setSaveTitle(event.target.value); }} /></label><label>Text<textarea rows="7" value={saveContent} onChange={(event) => setSaveContent(event.target.value)} /></label><footer><button type="button" onClick={() => { titleRequestRef.current++; setSaveEditor(null); }}>Cancel</button><button type="submit" disabled={!saveEditor.source || !saveContent.trim()}>Save memory</button></footer></form></div>}
+    {saveEditor && <div className="modal-backdrop"><form className="chat-grant-modal" onSubmit={(event) => { event.preventDefault(); void saveMemory(); }}><header><h2>Save as memory</h2><button type="button" onClick={() => { titleRequestRef.current++; setSaveEditor(null); }}>×</button></header><div className="chat-save-source"><strong>Source <span className="chat-provider-badge">built-in</span></strong></div><small>Only lines identified as durable decisions, facts, or preferences will be saved.</small><label>Title<input value={saveTitle} onChange={(event) => { titleEditedRef.current = true; setSaveTitle(event.target.value); }} /></label><label>Text<textarea rows="7" value={saveContent} onChange={(event) => setSaveContent(event.target.value)} /></label><footer><button type="button" onClick={() => { titleRequestRef.current++; setSaveEditor(null); }}>Cancel</button><button type="submit" disabled={!saveEditor.source || !saveContent.trim()}>Save memory</button></footer></form></div>}
   </section>;
 }
 
@@ -2070,7 +2070,7 @@ function App() {
         {pendingOpen ? <><header className="detail-header"><button className="back-button" type="button" onClick={() => setPendingOpen(false)}>‹</button><span>Pending memories</span></header><PendingMemoryInbox items={pendingMemories} onRefresh={refreshPendingMemories} loading={pendingLoading} loadError={pendingLoadError} /></> : connectOpen ? (
           <section className="connect-view">
             <header className="detail-header"><button className="back-button" type="button" onClick={() => setConnectOpen(false)}>‹</button><span>Connections</span>{suggestions.length > 0 && <button className="header-suggestions" type="button" onClick={() => { setConnectOpen(false); setSuggestionsOpen(true); }}>Suggestions ({suggestions.length})</button>}</header>
-            <ConnectionsDashboard mcp={connectorCards} clients={clients} extensions={extensionConnectionSites} providers={providerConnectionSettings} quickContext={quickConnectionSettings} activity={connectionActivity} counts={connectionCounts} mcpConfig={mcpConfig} onRefresh={refreshConnectionDashboard} onConnect={(id) => previewConnector(id)} onDisconnect={disconnectConnection} onTest={testMcpConnection} onConnectAll={connectAllDetected} onRotateAll={previewRotateAllTokens} initialTab={connectionsStartTab} />
+            <ConnectionsDashboard mcp={connectorCards} clients={clients} extensions={extensionConnectionSites} providers={providerConnectionSettings} quickContext={quickConnectionSettings} activity={connectionActivity} counts={connectionCounts} mcpConfig={mcpConfig} onRefresh={refreshConnectionDashboard} onConnect={(id) => previewConnector(id)} onDisconnect={disconnectConnection} onTest={testMcpConnection} onConnectAll={connectAllDetected} onRotateAll={previewRotateAllTokens} onOpenChat={() => { openGraphView(); setChatOpen(true); }} initialTab={connectionsStartTab} />
             {mcpConfig ? <>
               {embeddingStatus.state === 'error' && <section className="clients-settings embedding-retry-card"><header><h2>Semantic search model</h2><button type="button" onClick={() => void retryEmbedding()} disabled={embeddingRetrying}>{embeddingRetrying ? 'Retrying…' : 'Retry'}</button></header><ErrorCodeMessage error={embeddingStatus.message || 'Embedding needs re-indexing'} where="embeddings:status" fallbackCode="OB-EVAL-001" /></section>}
               <ProviderKeysPanel clients={clients} />
@@ -2134,17 +2134,7 @@ function App() {
               {suggestions.length > 0 && <button className="header-suggestions" type="button" onClick={() => { setSelectedId(null); setSuggestionsOpen(true); }}>Suggestions ({suggestions.length})</button>}
             </header>
             <div className="detail-source"><i style={{ background: SOURCE_COLORS[selectedMemory.source] }} />{selectedMemory.source}</div>
-            <h1>{selectedMemory.private && <Icon name="lock" size={14} />} {selectedMemory.title || 'Untitled memory'}</h1>
-            <p className="detail-content">{selectedMemory.content}</p>
-            <time className="detail-date">{dateLabel(selectedMemory.created_at)}</time>
-            <div className="detail-actions">
-              <label className="move-source-action">Move to source<select aria-label="Move memory to source" value={selectedMemory.source} onChange={(event) => void handleMoveMemory(selectedMemory, event.target.value)}>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label>
-              <button type="button" onClick={() => graphRef.current?.retrieve(selectedMemory.id)}>Retrieve</button>
-              <button type="button" aria-pressed={Boolean(selectedMemory.private)} onClick={() => handlePrivateToggle(selectedMemory)}>{selectedMemory.private ? 'Private · turn off' : 'Mark private'}</button>
-              <button type="button" aria-pressed={Boolean(selectedMemory.no_suggest)} onClick={() => void handleNoSuggestToggle(selectedMemory)}>{selectedMemory.no_suggest ? 'Never suggest · on' : 'Never suggest'}</button>
-              <button type="button" className="danger-button" onClick={() => handleDelete(selectedMemory.id)}>Delete</button>
-              {conversationPartCount >= 2 && / \(part \d+\/\d+\)$/.test(selectedMemory.title || '') && <button type="button" className="danger-button" onClick={handleDeleteConversationParts}>Delete all {conversationPartCount} parts of this chat</button>}
-            </div>
+            <h1>{Boolean(selectedMemory.private) && <Icon name="lock" size={14} />} {selectedMemory.title || 'Untitled memory'}</h1>
             <section className="detail-links">
               <div className="section-heading"><h2>Linked memories</h2><button type="button" onClick={() => { setPickerOpen((open) => !open); setPickerQuery(''); }}>＋ Link to...</button></div>
               {pickerOpen && (
@@ -2168,6 +2158,16 @@ function App() {
                 {regularLinkedMemories.length === 0 && !pickerOpen && <p className="empty-note">No linked memories yet. Choose “Link to…” to connect a related memory.</p>}
               </div>
             </section>
+            <p className="detail-content">{selectedMemory.content}</p>
+            <time className="detail-date">{dateLabel(selectedMemory.created_at)}</time>
+            <div className="detail-actions">
+              <label className="move-source-action">Move to source<select aria-label="Move memory to source" value={selectedMemory.source} onChange={(event) => void handleMoveMemory(selectedMemory, event.target.value)}>{SOURCES.map((source) => <option key={source} value={source}>{source}</option>)}</select></label>
+              <button type="button" onClick={() => graphRef.current?.retrieve(selectedMemory.id)}>Retrieve</button>
+              <button type="button" aria-pressed={Boolean(selectedMemory.private)} onClick={() => handlePrivateToggle(selectedMemory)}>{selectedMemory.private ? 'Private · turn off' : 'Mark private'}</button>
+              <button type="button" aria-pressed={Boolean(selectedMemory.no_suggest)} onClick={() => void handleNoSuggestToggle(selectedMemory)}>{selectedMemory.no_suggest ? 'Never suggest · on' : 'Never suggest'}</button>
+              <button type="button" className="danger-button" onClick={() => handleDelete(selectedMemory.id)}>Delete</button>
+              {conversationPartCount >= 2 && / \(part \d+\/\d+\)$/.test(selectedMemory.title || '') && <button type="button" className="danger-button" onClick={handleDeleteConversationParts}>Delete all {conversationPartCount} parts of this chat</button>}
+            </div>
             <section className="related-section">
               <h2>Related</h2>
               <div className="linked-list">
@@ -2203,7 +2203,7 @@ function App() {
                 const displayTitle = cleanMemoryTitle(item.title?.trim() || (full?.content || '').slice(0, 40));
                 return <button type="button" className="result-item" key={item.id} onClick={() => openDetail(item.id)}>
                   <i className="result-dot" style={{ background: SOURCE_COLORS[item.source] }} />
-                  <span className="result-copy"><strong title={displayTitle}>{item.private && <Icon name="lock" size={13} />} {displayTitle}</strong><small title={item.snippet || full?.content.slice(0, 120) || ''}>{item.snippet || full?.content.slice(0, 120) || ''}</small></span>
+                  <span className="result-copy"><strong title={displayTitle}>{Boolean(item.private) && <Icon name="lock" size={13} />} {displayTitle}</strong><small title={item.snippet || full?.content.slice(0, 120) || ''}>{item.snippet || full?.content.slice(0, 120) || ''}</small></span>
                   <span className="result-meta"><span>{item.source}</span><time>{relativeDate(item.created_at || resultMemory(item.id)?.created_at)}</time></span>
                 </button>;
               })}
@@ -2495,7 +2495,7 @@ function App() {
         .connection-tech-details { color:#aab9cb;font-size:9px;line-height:1.5; }.connection-tech-details summary { width:max-content;color:#9fb8d2;cursor:pointer; }.connection-tech-details small { display:block;margin-top:4px;overflow-wrap:anywhere; }
         .connections-dashboard button:focus-visible,.connection-tech-details summary:focus-visible { outline:2px solid #86c5ff;outline-offset:2px; }
         .connection-notice,.connection-test-results { margin:0;padding:7px;border:1px solid rgba(143,196,255,.18);border-radius:6px;color:#cad8eb;background:#121e30;font-size:10px; }.connection-test-results { display:grid;gap:4px; }
-        .connection-groups { display:grid;gap:12px; }.connection-group { display:grid;gap:8px;min-width:0;padding:10px;border:1px solid rgba(175,195,224,.12);border-radius:8px;background:rgba(12,20,31,.42); }.connection-group-heading { display:flex;align-items:flex-start;justify-content:space-between;gap:10px; }.connection-group-heading > div { min-width:0; }.connection-group-heading h3 { margin:0;color:#e2eaf5;font-size:12px; }.connection-group-heading p { margin:4px 0 0;color:#a5b3c4;font-size:10px;line-height:1.4; }.connection-group-heading > small { flex:0 0 auto;color:#91a0b4;font-size:9px;text-align:right; }.connection-coming-soon-card { min-height:56px;display:flex;align-items:center;padding:10px;border:1px dashed rgba(175,195,224,.2);border-radius:7px;color:#b4c2d2;background:rgba(15,24,37,.45);font-size:11px; }
+        .connection-groups { display:grid;gap:12px; }.connection-group { display:grid;gap:8px;min-width:0;padding:10px;border:1px solid rgba(175,195,224,.12);border-radius:8px;background:rgba(12,20,31,.42); }.connection-group-heading { display:flex;align-items:flex-start;justify-content:space-between;gap:10px; }.connection-group-heading > div { min-width:0; }.connection-group-heading h3 { margin:0;color:#e2eaf5;font-size:12px; }.connection-group-heading p { margin:4px 0 0;color:#a5b3c4;font-size:10px;line-height:1.4; }.connection-group-heading > small { flex:0 0 auto;color:#91a0b4;font-size:9px;text-align:right; }.connection-built-in-card { min-height:56px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px;border:1px solid rgba(175,195,224,.16);border-radius:7px;color:#dce7f4;background:rgba(15,24,37,.55);font-size:12px; }.connection-built-in-details { display:grid;gap:5px;min-width:0; }.connection-built-in-details small { color:#a5b3c4;font-size:10px;line-height:1.4; } @media(max-width:520px) { .connection-group-heading { flex-wrap:wrap; }.connection-built-in-card { align-items:stretch;flex-direction:column; }.connection-built-in-card > button { width:100%; } }
         .connection-compact-list { display:grid;gap:7px;min-width:0; }.connection-compact-row { display:grid;gap:6px;min-width:0;padding:9px;border:1px solid rgba(175,195,224,.14);border-radius:7px;background:rgba(15,24,37,.7); }.connection-compact-heading { display:flex;align-items:flex-start;justify-content:space-between;gap:7px; }.connection-compact-heading > div { display:grid;gap:3px;min-width:0; }.connection-compact-heading strong { color:#e2eaf5;font-size:11px;overflow-wrap:anywhere; }.connection-compact-reason { color:#f0b5ae;font-size:9px;line-height:1.4; }.connection-compact-meta { display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap;color:#91a0b4;font-size:9px; }.connection-details-button { justify-self:start; }
         .connection-type { color:#91a4bb!important; }.connection-status { display:inline-block;padding:3px 5px;border-radius:5px;color:#d7e4f4;background:#26364d;font-size:9px;white-space:nowrap; }.connection-status.connected,.connection-status.paired { color:#b7f0ca;background:#173b2c; }.connection-status.broken,.connection-status.selectors-broken,.connection-status.needs-reconnect,.connection-status.needs-restart,.connection-status.failing { color:#ffcbc3;background:#48272a; }.connection-status.not-installed,.connection-status.not-paired,.connection-status.not-connected,.connection-status.needs-approval { color:#d1d6df;background:#343b49; }.connection-status.degraded,.connection-status.not-checked,.connection-status[class*="busy-"] { color:#f3d18a;background:#493b1d; }
         .connection-works { display:grid;gap:4px;min-width:180px; }.connection-works span { color:#b9c9dc; }.connection-works span:first-letter { color:#9ce0b9; }.connection-works small { display:block;padding-left:14px;color:#8393a7;font-size:8px; }

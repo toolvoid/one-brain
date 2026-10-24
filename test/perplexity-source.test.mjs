@@ -16,6 +16,7 @@ test('Perplexity is registered as a source and extension clients write to it', a
   assert.match(app, /const CHAT_SOURCES = \[[^\]]*'perplexity'/);
   assert.match(graph, /const SOURCES = \[[^\]]*'perplexity'/);
   assert.match(db, /const MEMORY_SOURCES = \[[^\]]*'perplexity'/);
+  assert.match(await read('../electron/mcp-server.js'), /const SOURCES = \[[^\]]*'perplexity'/);
 });
 
 test('Perplexity graph color is unique among all source colors', async () => {

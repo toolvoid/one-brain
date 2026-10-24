@@ -21,8 +21,42 @@
       return { ...item, id: item.id || `${hash(base)}:${occurrence}`, order: Number.isFinite(item.order) ? item.order : index };
     });
   }
-  async function loadFullChat({ scroller, collect, progress = () => {}, cancelled = () => false, wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), maxSteps = 300 } = {}) {
+  async function loadFullChat({ scroller, collect, progress = () => {}, cancelled = () => false, wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), maxSteps = 300, mode = 'history', stableMs = 1500 } = {}) {
     if (!scroller) return { messages: normalize(collect?.() || []), cancelled: false, scrollableFound: false };
+    if (mode === 'scroll-to-top-stable') {
+      if (!(Number(scroller.scrollHeight) > Number(scroller.clientHeight)) || typeof scroller.scrollTop !== 'number') return { messages: normalize(collect?.() || []), cancelled: false, scrollableFound: false, nothingMoreToLoad: true, steps: 0 };
+      const originalTop = scroller.scrollTop, messages = normalize(collect?.() || []), initialCount = messages.length;
+      let stableFor = 0, steps = 0, reachedTop = Number(scroller.scrollTop) <= 0;
+      try {
+        progress(messages.length);
+        while (steps < maxSteps && !cancelled()) {
+          const priorCount = messages.length;
+          const priorTop = Number(scroller.scrollTop) || 0;
+          scroller.scrollTop = Math.max(0, priorTop - Math.max(200, Math.floor(Number(scroller.clientHeight) * 0.75)));
+          reachedTop = Number(scroller.scrollTop) <= 0;
+          steps++;
+          await wait(100);
+          const next = merge(messages, normalize(collect?.() || []));
+          messages.splice(0, messages.length, ...next);
+          progress(messages.length);
+          stableFor = messages.length === priorCount ? stableFor + 100 : 0;
+          if (reachedTop && stableFor < stableMs) {
+            while (stableFor < stableMs && !cancelled() && steps < maxSteps) {
+              steps++;
+              await wait(100);
+              const before = messages.length;
+              const updated = merge(messages, normalize(collect?.() || []));
+              messages.splice(0, messages.length, ...updated);
+              progress(messages.length);
+              stableFor = messages.length === before ? stableFor + 100 : 0;
+            }
+            break;
+          }
+          if (reachedTop && stableFor >= stableMs) break;
+        }
+        return { messages, cancelled: cancelled(), scrollableFound: true, nothingMoreToLoad: reachedTop && stableFor >= stableMs && messages.length <= initialCount, steps };
+      } finally { scroller.scrollTop = originalTop; }
+    }
     const originalTop = scroller.scrollTop, messages = [];
     try {
       scroller.scrollTop = scroller.scrollHeight; await wait(350);

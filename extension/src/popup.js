@@ -54,7 +54,7 @@
         card.append(origins);
       }
       const current = await message({ type: 'get-settings', site: status.site });
-      for (const [key, text, defaultValue] of [['enabled', 'Enable', true], ['showButtons', 'Show buttons', true], ['autoSaveMessages', 'Auto-save my messages', false]]) {
+      for (const [key, text, defaultValue] of [['enabled', 'Enable', true], ['showButtons', 'Show buttons', true], ['autoSaveMessages', 'Auto-save my messages', false], ['smartSaveEnabled', 'Smart save filter (important messages only)', true], ['autoSaveFinishedReplies', 'Auto-save finished replies (private)', false]]) {
         const wrapper = document.createElement('label'); const input = document.createElement('input'); input.type = 'checkbox'; input.checked = current[key] ?? defaultValue;
         input.addEventListener('change', async () => {
           const settings = { ...current, [key]: input.checked };
