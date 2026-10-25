@@ -26,7 +26,7 @@ Choose the installer for your system from [GitHub Releases](../../releases). The
 
 | Platform | Installer | Artifact pattern | Download |
 | --- | --- | --- | --- |
-| Linux x64 | AppImage | `One-Brain-<version>-linux-x64.AppImage` | [Releases](../../releases) |
+| Linux x64 | AppImage | `One-Brain-<version>-linux-x86_64.AppImage` | [Releases](../../releases) |
 | Windows x64 | NSIS installer | `One-Brain-<version>-win-x64.exe` | [Releases](../../releases) |
 | macOS Apple Silicon | DMG | `One-Brain-<version>-mac-arm64.dmg` | [Releases](../../releases) |
 
@@ -49,7 +49,7 @@ Linux x64, Windows x64, and macOS on Apple Silicon only. See [platform details](
 
 - Windows and macOS builds are built and smoke-tested in CI, but have not been manually tested.
 - Installers are unsigned; Windows SmartScreen and macOS Gatekeeper may warn.
-- A signed automatic update source is not configured; install updates from releases or the Linux package manager.
+- A signed automatic update source is not configured; install updates from releases.
 - Ubuntu AppImage use may require `libfuse2`.
 - On Wayland, One Brain re-launches under XWayland when available. Set `ONE_BRAIN_OZONE=auto` to skip that re-launch when collecting logs; XWayland is required for the automatic X11 path.
 - First use of semantic search needs internet to download the roughly 130 MB embedding model. A failure shows **OB-EMBED-001** and a Retry action.
