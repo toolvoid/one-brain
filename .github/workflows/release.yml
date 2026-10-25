@@ -21,9 +21,6 @@ jobs:
           - os: windows-latest
             platform: win
             arch: x64
-          - os: macos-15-intel
-            platform: mac
-            arch: x64
           - os: macos-latest
             platform: mac
             arch: arm64
@@ -53,9 +50,6 @@ jobs:
         if: matrix.platform == 'win'
         run: '& "release/win-unpacked/One Brain.exe" --smoke-test'
         shell: pwsh
-      - name: Smoke test macOS app
-        if: matrix.platform == 'mac' && matrix.arch == 'x64'
-        run: '"release/mac/One Brain.app/Contents/MacOS/One Brain" --smoke-test'
       - name: Smoke test macOS app
         if: matrix.platform == 'mac' && matrix.arch == 'arm64'
         run: '"release/mac-arm64/One Brain.app/Contents/MacOS/One Brain" --smoke-test'

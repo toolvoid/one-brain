@@ -31,9 +31,11 @@ The built-in retrieval evaluation currently reports:
 | Synthetic | 25 | 90.5% | 100% | 0.894 | 0% (4 questions) |
 | Real memories | 12 | 91.7% | — | 0.917 | — |
 
-Before tuning, synthetic hit@3 was 71.4%, with a 100% false-positive rate on the negative questions. These sets are small, so the results are indicative rather than a broad performance guarantee. The project has 282 automated tests passing.
+Before tuning, synthetic hit@3 was 71.4%, with a 100% false-positive rate on the negative questions. These sets are small, so the results are indicative rather than a broad performance guarantee. The project has 324 automated tests passing.
 
-One Brain is Linux-first. Wayland and software-rendering fallbacks are handled; Windows and macOS have not been tested.
+### Supported platforms
+
+One Brain supports Linux x64, Windows x64, and macOS on Apple Silicon only.
 
 ## Run locally
 

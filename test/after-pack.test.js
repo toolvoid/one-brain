@@ -50,6 +50,30 @@ test('afterPack locates the native runtime inside a macOS app bundle', (t) => {
   assert.ok(fs.existsSync(runtime));
 });
 
+test('afterPack keeps Windows x64 and remains strict for unsupported macOS x64', (t) => {
+  const appOutDir = fs.mkdtempSync(path.join(os.tmpdir(), 'one-brain-after-pack-platforms-'));
+  t.after(() => fs.rmSync(appOutDir, { recursive: true, force: true }));
+  const root = path.join(appOutDir, 'resources', 'app.asar.unpacked', 'node_modules', 'onnxruntime-node', 'bin', 'napi-v6');
+  const put = (relative) => {
+    const file = path.join(root, relative);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'native');
+  };
+  put('win32/x64/onnxruntime.dll');
+  put('win32/arm64/onnxruntime.dll');
+  put('darwin/arm64/libonnxruntime.dylib');
+
+  assert.throws(
+    () => pruneNativeRuntime(appOutDir, 'darwin', 1, { log() {} }),
+    /expected onnxruntime-node target directory is missing: .*darwin[\\/]x64/
+  );
+
+  pruneNativeRuntime(appOutDir, 'win32', 1, { log() {} });
+
+  assert.ok(fs.existsSync(path.join(root, 'win32/x64/onnxruntime.dll')));
+  assert.equal(fs.existsSync(path.join(root, 'win32/arm64')), false);
+});
+
 test('afterPack preserves the sharp relative-RPATH layout and reports native sizes', async (t) => {
   const appOutDir = fs.mkdtempSync(path.join(os.tmpdir(), 'one-brain-sharp-after-pack-'));
   t.after(() => fs.rmSync(appOutDir, { recursive: true, force: true }));
