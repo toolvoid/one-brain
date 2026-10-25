@@ -4,6 +4,7 @@ const OneBrainDeepSeekSelectors = Object.freeze({
   send: ['button[aria-label*="send" i]', 'button[data-testid*="send" i]', '[role="button"][aria-label*="send" i]', 'button[type="submit"]'],
   pickSend(scope) { return [...scope.querySelectorAll('button')].find((button) => /^(?:send|submit)$/i.test(String(button.getAttribute('aria-label') || button.textContent || '').trim())) || null; },
   messages: ['[data-message-author-role]', '[data-testid*="message" i]', '[data-testid*="chat-message" i]', '[class*="message" i]'],
+  actionRows: ['[role="toolbar"]', '[data-testid*="message-actions" i]', '[data-testid*="actions" i]'],
   loadOlder: ['button[aria-label*="older" i]', 'button[aria-label*="load more" i]']
 });
 const OneBrainDeepSeekAdapter = globalThis.OneBrainAdapterFactory.createAdapter('deepseek', OneBrainDeepSeekSelectors);

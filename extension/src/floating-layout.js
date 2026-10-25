@@ -1,21 +1,27 @@
 'use strict';
 
 (function (root) {
-  function positionAboveComposer(launcher, composer, viewportHeight = root.innerHeight, gap = 12, viewportWidth = root.innerWidth) {
-    let top = null;
-    let right = null;
-    try {
-      const rect = composer?.getBoundingClientRect?.();
-      top = Number(rect?.top);
-      right = Number(rect?.right);
-    } catch {}
-    const bottom = Number.isFinite(top) ? Math.max(12, Number(viewportHeight || 0) - top + gap) : 16;
-    if (launcher?.style) launcher.style.bottom = `${bottom}px`;
-    viewportWidth = Number(viewportWidth || 0);
-    if (launcher?.style) launcher.style.right = Number.isFinite(right) && right > 0 && viewportWidth >= right ? `${Math.max(12, viewportWidth - right)}px` : '16px';
-    return bottom;
+  const VIEWPORT_GAP = 8;
+  function positionLauncher(launcher, viewportHeight = root.innerHeight, viewportWidth = root.innerWidth, gap = 16) {
+    const height = Math.max(0, Number(viewportHeight) || 0);
+    const width = Math.max(0, Number(viewportWidth) || 0);
+    const inset = Math.max(VIEWPORT_GAP, Number(gap) || 0);
+    if (launcher?.style) {
+      launcher.style.position = 'fixed';
+      launcher.style.bottom = `${Math.max(VIEWPORT_GAP, Math.min(inset, Math.max(VIEWPORT_GAP, height - VIEWPORT_GAP)))}px`;
+      launcher.style.right = `${Math.max(VIEWPORT_GAP, Math.min(inset, Math.max(VIEWPORT_GAP, width - VIEWPORT_GAP)))}px`;
+    }
+    return { bottom: Number.parseFloat(launcher?.style?.bottom) || 0, right: Number.parseFloat(launcher?.style?.right) || 0 };
   }
-  const api = Object.freeze({ positionAboveComposer });
+  function observeIgnoredScroll(view, onIgnored = () => {}) {
+    const listener = (event) => {
+      const target = event.target;
+      if (target !== view && target !== view.document && target !== view.document?.documentElement && target !== view.document?.body) onIgnored(event);
+    };
+    view.addEventListener('scroll', listener, { passive: true });
+    return () => view.removeEventListener('scroll', listener);
+  }
+  const api = Object.freeze({ positionLauncher, observeIgnoredScroll });
   root.OneBrainFloatingLayout = api;
   if (typeof module !== 'undefined') module.exports = api;
 })(globalThis);

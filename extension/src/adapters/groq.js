@@ -5,6 +5,7 @@ const OneBrainGroqSelectors = Object.freeze({
   send: ['button[type="submit"]', 'button[aria-label*="submit" i]', 'button[aria-label*="send" i]', 'button[data-testid*="submit" i]', '[role="button"][aria-label*="submit" i]'],
   pickSend(scope) { return [...scope.querySelectorAll('button')].find((button) => /^(?:send|submit)$/i.test(String(button.getAttribute('aria-label') || button.textContent || '').trim())) || null; },
   messages: ['[data-message-author-role]', '[data-testid*="message" i]', '[class*="message" i]', '[role="log"] [role="group"]'],
+  actionRows: ['[role="toolbar"]', '[data-testid*="message-actions" i]', '[data-testid*="actions" i]'],
   loadOlder: []
 });
 const OneBrainGroqAdapter = globalThis.OneBrainAdapterFactory.createAdapter('groq', OneBrainGroqSelectors);

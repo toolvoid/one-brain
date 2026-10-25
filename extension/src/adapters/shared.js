@@ -49,6 +49,27 @@
         return { id, role, text, ...(ts ? { ts } : {}), order: index, element, selectorName, selector };
       }).filter(Boolean).map((message, order) => ({ ...message, order }));
     }
+    function findActionRow(message) {
+      const element = message?.element || message;
+      if (!element?.querySelectorAll) return null;
+      for (const selector of selectors.actionRows || []) {
+        try {
+          const row = element.querySelector(selector);
+          const controls = [...(row?.querySelectorAll?.('button') || [])].filter((button) => !button.closest?.('.one-brain-extension-ui, [data-one-brain-ui]'));
+          if (controls.length >= 2) return row;
+        } catch {}
+      }
+      const buttons = [...element.querySelectorAll('button')].filter((button) => !button.closest?.('.one-brain-extension-ui, [data-one-brain-ui]'));
+      const labels = (button) => `${button.getAttribute?.('aria-label') || ''} ${button.getAttribute?.('title') || ''} ${button.getAttribute?.('data-testid') || ''}`;
+      const actionButtons = buttons.filter((button) => /copy|like|dislike|thumb|retry|regenerat|helpful|feedback|fork/i.test(labels(button)));
+      const candidates = actionButtons.length >= 2 ? actionButtons : buttons;
+      if (candidates.length < 2) return null;
+      for (let node = candidates[0].parentElement; node && element.contains(node); node = node.parentElement) {
+        const count = candidates.filter((button) => node.contains(button)).length;
+        if (count >= 2) return node;
+      }
+      return null;
+    }
     function hash(value) { let h = 2166136261; for (const char of value) h = Math.imul(h ^ char.charCodeAt(0), 16777619); return (h >>> 0).toString(36); }
     function input(scope = document) { return typeof selectors.pickInput === 'function' ? selectors.pickInput(scope, find, visible) : find(selectors.composer || selectors.input, scope); }
     function readDraft(scope = document) { const target = scope?.nodeType === 1 ? scope : input(); return !target ? '' : /^(?:TEXTAREA|INPUT)$/.test(target.tagName) ? String(target.value || '') : String(target.innerText || target.textContent || ''); }
@@ -80,7 +101,7 @@
       return pageScroller && pageScroller.scrollHeight > pageScroller.clientHeight + 2 ? pageScroller : null;
     }
     function findSendButton(scope = document) { const picked = typeof selectors.pickSend === 'function' ? selectors.pickSend(scope) : null; return visible(picked) ? picked : find(selectors.sendButton || selectors.send, scope); }
-    const api = { site, selectors, getMessages, readRecentMessages: getMessages, findInput: input, getInputElement: input, readDraft, writeDraft, findSendButton, getSendButton: findSendButton,
+    const api = { site, selectors, getMessages, findActionRow, readRecentMessages: getMessages, findInput: input, getInputElement: input, readDraft, writeDraft, findSendButton, getSendButton: findSendButton,
       historyComplete: Boolean(selectors.historyComplete), getLoadOlderButton: (scope = document) => find(selectors.loadOlder, scope), findScrollContainer, readChatKey: () => `${site}:${String(root.location?.pathname || '').split('/').filter(Boolean).at(-1) || 'new'}`,
       getLastAssistantMessage: (scope = document) => getMessages(scope).filter((item) => item.role === 'assistant').at(-1) || null, selfCheck, extractText: textOf,
       observe(callback, scope = document.body) { const observer = new MutationObserver(callback); if (scope) observer.observe(scope, { childList: true, subtree: true }); return () => observer.disconnect(); } };

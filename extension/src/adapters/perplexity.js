@@ -98,6 +98,7 @@ const OneBrainPerplexitySelectors = Object.freeze({
   send: ['button[aria-label="Submit"]'],
   pickSend,
   messageGroups: { user: [], assistant: [] },
+  actionRows: ['.action-row', '[role="toolbar"]', '[data-testid*="message-actions" i]'],
   getMessageElements: discoverMessages,
   getText(element, role, readText) {
     if (role === 'user') {

@@ -12,17 +12,19 @@ test('finished-reply auto-save is disabled by default', () => {
   const content = fs.readFileSync('extension/src/content.js', 'utf8');
   const popup = fs.readFileSync('extension/src/popup.js', 'utf8');
   assert.match(content, /autoSaveFinishedReplies:\s*autoSaveGuard\.DEFAULT_AUTO_SAVE_FINISHED_REPLIES/);
+  assert.match(content, /autoSaveMessages:\s*false/);
   assert.match(popup, /autoSaveFinishedReplies',\s*'Auto-save finished replies \(private\)',\s*false/);
   assert.match(content, /}, 2000\);/);
   assert.match(content, /result\?\.locked/);
 });
 
-test('per-message Save refreshes the current site setting before applying the filter', () => {
+test('each message Save refreshes settings before applying the filter', () => {
   const content = fs.readFileSync('extension/src/content.js', 'utf8');
-  const saveAction = content.slice(content.indexOf("messageActionRow(message).append(createButton('Save'"), content.indexOf('function messageActionRow'));
+  const saveAction = content.slice(content.indexOf('async function saveMessage(message)'), content.indexOf('function renderInputButton'));
   assert.match(saveAction, /type: 'get-settings', site: SITE/);
   assert.match(saveAction, /config\.smartSaveEnabled !== false/);
   assert.match(saveAction, /skipSmartFilter: config\.smartSaveEnabled === false/);
+  assert.match(content, /createButton: \(message\) => createButton\('Save', \(\) => \{ void saveMessage\(message\); \}\)/);
 });
 
 test('duplicate guard saves a reply once across restored fingerprints', async () => {

@@ -1,6 +1,7 @@
 'use strict';
 const OneBrainChatGPTSelectors = Object.freeze({
   messageGroups: { primary: ['[data-message-author-role]'], turnFallback: ['[data-testid^="conversation-turn-"]'], roleFallback: ['[aria-label*="user message" i]', '[aria-label*="assistant message" i]'] },
+  actionRows: ['[role="toolbar"]', '[data-testid*="message-actions" i]', '[data-testid*="actions" i]'],
   composer: ['#prompt-textarea', 'textarea[placeholder]', '[contenteditable="true"][role="textbox"]', '[aria-label*="message" i]'],
   sendButton: ['[data-testid="send-button"]', 'button[aria-label*="send" i]', 'button[data-testid*="send" i]'],
   loadOlder: ['button[aria-label*="load older" i]', 'button[aria-label*="load more" i]', '[data-testid*="load-older" i]']

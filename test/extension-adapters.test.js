@@ -80,6 +80,8 @@ for (const site of ['chatgpt', 'claude', 'gemini', 'deepseek', 'groq', 'perplexi
     const fixture = fs.readFileSync(fixturePath, 'utf8');
     const root = parseFixture(fixture);
     const messages = adapter.getMessages(root);
+    assert.equal(typeof adapter.findActionRow, 'function');
+    assert.ok(adapter.selectors.actionRows?.length, `${site} defines message action-row selectors`);
     assert.ok(messages.length >= 1);
     assert.equal(messages.at(-1).role, 'assistant');
     assert.deepEqual(messages.map((message) => message.order), messages.map((_message, index) => index));

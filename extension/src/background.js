@@ -7,8 +7,8 @@ if (!globalThis.OneBrainAutoSaveGuard && typeof importScripts === 'function') {
 const ONE_BRAIN_API_DEFAULT = 'http://127.0.0.1:3738';
 const ONE_BRAIN_SITES = ['chatgpt', 'claude', 'gemini', 'deepseek', 'groq', 'perplexity'];
 const ONE_BRAIN_MIN_API_VERSION = '1.1.0';
-const ONE_BRAIN_BUILD_ID = '1.4.6-loopguard';
-const CONTENT_SCRIPT_VERSION = '1.4.6';
+const ONE_BRAIN_BUILD_ID = '1.4.10-loopguard';
+const CONTENT_SCRIPT_VERSION = '1.4.10';
 const statusCache = new Map(), statusInflight = new Map();
 const searchRequests = new Map();
 let healthPollStarted = false, healthPollDelay = 15_000, healthPollTimer = null;

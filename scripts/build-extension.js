@@ -6,9 +6,9 @@ const { createHash, createPrivateKey, createPublicKey, generateKeyPairSync } = r
 const { generateIcons } = require('./generate-extension-assets');
 
 const ROOT = path.resolve(__dirname, '..');
-const EXTENSION_VERSION = '1.4.6';
+const EXTENSION_VERSION = '1.4.10';
 const hosts = ['http://127.0.0.1/*', 'https://chatgpt.com/*', 'https://claude.ai/*', 'https://gemini.google.com/*', 'https://chat.deepseek.com/*', 'https://console.groq.com/playground*', 'https://perplexity.ai/*', 'https://www.perplexity.ai/*'];
-const common = ['src/adapters/shared.js', 'src/chat-loader.js', 'src/context-blocks.js', 'src/background-message.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/smart-save.js', 'src/insertion-guard.js', 'src/manual-context.js', 'src/layout-fallback.js', 'src/floating-layout.js', 'src/auto-save-guard.js'];
+const common = ['src/adapters/shared.js', 'src/chat-loader.js', 'src/context-blocks.js', 'src/background-message.js', 'src/search-intent.js', 'src/editor-insertion.js', 'src/smart-save.js', 'src/insertion-guard.js', 'src/manual-context.js', 'src/layout-fallback.js', 'src/floating-layout.js', 'src/message-actions.js', 'src/auto-save-guard.js'];
 const contentScripts = [
   { matches: ['https://chatgpt.com/*'], js: [...common, 'src/adapters/chatgpt.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },
   { matches: ['https://claude.ai/*'], js: [...common, 'src/adapters/claude.js', 'src/content.js'], css: ['src/content.css'], run_at: 'document_idle' },

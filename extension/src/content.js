@@ -14,8 +14,9 @@
   const layoutFallbackModule = globalThis.OneBrainLayoutFallback;
   const chatLoader = globalThis.OneBrainChatLoader;
   const floatingLayout = globalThis.OneBrainFloatingLayout;
+  const messageActions = globalThis.OneBrainMessageActions;
   const autoSaveGuard = globalThis.OneBrainAutoSaveGuard;
-  if (!SITE || !API || !adapter || !editorTools || !searchIntent || !backgroundMessage || !smartSave || !insertionGuardModule || !manualContext || !layoutFallbackModule || !chatLoader || !floatingLayout || !autoSaveGuard) return;
+  if (!SITE || !API || !adapter || !editorTools || !searchIntent || !backgroundMessage || !smartSave || !insertionGuardModule || !manualContext || !layoutFallbackModule || !chatLoader || !floatingLayout || !messageActions || !autoSaveGuard) return;
   const timers = new Set();
   const eventController = new AbortController();
   let stopped = false, staleToastShown = false, adapterCleanup = () => {};
@@ -127,6 +128,36 @@
     return button;
   }
 
+  let buttonRefreshFrame = 0, launcherPositionFrame = 0;
+  function scheduleButtonRefresh() {
+    if (buttonRefreshFrame) return;
+    buttonRefreshFrame = window.requestAnimationFrame(() => { buttonRefreshFrame = 0; refreshButtons(); });
+  }
+  function scheduleLauncherPosition() {
+    if (launcherPositionFrame) return;
+    launcherPositionFrame = window.requestAnimationFrame(() => {
+      launcherPositionFrame = 0;
+      const composer = adapter.getInputElement();
+      if (composerResizeObserver && composer !== observedComposer) {
+        composerResizeObserver.disconnect();
+        observedComposer = composer;
+        if (composer) composerResizeObserver.observe(composer);
+      }
+      positionLauncher();
+    });
+  }
+  async function saveMessage(message) {
+    try {
+      const latestSettings = await askBackground({ type: 'get-settings', site: SITE });
+      if (typeof latestSettings?.smartSaveEnabled === 'boolean') config.smartSaveEnabled = latestSettings.smartSaveEnabled;
+    } catch {}
+    if (smartSaveToggle) smartSaveToggle.checked = config.smartSaveEnabled !== false;
+    const text = cleanOutgoingText(message.text || readText(message.element));
+    const check = smartSave.scoreMessage(text);
+    if (config.smartSaveEnabled !== false && !check.keep) { toast('Smart save is on for this site. Turn it off in One Brain settings to save this message.', true); return; }
+    openConfirmation({ kind: 'message', text: check.text, skipSmartFilter: config.smartSaveEnabled === false });
+  }
+
   function renderInputButton() {
     const editor = adapter.getInputElement();
     const buttons = [...document.querySelectorAll('.one-brain-add-memory')];
@@ -145,32 +176,12 @@
   function refreshButtons() {
     menu.hidden = !config.enabled || !config.showButtons;
     if (smartSaveToggle) smartSaveToggle.checked = config.smartSaveEnabled !== false;
-    if (!config.enabled || !config.showButtons) document.querySelectorAll('.one-brain-extension-save').forEach((button) => button.remove());
-    else for (const message of adapter.getMessages()) {
-      if (message.role !== 'assistant' || !message.element?.isConnected || message.element.querySelector('.one-brain-extension-save')) continue;
-      messageActionRow(message).append(createButton('Save', async () => {
-        try {
-          const latestSettings = await askBackground({ type: 'get-settings', site: SITE });
-          if (typeof latestSettings?.smartSaveEnabled === 'boolean') config.smartSaveEnabled = latestSettings.smartSaveEnabled;
-        } catch {}
-        if (smartSaveToggle) smartSaveToggle.checked = config.smartSaveEnabled !== false;
-        const text = cleanOutgoingText(message.text || readText(message.element));
-        const check = smartSave.scoreMessage(text);
-        if (config.smartSaveEnabled !== false && !check.keep) { toast('Smart save is on for this site. Turn it off in One Brain settings to save this message.', true); return; }
-        openConfirmation({ kind: 'message', text: check.text, skipSmartFilter: config.smartSaveEnabled === false });
-      }));
-    }
+    messageActions.renderSaveButtons(adapter, {
+      enabled: config.enabled && config.showButtons,
+      isStreaming: replyIsGenerating(),
+      createButton: (message) => createButton('Save', () => { void saveMessage(message); })
+    });
     renderInputButton();
-  }
-
-  function messageActionRow(message) {
-    const buttons = [...(message.element.querySelectorAll?.('button') || [])].filter((button) => !button.closest?.('.one-brain-extension-ui'));
-    const anchor = buttons.find((button) => button.getAttribute('aria-label') === 'Helpful') || buttons.at(-1);
-    for (let node = anchor?.parentElement; node && message.element.contains(node); node = node.parentElement) {
-      const count = [...node.querySelectorAll('button')].filter((button) => !button.closest?.('.one-brain-extension-ui')).length;
-      if (count >= 2 && !node.querySelector('.prose h2')) return node;
-    }
-    return message.element;
   }
 
   function openConfirmation({ kind, text, messages = [], skipSmartFilter = false }) {
@@ -242,7 +253,7 @@
       launcherActions?.append(manualButton);
   });
   let lastLayoutBroken = null, layoutWarningTimer = null;
-  const CONTENT_SCRIPT_VERSION = '1.4.6';
+  const CONTENT_SCRIPT_VERSION = '1.4.10';
   function reportAdapterLayout(matched, broken) {
     void askBackground({ type: 'adapter-self-check-report', site: SITE, matched, reason: broken ? 'Chat composer controls were not detected; context insertion may be unavailable.' : undefined });
   }
@@ -686,7 +697,7 @@
   const launcher = document.createElement('aside'); launcher.className = 'one-brain-extension-ui one-brain-extension-launcher'; launcher.dataset.expanded = 'false';
   launcherActions = document.createElement('div'); launcherActions.className = 'one-brain-launcher-actions'; launcherActions.hidden = true;
   const launcherButton = document.createElement('button'); launcherButton.type = 'button'; launcherButton.className = 'one-brain-launcher-toggle'; launcherButton.textContent = 'One Brain'; launcherButton.setAttribute('aria-expanded', 'false'); launcherButton.title = 'Open One Brain actions';
-  launcherButton.addEventListener('click', () => { launcherExpanded = !launcherExpanded; launcher.dataset.expanded = String(launcherExpanded); launcherActions.hidden = !launcherExpanded; launcherButton.setAttribute('aria-expanded', String(launcherExpanded)); positionLauncher(); });
+  launcherButton.addEventListener('click', () => { launcherExpanded = !launcherExpanded; launcher.dataset.expanded = String(launcherExpanded); launcherActions.hidden = !launcherExpanded; launcherButton.setAttribute('aria-expanded', String(launcherExpanded)); });
   const addMemoryButton = createButton('Add memory', () => { launcherExpanded = false; launcher.dataset.expanded = 'false'; launcherActions.hidden = true; launcherButton.setAttribute('aria-expanded', 'false'); void openSuggestions('manual'); }, 'one-brain-manual-context');
   smartSaveToggle = document.createElement('input'); smartSaveToggle.type = 'checkbox'; smartSaveToggle.checked = config.smartSaveEnabled !== false;
   const smartSaveLabel = document.createElement('label'); smartSaveLabel.className = 'one-brain-smart-save-toggle'; smartSaveLabel.append(smartSaveToggle, document.createTextNode('Smart save filter (important only)'));
@@ -700,18 +711,21 @@
   launcherActions.append(menu, addMemoryButton, smartSaveLabel, chatMemoryToggle, removeContext);
   launcher.append(launcherActions, launcherButton);
   document.documentElement.append(launcher);
-  function positionLauncher() { floatingLayout.positionAboveComposer(launcher, adapter.getInputElement(), window.innerHeight, 12, window.innerWidth); launcher.style.right = '16px'; }
-  window.addEventListener('resize', positionLauncher, { signal: eventController.signal });
-  window.addEventListener('scroll', positionLauncher, { capture: true, signal: eventController.signal });
-  let composerResizeObserver = null;
-  if (typeof ResizeObserver === 'function') { composerResizeObserver = new ResizeObserver(positionLauncher); const composer = adapter.getInputElement(); if (composer) composerResizeObserver.observe(composer); }
-  const originalAdapterCleanup = adapterCleanup;
-  adapterCleanup = () => { originalAdapterCleanup?.(); composerResizeObserver?.disconnect(); };
+  function positionLauncher() { floatingLayout.positionLauncher(launcher, window.innerHeight, window.innerWidth, 16); }
+  window.addEventListener('resize', scheduleLauncherPosition, { signal: eventController.signal });
+  const cleanupIgnoredScroll = floatingLayout.observeIgnoredScroll(window, (event) => {
+    try { if (localStorage.onebrainDebug === '1') console.debug('[onebrain] ignored non-viewport scroll', { target: event.target?.nodeName || 'unknown' }); } catch {}
+  });
+  let composerResizeObserver = null, observedComposer = null;
+  if (typeof ResizeObserver === 'function') { composerResizeObserver = new ResizeObserver(scheduleLauncherPosition); observedComposer = adapter.getInputElement(); if (observedComposer) composerResizeObserver.observe(observedComposer); }
   positionLauncher();
   document.addEventListener('keydown', sendIntent, { capture: true, signal: eventController.signal });
   document.addEventListener('click', sendIntent, { capture: true, signal: eventController.signal });
   document.addEventListener('input', scheduleIntentSearch, { capture: true, signal: eventController.signal });
-  window.addEventListener('popstate', () => { void syncChatRoute(); }, { signal: eventController.signal });
+  document.addEventListener('input', scheduleLauncherPosition, { capture: true, signal: eventController.signal });
+  document.addEventListener('focusin', scheduleLauncherPosition, { capture: true, signal: eventController.signal });
+  window.addEventListener('popstate', () => { scheduleButtonRefresh(); void syncChatRoute(); }, { signal: eventController.signal });
+  window.addEventListener('hashchange', scheduleButtonRefresh, { signal: eventController.signal });
 
   runtimeMessageListener = (message, _sender, sendResponse) => {
     if (message?.type === 'adapter-self-check') { sendResponse({ site: SITE, matched: adapter.selfCheck() }); return false; }
@@ -730,8 +744,9 @@
 
   void loadConfig();
   void loadChatState();
-  const cleanupContentObserver = adapter.observe(() => { if (stopped) return; refreshButtons(); confirmSentMessages(); scheduleAutoSaveFinishedReply(); void syncChatRoute(); });
-  const cleanupLayoutObserver = adapter.observe(() => { checkAdapterLayout(); positionLauncher(); });
-  adapterCleanup = () => { cleanupContentObserver?.(); cleanupLayoutObserver?.(); composerResizeObserver?.disconnect(); };
+  const cleanupContentObserver = adapter.observe(() => { if (stopped) return; scheduleButtonRefresh(); confirmSentMessages(); scheduleAutoSaveFinishedReply(); void syncChatRoute(); });
+  const cleanupLayoutObserver = adapter.observe(() => { checkAdapterLayout(); });
+  adapterCleanup = () => { cleanupContentObserver?.(); cleanupLayoutObserver?.(); composerResizeObserver?.disconnect(); cleanupIgnoredScroll(); if (buttonRefreshFrame) window.cancelAnimationFrame(buttonRefreshFrame); if (launcherPositionFrame) window.cancelAnimationFrame(launcherPositionFrame); };
+  refreshButtons();
   checkAdapterLayout();
 })();
