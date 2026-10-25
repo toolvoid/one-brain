@@ -1,6 +1,6 @@
 {
   "name": "one-brain",
-  "version": "1.2.0",
+  "version": "1.5.0",
   "description": "A local desktop app for saving and searching AI memories.",
   "author": "One Brain",
   "desktopName": "One Brain",
@@ -22,10 +22,7 @@
   "dependencies": {
     "@huggingface/transformers": "^4.3.1",
     "@modelcontextprotocol/sdk": "^1.32.1",
-    "better-sqlite3-multiple-ciphers": "^13.0.3",
-    "react": "^19.3.0",
-    "react-dom": "^19.3.0",
-    "three": "^0.186.1"
+    "better-sqlite3-multiple-ciphers": "^13.0.3"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^6.1.2",
@@ -33,11 +30,15 @@
     "electron": "^44.6.0",
     "electron-builder": "^26.15.3",
     "jsdom": "^26.1.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
     "sharp": "^0.35.5",
+    "three": "^0.186.1",
     "vite": "^8.3.3",
     "wait-on": "^9.5.1"
   },
   "build": {
+    "afterPack": "scripts/after-pack.js",
     "appId": "com.onebrain.desktop",
     "productName": "One Brain",
     "artifactName": "One-Brain-${version}-${os}-${arch}.${ext}",
@@ -51,6 +52,9 @@
     "files": [
       "!test/**",
       "!extension/**",
+      "!**/*.map",
+      "!node_modules/@img/sharp-libvips-linuxmusl-x64/**",
+      "!node_modules/@img/sharp-linuxmusl-x64/**",
       {
         "from": "extension/src",
         "to": "extension/src",

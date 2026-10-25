@@ -1,3 +1,55 @@
+const smokeFlag = process.argv.includes('--smoke-test');
+if (smokeFlag) {
+  const { app: smokeApp } = require('electron');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { randomBytes, createCipheriv, createDecipheriv } = require('node:crypto');
+  const smokeUserData = fs.mkdtempSync(path.join(os.tmpdir(), 'one-brain-smoke-'));
+  smokeApp.setPath('userData', smokeUserData);
+  smokeApp.whenReady().then(async () => {
+    try {
+      const key = randomBytes(32);
+      const smokeSafeStorage = {
+        isEncryptionAvailable: () => true,
+        getSelectedStorageBackend: () => 'smoke-test-aes-256-gcm',
+        encryptString(value) {
+          const iv = randomBytes(12);
+          const cipher = createCipheriv('aes-256-gcm', key, iv);
+          const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
+          return Buffer.concat([iv, cipher.getAuthTag(), ciphertext]);
+        },
+        decryptString(value) {
+          const bytes = Buffer.from(value);
+          const decipher = createDecipheriv('aes-256-gcm', key, bytes.subarray(0, 12));
+          decipher.setAuthTag(bytes.subarray(12, 28));
+          return Buffer.concat([decipher.update(bytes.subarray(28)), decipher.final()]).toString('utf8');
+        },
+      };
+      const smokeDb = module.require(path.join(__dirname, 'db.js'));
+      const status = await smokeDb.initializeDatabase(smokeUserData, smokeSafeStorage);
+      if (!status.writable) throw new Error(`Smoke database is not writable: ${status.message || status.state}`);
+      const { memory } = smokeDb.addMemory({ source: 'built-in', title: 'Smoke test', content: 'Encrypted smoke test row.' });
+      const roundTrip = smokeDb.getMemory(memory.id);
+      if (!roundTrip || roundTrip.content !== 'Encrypted smoke test row.') throw new Error('Encrypted database row did not read back correctly.');
+      require('onnxruntime-node');
+      smokeDb.closeDatabaseForTest();
+      fs.rmSync(smokeUserData, { recursive: true, force: true });
+      console.log('SMOKE_OK');
+      smokeApp.exit(0);
+    } catch (error) {
+      console.error(error?.stack || error);
+      try { fs.rmSync(smokeUserData, { recursive: true, force: true }); } catch {}
+      smokeApp.exit(1);
+    }
+  }).catch((error) => {
+    console.error(error?.stack || error);
+    try { fs.rmSync(smokeUserData, { recursive: true, force: true }); } catch {}
+    smokeApp.exit(1);
+  });
+}
+
+if (!smokeFlag) {
 process.umask(0o077);
 const { enforcePrivateTree, cleanupSensitiveTemps } = require('./private-files');
 const { app, powerMonitor } = require('electron');
@@ -452,7 +504,7 @@ function startEmbedder() {
       else publishEmbeddingStatus(status);
     },
   });
-  return embedderManager.ensureLoaded().catch((error) => publishEmbeddingStatus({ state: 'error', message: String(error?.message || 'Local embedding model failed to load.').slice(0, 200) }));
+  return embedderManager.ensureLoaded().catch(() => publishEmbeddingStatus({ state: 'error', message: 'OB-EMBED-001' }));
 }
 
 ipcMain.handle('memories:add', (_event, memory) => addMemory(memory, { handAdded: true }));
@@ -1057,3 +1109,4 @@ app.on('before-quit', (event) => {
 app.on('window-all-closed', () => {
   handleAllWindowsClosed({ platform: process.platform, isLocked: lockController.isLocked, quit: () => app.quit() });
 });
+}

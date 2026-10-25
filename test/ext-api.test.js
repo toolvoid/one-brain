@@ -119,7 +119,7 @@ test('pairing and extension requests enforce the paired origin and loopback host
   assert.equal(response.status, 200);
   const ping = await response.json();
   assert.equal(ping.apiVersion, '1.2.0');
-  assert.equal(ping.appVersion, '1.2.0');
+  assert.equal(ping.appVersion, '1.5.0');
   assert.equal(ping.paired, true);
   assert.equal(ping.approval, 'approved');
   assert.equal(response.headers.get('access-control-allow-origin'), h.origin);

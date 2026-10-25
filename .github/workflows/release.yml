@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -16,10 +17,16 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: linux
+            arch: x64
           - os: windows-latest
             platform: win
+            arch: x64
+          - os: macos-15-intel
+            platform: mac
+            arch: x64
           - os: macos-latest
             platform: mac
+            arch: arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -36,18 +43,34 @@ jobs:
       - name: Build Windows installer
         if: matrix.platform == 'win'
         run: npx electron-builder --win nsis --x64 --publish never
-      - name: Build macOS x64 and arm64 disk images
+      - name: Build macOS disk image
         if: matrix.platform == 'mac'
-        run: |
-          npx electron-builder --mac dmg --x64 --publish never
-          npx electron-builder --mac dmg --arm64 --publish never
+        run: npx electron-builder --mac dmg --${{ matrix.arch }} --publish never
+      - name: Smoke test Linux app
+        if: matrix.platform == 'linux'
+        run: xvfb-run -a release/linux-unpacked/one-brain --no-sandbox --smoke-test
+      - name: Smoke test Windows app
+        if: matrix.platform == 'win'
+        run: '& "release/win-unpacked/One Brain.exe" --smoke-test'
+        shell: pwsh
+      - name: Smoke test macOS app
+        if: matrix.platform == 'mac' && matrix.arch == 'x64'
+        run: '"release/mac/One Brain.app/Contents/MacOS/One Brain" --smoke-test'
+      - name: Smoke test macOS app
+        if: matrix.platform == 'mac' && matrix.arch == 'arm64'
+        run: '"release/mac-arm64/One Brain.app/Contents/MacOS/One Brain" --smoke-test'
+      - name: Print installer sizes
+        if: always()
+        run: node -e "const fs=require('fs'); for (const n of fs.readdirSync('release')) { const p='release/'+n; if (fs.statSync(p).isFile() && n.startsWith('One-Brain-')) console.log(n+': '+(fs.statSync(p).size/1048576).toFixed(1)+' MiB'); }"
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: One-Brain-${{ matrix.platform }}
+          name: One-Brain-${{ matrix.platform }}-${{ matrix.arch }}
           path: release/One-Brain-*
-          if-no-files-found: error
+          if-no-files-found: warn
 
   publish:
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     permissions:

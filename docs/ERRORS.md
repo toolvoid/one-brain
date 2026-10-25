@@ -96,3 +96,9 @@ One Brain uses these stable codes in error messages, local diagnostics, and loca
 | Code | Title | Meaning | Fix | Severity |
 | --- | --- | --- | --- | --- |
 | OB-UPDATE-001 | Automatic updates are not configured | This One Brain build has no signed update source configured. | Use the official download or your Linux package manager to install updates. | info |
+
+## EMBED
+
+| Code | Title | Meaning | Fix | Severity |
+| --- | --- | --- | --- | --- |
+| OB-EMBED-001 | Local embedding model unavailable | One Brain could not load its local embedding model. Check your internet connection, then retry. | Reconnect to the internet and select Retry. One Brain will download the pinned model revision when the model is first needed. | error |

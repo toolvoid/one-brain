@@ -7,6 +7,11 @@ let activeModel = workerData.model;
 let loadError = null;
 let work = Promise.resolve();
 
+const MODEL_REVISIONS = Object.freeze({
+  'Xenova/paraphrase-multilingual-MiniLM-L12-v2': '2c4055b12046f11709e9df2c122e59ffbdc2f900',
+  'Xenova/all-MiniLM-L6-v2': '751bff37182d3f1213fa05d7196b954e230abad9',
+});
+
 function modelUnavailable(error) {
   return /\b404\b|not found|no onnx model|unsupported model|could not locate.*model/i.test(String(error?.message || error));
 }
@@ -20,11 +25,11 @@ async function loadModel() {
   globalThis.fetch = blockRelativeModelFetch(globalThis.fetch.bind(globalThis));
 
   try {
-    extractor = await pipeline('feature-extraction', workerData.model, { dtype: 'q8' });
+    extractor = await pipeline('feature-extraction', workerData.model, { dtype: 'q8', revision: MODEL_REVISIONS[workerData.model] });
   } catch (error) {
     if (!modelUnavailable(error)) throw error;
     activeModel = workerData.fallbackModel;
-    extractor = await pipeline('feature-extraction', activeModel, { dtype: 'q8' });
+    extractor = await pipeline('feature-extraction', activeModel, { dtype: 'q8', revision: MODEL_REVISIONS[activeModel] });
   }
   // The feature-extraction pipeline truncates input using this tokenizer limit.
   // Use the model's position limit explicitly so unusually long memories stay local and bounded.
@@ -38,7 +43,7 @@ async function loadModel() {
 const ready = loadModel().catch((error) => {
   loadError = error;
   const detail = error?.cause?.message || error?.message || error;
-  parentPort.postMessage({ type: 'status', state: 'error', message: String(detail).split('\n')[0] });
+  parentPort.postMessage({ type: 'status', state: 'error', message: 'OB-EMBED-001', detail: String(detail).split('\n')[0] });
 });
 
 parentPort.on('message', ({ type, id, text }) => {
