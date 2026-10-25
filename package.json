@@ -127,5 +127,6 @@
       ],
       "icon": "build/icon.ico"
     }
-  }
+  },
+  "license": "MIT"
 }
