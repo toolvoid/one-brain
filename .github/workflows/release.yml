@@ -75,6 +75,22 @@ jobs:
           pattern: One-Brain-*
           path: release
           merge-multiple: true
+      - name: Create stable installer names
+        shell: bash
+        run: |
+          set -euo pipefail
+          copy_installer() {
+            local source="$1"
+            local stable_name="$2"
+            if [[ ! -f "$source" ]]; then
+              echo "::error::Required installer is missing: ${source}"
+              exit 1
+            fi
+            cp "$source" "release/${stable_name}"
+          }
+          copy_installer 'release/One-Brain-1.5.1-linux-x64.AppImage' 'One-Brain-linux-x64.AppImage'
+          copy_installer 'release/One-Brain-1.5.1-win-x64.exe' 'One-Brain-win-x64.exe'
+          copy_installer 'release/One-Brain-1.5.1-mac-arm64.dmg' 'One-Brain-mac-arm64.dmg'
       - uses: softprops/action-gh-release@v2
         with:
           files: release/One-Brain-*
