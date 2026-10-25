@@ -29,7 +29,7 @@ if (smokeFlag) {
       const smokeDb = module.require(path.join(__dirname, 'db.js'));
       const status = await smokeDb.initializeDatabase(smokeUserData, smokeSafeStorage);
       if (!status.writable) throw new Error(`Smoke database is not writable: ${status.message || status.state}`);
-      const { memory } = smokeDb.addMemory({ source: 'built-in', title: 'Smoke test', content: 'Encrypted smoke test row.' });
+      const memory = smokeDb.addMemory({ source: 'built-in', title: 'Smoke test', content: 'Encrypted smoke test row.' });
       const roundTrip = smokeDb.getMemory(memory.id);
       if (!roundTrip || roundTrip.content !== 'Encrypted smoke test row.') throw new Error('Encrypted database row did not read back correctly.');
       require('onnxruntime-node');
