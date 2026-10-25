@@ -44,7 +44,12 @@
     "artifactName": "One-Brain-${version}-${os}-${arch}.${ext}",
     "npmRebuild": true,
     "asarUnpack": [
-      "**/*.node"
+      "**/*.node",
+      "electron/embedder-worker.mjs",
+      "electron/embedding-error.js",
+      "src/lib/embedder-config.mjs",
+      "node_modules/sharp/**",
+      "node_modules/@img/**"
     ],
     "directories": {
       "output": "release"

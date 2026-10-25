@@ -12,17 +12,22 @@ function archDirectory(arch) {
   return ({ 0: 'ia32', 1: 'x64', 2: 'armv7l', 3: 'arm64' })[arch] || String(arch);
 }
 
-function findNativeRoot(appOutDir) {
+function findUnpackedRoot(appOutDir) {
   const candidates = [
-    path.join(appOutDir, 'resources', 'app.asar.unpacked', NATIVE_RELATIVE_PATH),
-    path.join(appOutDir, 'Resources', 'app.asar.unpacked', NATIVE_RELATIVE_PATH),
+    path.join(appOutDir, 'resources', 'app.asar.unpacked'),
+    path.join(appOutDir, 'Resources', 'app.asar.unpacked'),
   ];
   try {
     for (const name of fs.readdirSync(appOutDir)) {
-      if (name.endsWith('.app')) candidates.push(path.join(appOutDir, name, 'Contents', 'Resources', 'app.asar.unpacked', NATIVE_RELATIVE_PATH));
+      if (name.endsWith('.app')) candidates.push(path.join(appOutDir, name, 'Contents', 'Resources', 'app.asar.unpacked'));
     }
   } catch {}
   return candidates.find((candidate) => fs.existsSync(candidate));
+}
+
+function findNativeRoot(appOutDir) {
+  const unpackedRoot = findUnpackedRoot(appOutDir);
+  return unpackedRoot ? path.join(unpackedRoot, NATIVE_RELATIVE_PATH) : undefined;
 }
 
 function directorySize(target) {
@@ -30,6 +35,28 @@ function directorySize(target) {
   const stat = fs.statSync(target);
   if (stat.isFile()) return stat.size;
   return fs.readdirSync(target).reduce((total, name) => total + directorySize(path.join(target, name)), 0);
+}
+
+function summarizeSharpRuntime(appOutDir) {
+  const unpackedRoot = findUnpackedRoot(appOutDir);
+  if (!unpackedRoot) return { bindingFiles: [], libvipsFiles: [], bytes: 0 };
+  const searchRoots = [path.join(unpackedRoot, 'node_modules', 'sharp'), path.join(unpackedRoot, 'node_modules', '@img')];
+  const bindingFiles = [];
+  const libvipsFiles = [];
+  function visit(directory) {
+    if (!fs.existsSync(directory)) return;
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const target = path.join(directory, entry.name);
+      if (entry.isDirectory()) visit(target);
+      else if (entry.isFile()) {
+        if (/^sharp-.+\.node$/i.test(entry.name)) bindingFiles.push(target);
+        if (/^libvips[^/]*\.(?:so(?:\..*)?|dylib|dll)$/i.test(entry.name)) libvipsFiles.push(target);
+      }
+    }
+  }
+  for (const root of searchRoots) visit(root);
+  const bytes = [...bindingFiles, ...libvipsFiles].reduce((total, file) => total + fs.statSync(file).size, 0);
+  return { bindingFiles, libvipsFiles, bytes };
 }
 
 function pruneNativeRuntime(appOutDir, platform, arch, logger = console) {
@@ -79,6 +106,17 @@ function pruneNativeRuntime(appOutDir, platform, arch, logger = console) {
 
 module.exports = async function afterPack(context) {
   pruneNativeRuntime(context.appOutDir, context.electronPlatformName, context.arch);
+  const sharpRuntime = summarizeSharpRuntime(context.appOutDir);
+  if (context.electronPlatformName === 'linux' && context.arch === 1) {
+    const bindingHasAdjacentLibvips = sharpRuntime.bindingFiles.some((binding) => {
+      if (!binding.includes(`${path.sep}sharp-linux-x64${path.sep}`)) return false;
+      const libvipsDirectory = path.resolve(path.dirname(binding), '..', '..', 'sharp-libvips-linux-x64', 'lib');
+      return sharpRuntime.libvipsFiles.includes(path.join(libvipsDirectory, 'libvips-cpp.so.8.18.7'));
+    });
+    if (!bindingHasAdjacentLibvips) throw new Error('[afterPack] unpacked sharp linux-x64 binding or its relative-RPATH libvips library is missing.');
+  }
+  console.log(`[afterPack] sharp native payload: ${sharpRuntime.bindingFiles.length} binding(s), ${sharpRuntime.libvipsFiles.length} libvips library file(s), ${(sharpRuntime.bytes / (1024 * 1024)).toFixed(1)} MiB unpacked`);
 };
 
 module.exports.pruneNativeRuntime = pruneNativeRuntime;
+module.exports.summarizeSharpRuntime = summarizeSharpRuntime;

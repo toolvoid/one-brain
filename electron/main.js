@@ -55,6 +55,8 @@ if (smokeFlag) {
       const roundTrip = smokeDb.getMemory(memory.id);
       if (!roundTrip || roundTrip.content !== 'Encrypted smoke test row.') throw new Error('Encrypted database row did not read back correctly.');
       require('onnxruntime-node');
+      const { pipeline } = await import('@huggingface/transformers');
+      if (typeof pipeline !== 'function') throw new Error('Transformers Node pipeline export is unavailable.');
       smokeDb.closeDatabaseForTest();
       fs.rmSync(smokeUserData, { recursive: true, force: true });
       console.log('SMOKE_OK');
@@ -115,6 +117,7 @@ const { rendererErrorLocation, rendererErrorMessage } = require('./renderer-erro
 const { readGraphicsSettings, writeGraphicsSettings } = require('./graphics-settings');
 const { getAutomaticSoftwareFallback, prepareGraphicsStartup, recordStableHardwareStart, resetGraphicsFailuresForRetry } = require('./graphics-fallback');
 const { buildRelaunchOptions } = require('./relaunch-options');
+const { embeddingErrorDetails } = require('./embedding-error');
 const graphicsUserDataPath = userDataRoot;
 let graphicsSettings = readGraphicsSettings(graphicsUserDataPath);
 const graphicsStartup = prepareGraphicsStartup(process.platform, graphicsSettings);
@@ -526,15 +529,28 @@ function configureReadyEmbedder(status) {
   });
 }
 
+function reportEmbeddingLoadFailure(error) {
+  const details = error?.code === 'OB-EMBED-001' && typeof error.message === 'string' && typeof error.stack === 'string'
+    ? error
+    : embeddingErrorDetails(error);
+  lifecycleLog.append('embedding_load_failed', {
+    code: 'OB-EMBED-001', errorName: details.name, errorMessage: details.message, stack: details.stack,
+  });
+  publishEmbeddingStatus({ state: 'error', message: details });
+}
+
 function startEmbedder() {
   if (!embedderManager) embedderManager = createLazyEmbedder({
-    createWorker: (onStatus) => createEmbedder(app.getPath('userData'), onStatus),
+    createWorker: (onStatus) => createEmbedder(app.getPath('userData'), onStatus, { appPath: app.getAppPath() }),
     onStatus: (status) => {
       if (status.state === 'ready') configureReadyEmbedder(status);
+      else if (status.state === 'error') reportEmbeddingLoadFailure(status.message);
       else publishEmbeddingStatus(status);
     },
   });
-  return embedderManager.ensureLoaded().catch(() => publishEmbeddingStatus({ state: 'error', message: 'OB-EMBED-001' }));
+  return embedderManager.ensureLoaded().catch((error) => {
+    if (embeddingStatus.state !== 'error') reportEmbeddingLoadFailure(error);
+  });
 }
 
 ipcMain.handle('memories:add', (_event, memory) => addMemory(memory, { handAdded: true }));

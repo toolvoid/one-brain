@@ -63,6 +63,6 @@ test('error message UI parses and includes title, fix, muted code, details, and 
   const file = path.join(ROOT, 'src/components/ErrorCodeMessage.jsx');
   const source = fs.readFileSync(file, 'utf8');
   assert.doesNotThrow(() => babel.transformSync(source, { filename: file, configFile: false, babelrc: false, plugins: [[jsxPlugin, { runtime: 'automatic' }]] }));
-  for (const label of ['app-error-code', 'app-error-fix', 'Likely cause:', 'Steps:', 'Copy code', 'Details']) assert.ok(source.includes(label), `error UI should include ${label}`);
+  for (const label of ['app-error-code', 'app-error-fix', 'Likely cause:', 'Steps:', 'Copy code', 'Details', 'diagnostic.name', 'diagnostic.message', 'diagnostic.stack']) assert.ok(source.includes(label), `error UI should include ${label}`);
 });
 

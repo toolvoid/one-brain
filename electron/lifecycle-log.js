@@ -59,6 +59,12 @@ function safeDetails(event, details = {}) {
     if (/^[\w.-]{1,100}$/.test(String(details.source || ''))) safe.source = String(details.source);
     if (Number.isFinite(Number(details.line)) && Number(details.line) > 0) safe.line = Math.floor(Number(details.line));
   }
+  if (event === 'embedding_load_failed') {
+    if (VALID_ERROR_CODES.has(String(details.code || ''))) safe.code = String(details.code);
+    if (/^[\w.$-]{1,100}$/.test(String(details.errorName || ''))) safe.errorName = String(details.errorName);
+    if (typeof details.errorMessage === 'string') safe.errorMessage = details.errorMessage.slice(0, 4_000);
+    if (typeof details.stack === 'string') safe.stack = details.stack.split(/\r?\n/).slice(0, 8).join('\n').slice(0, 8_000);
+  }
   if (['user_data_permissions_fixed', 'user_data_permissions_failed'].includes(event) && Number.isFinite(Number(details.count))) safe.count = Math.max(0, Math.floor(Number(details.count)));
   if (['window_created', 'window_closed', 'window_unresponsive', 'window_shown', 'window_hidden', 'window_minimized', 'window_restored'].includes(event)) {
     safe.window = String(details.window || 'main').slice(0, 32);
@@ -81,6 +87,7 @@ function safeRecord(value) {
 }
 
 function errorCodeForEvent(event, details = {}) {
+  if (event === 'embedding_load_failed') return 'OB-EMBED-001';
   if (event === 'renderer_error') return appError('OB-SYS-000', { errorName: details.name, where: details.source || 'renderer' }).code;
   if (['child_process_gone', 'render_process_gone'].includes(event) && Number(details.exitCode) === 139) return 'OB-GRAPH-001';
   if (['child_process_gone', 'render_process_gone'].includes(event)) return 'OB-SYS-004';

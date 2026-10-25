@@ -47,3 +47,23 @@ test('relative /models URLs are rejected before reaching fetch', async () => {
   await guarded('https://huggingface.co/Xenova/model/config.json');
   assert.equal(called, true);
 });
+
+test('transformers fetch guard preserves Electron global fetch and wraps the imported fetch', async () => {
+  const { configureModelFetch } = await import('../src/lib/embedder-config.mjs');
+  const originalGlobalFetch = globalThis.fetch;
+  let usedImportedFetch = false;
+  const importedElectronFetch = async () => { usedImportedFetch = true; return { ok: true }; };
+  const environment = { fetch: importedElectronFetch };
+  const guarded = configureModelFetch(environment, async () => { throw new Error('fallback fetch should not replace imported fetch'); });
+
+  await guarded('https://huggingface.co/model/config.json');
+  assert.equal(usedImportedFetch, true);
+  assert.equal(globalThis.fetch, originalGlobalFetch);
+  await assert.rejects(guarded('/models/model/config.json'), /absolute/);
+});
+
+test('packaged embedder worker path points outside app.asar while development stays in the project', () => {
+  const { resolveEmbedderWorkerPath } = require('../electron/embedder');
+  assert.equal(resolveEmbedderWorkerPath('/opt/one-brain/resources/app.asar'), '/opt/one-brain/resources/app.asar.unpacked/electron/embedder-worker.mjs');
+  assert.equal(resolveEmbedderWorkerPath('/workspace/one-brain'), '/workspace/one-brain/electron/embedder-worker.mjs');
+});

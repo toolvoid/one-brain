@@ -19,3 +19,10 @@ export function blockRelativeModelFetch(fetchImpl) {
     return fetchImpl(input, init);
   };
 }
+
+export function configureModelFetch(transformersEnvironment, fallbackFetch) {
+  const fetchImpl = transformersEnvironment?.fetch || fallbackFetch;
+  if (typeof fetchImpl !== 'function') throw new TypeError('Transformers fetch is unavailable.');
+  transformersEnvironment.fetch = blockRelativeModelFetch(fetchImpl);
+  return transformersEnvironment.fetch;
+}

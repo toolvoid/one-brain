@@ -16,6 +16,7 @@ export function ErrorCodeMessage({ error, where = 'renderer', fallbackCode = 'OB
     ? window.brain.appError(fallbackCode, details)
     : mapped || { code: fallbackCode, title: 'Unexpected error', message: String(source), fix: 'Try the action again. If it continues, copy the code and include it when asking for help.', severity: 'error' };
   const entry = useMemo(() => window.brain?.getErrorCodes?.().find((item) => item.code === normalized.code), [normalized.code]);
+  const diagnostic = error && typeof error === 'object' && error.code === 'OB-EMBED-001' ? error : null;
   async function copyCode() {
     try {
       const result = await window.brain?.copyText?.(normalized.code);
@@ -26,7 +27,7 @@ export function ErrorCodeMessage({ error, where = 'renderer', fallbackCode = 'OB
   return <section className={`app-error-message severity-${normalized.severity} ${className}`} role="alert">
     <div className="app-error-heading"><strong>{normalized.title}</strong><span className="app-error-code">{normalized.code}</span></div>
     <p>{normalized.message}</p><p className="app-error-fix"><strong>Try this:</strong> {normalized.fix}</p>
-    <div className="app-error-actions"><button type="button" onClick={copyCode}>{copied || 'Copy code'}</button><details><summary>Details</summary><p><strong>Likely cause:</strong> {entry?.cause || 'The app could not classify this error.'}</p><p><strong>Steps:</strong> {entry?.steps || normalized.fix}</p></details></div>
+    <div className="app-error-actions"><button type="button" onClick={copyCode}>{copied || 'Copy code'}</button><details><summary>Details</summary><p><strong>Likely cause:</strong> {entry?.cause || 'The app could not classify this error.'}</p><p><strong>Steps:</strong> {entry?.steps || normalized.fix}</p>{diagnostic && <><p><strong>Error:</strong> {diagnostic.name || 'Error'}: {diagnostic.message || 'No error message.'}</p>{diagnostic.stack && <pre className="app-error-stack">{diagnostic.stack}</pre>}</>}</details></div>
   </section>;
 }
 

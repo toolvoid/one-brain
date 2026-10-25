@@ -1,11 +1,16 @@
 import { mkdir } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import path from 'node:path';
 import { parentPort, workerData } from 'node:worker_threads';
-import { blockRelativeModelFetch, localModelEnvironment } from '../src/lib/embedder-config.mjs';
+import { configureModelFetch, localModelEnvironment } from '../src/lib/embedder-config.mjs';
+import embeddingErrorHelpers from './embedding-error.js';
 
 let extractor;
 let activeModel = workerData.model;
 let loadError = null;
 let work = Promise.resolve();
+const requireFromApp = createRequire(path.join(workerData.appPath, 'electron', 'embedder-worker.mjs'));
+const { embeddingFailureStatus, embeddingErrorDetails } = embeddingErrorHelpers;
 
 const MODEL_REVISIONS = Object.freeze({
   'Xenova/paraphrase-multilingual-MiniLM-L12-v2': '2c4055b12046f11709e9df2c122e59ffbdc2f900',
@@ -20,9 +25,10 @@ async function loadModel() {
   parentPort.postMessage({ type: 'status', state: 'loading' });
   const modelEnvironment = localModelEnvironment(workerData.userDataPath);
   await mkdir(modelEnvironment.cacheDir, { recursive: true });
-  const { env, pipeline } = await import('@huggingface/transformers');
+  const electronFetch = typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : undefined;
+  const { env, pipeline } = requireFromApp('@huggingface/transformers');
   Object.assign(env, modelEnvironment);
-  globalThis.fetch = blockRelativeModelFetch(globalThis.fetch.bind(globalThis));
+  configureModelFetch(env, electronFetch);
 
   try {
     extractor = await pipeline('feature-extraction', workerData.model, { dtype: 'q8', revision: MODEL_REVISIONS[workerData.model] });
@@ -42,8 +48,7 @@ async function loadModel() {
 
 const ready = loadModel().catch((error) => {
   loadError = error;
-  const detail = error?.cause?.message || error?.message || error;
-  parentPort.postMessage({ type: 'status', state: 'error', message: 'OB-EMBED-001', detail: String(detail).split('\n')[0] });
+  parentPort.postMessage(embeddingFailureStatus(error));
 });
 
 parentPort.on('message', ({ type, id, text }) => {
@@ -56,6 +61,6 @@ parentPort.on('message', ({ type, id, text }) => {
     const vector = new Float32Array(output.data);
     parentPort.postMessage({ type: 'embedding', id, vector }, [vector.buffer]);
   }).catch((error) => {
-    parentPort.postMessage({ type: 'embedding', id, error: String(error?.message || error).split('\n')[0] });
+    parentPort.postMessage({ type: 'embedding', id, error: embeddingErrorDetails(error) });
   });
 });
