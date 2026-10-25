@@ -61,7 +61,7 @@ jobs:
         run: '"release/mac-arm64/One Brain.app/Contents/MacOS/One Brain" --smoke-test'
       - name: Print installer sizes
         if: always()
-        run: node -e "const fs=require('fs'); for (const n of fs.readdirSync('release')) { const p='release/'+n; if (fs.statSync(p).isFile() && n.startsWith('One-Brain-')) console.log(n+': '+(fs.statSync(p).size/1048576).toFixed(1)+' MiB'); }"
+        run: node scripts/print-sizes.js
       - uses: actions/upload-artifact@v4
         if: always()
         with:
