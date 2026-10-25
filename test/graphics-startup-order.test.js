@@ -7,7 +7,6 @@ const path = require('node:path');
 test('Linux graphics switches and safe-mode call run before Electron window and app modules load', () => {
   const source = fs.readFileSync(path.join(__dirname, '../electron/main.js'), 'utf8');
   const switches = [
-    'app.commandLine.appendSwitch(\'ozone-platform\'',
     'app.commandLine.appendSwitch(\'use-gl\'',
     'app.commandLine.appendSwitch(\'use-angle\'',
     'app.disableHardwareAcceleration()'
@@ -20,4 +19,15 @@ test('Linux graphics switches and safe-mode call run before Electron window and 
     assert.ok(position < secondElectronRequire, `${expression} precedes BrowserWindow import`);
     assert.ok(position < databaseRequire, `${expression} precedes app module imports`);
   }
+});
+
+test('Wayland X11 re-exec happens before Electron loads and does not append ozone switches late', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../electron/main.js'), 'utf8');
+  const decision = source.indexOf('if (shouldForceX11(');
+  const electronRequire = source.indexOf("require('electron')");
+  assert.notEqual(decision, -1);
+  assert.ok(decision < electronRequire);
+  assert.ok(source.indexOf('process.exit(0)', decision) < electronRequire);
+  assert.doesNotMatch(source, /appendSwitch\(['"]ozone-platform['"]/);
+  assert.match(source.slice(0, electronRequire), /if \(!smokeFlag\)[\s\S]*shouldForceX11/);
 });

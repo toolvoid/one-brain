@@ -1,4 +1,26 @@
 const smokeFlag = process.argv.includes('--smoke-test');
+if (!smokeFlag) {
+  const { shouldForceX11 } = require('./linux-ozone');
+  if (shouldForceX11(process.platform, process.argv, process.env)) {
+    const { spawn } = require('node:child_process');
+    const environment = { ...process.env, ONE_BRAIN_X11_REEXEC: '1' };
+    const args = [...process.argv.slice(1), '--ozone-platform=x11'];
+    let command = process.env.APPIMAGE || process.execPath;
+    let spawnArgs = args;
+    let spawnOptions = { detached: true, stdio: 'ignore', env: environment };
+    if (process.env.APPIMAGE) {
+      const { buildRelaunchOptions } = require('./relaunch-options');
+      const options = buildRelaunchOptions(environment, [...process.argv, '--ozone-platform=x11']);
+      command = options.command;
+      spawnArgs = options.args;
+      spawnOptions = options.options;
+    }
+    const child = spawn(command, spawnArgs, spawnOptions);
+    child.unref();
+    process.exit(0);
+  }
+}
+
 if (smokeFlag) {
   const { app: smokeApp } = require('electron');
   const fs = require('node:fs');
@@ -53,6 +75,7 @@ if (!smokeFlag) {
 process.umask(0o077);
 const { enforcePrivateTree, cleanupSensitiveTemps } = require('./private-files');
 const { app, powerMonitor } = require('electron');
+const { spawn } = require('node:child_process');
 const path = require('path');
 const appIconPath = app.isPackaged
   ? path.join(process.resourcesPath, 'one-brain', 'icon.png')
@@ -91,6 +114,7 @@ const { createCrashLoopLimiter } = require('./window-lifecycle');
 const { rendererErrorLocation, rendererErrorMessage } = require('./renderer-errors');
 const { readGraphicsSettings, writeGraphicsSettings } = require('./graphics-settings');
 const { getAutomaticSoftwareFallback, prepareGraphicsStartup, recordStableHardwareStart, resetGraphicsFailuresForRetry } = require('./graphics-fallback');
+const { buildRelaunchOptions } = require('./relaunch-options');
 const graphicsUserDataPath = userDataRoot;
 let graphicsSettings = readGraphicsSettings(graphicsUserDataPath);
 const graphicsStartup = prepareGraphicsStartup(process.platform, graphicsSettings);
@@ -99,7 +123,6 @@ const graphicsStartupConfig = getGraphicsStartupConfig(process.platform, { ...pr
 let gpuCrashCount = 0;
 let graphicsStabilityTimer = null;
 let graphicsFallbackRestartScheduled = false;
-if (graphicsStartupConfig.ozonePlatform) app.commandLine.appendSwitch('ozone-platform', graphicsStartupConfig.ozonePlatform);
 if (graphicsStartupConfig.useGl) app.commandLine.appendSwitch('use-gl', graphicsStartupConfig.useGl);
 if (graphicsStartupConfig.useAngle) app.commandLine.appendSwitch('use-angle', graphicsStartupConfig.useAngle);
 if (graphicsStartupConfig.disableHardwareAcceleration) app.disableHardwareAcceleration();
@@ -300,8 +323,15 @@ function activateAutomaticSoftwareFallback(reason) {
   graphicsSettings = writeGraphicsSettings(graphicsUserDataPath, { ...next, restartNotice: false });
   graphicsRestartNoticePending = false;
   lifecycleLog.append('graphics_software_fallback', { reason, failureCount: graphicsSettings.failureCount });
-  app.relaunch();
-  app.quit();
+  const relaunchOptions = buildRelaunchOptions(process.env, process.argv);
+  if (relaunchOptions) {
+    const relaunchProcess = spawn(relaunchOptions.command, relaunchOptions.args, relaunchOptions.options);
+    relaunchProcess.unref();
+    app.exit(0);
+  } else {
+    app.relaunch();
+    app.quit();
+  }
   return true;
 }
 

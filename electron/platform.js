@@ -3,7 +3,11 @@ function getGraphicsStartupConfig(platform, env = {}, savedSettings = {}) {
   const linux = platform === 'linux';
   if (!linux) return { ozonePlatform: null, useGl: null, useAngle: null, disableHardwareAcceleration: false, safeGraphicsMode: false, mode: 'auto' };
   const args = Array.isArray(env.argv) ? env.argv : [];
-  const explicitOzone = args.some((arg) => String(arg).startsWith('--ozone-platform'));
+  const explicitOzone = args.some((arg) => {
+    const value = String(arg);
+    return value === '--ozone-platform' || value.startsWith('--ozone-platform=')
+      || value === '--ozone-platform-hint' || value.startsWith('--ozone-platform-hint=');
+  });
   const mode = ['auto', 'hardware', 'safe-software'].includes(savedSettings.mode)
     ? savedSettings.mode
     : (savedSettings.safeGraphicsMode === true ? 'safe-software' : 'auto');
