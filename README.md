@@ -26,9 +26,9 @@ Choose the installer for your system from [GitHub Releases](../../releases). The
 
 | Platform | Installer | Versioned artifact | Stable name | Download |
 | --- | --- | --- | --- | --- |
-| Linux x64 | AppImage | `One-Brain-<version>-linux-x64.AppImage` | `One-Brain-linux-x64.AppImage` | [Releases](../../releases) |
-| Windows x64 | NSIS installer | `One-Brain-<version>-win-x64.exe` | `One-Brain-win-x64.exe` | [Releases](../../releases) |
-| macOS Apple Silicon | DMG | `One-Brain-<version>-mac-arm64.dmg` | `One-Brain-mac-arm64.dmg` | [Releases](../../releases) |
+| Linux x64 | AppImage | `One-Brain-<version>-linux-x64.AppImage` | `One-Brain-linux-x64.AppImage` | [Download](https://github.com/toolvoid/one-brain/releases/latest/download/One-Brain-linux-x64.AppImage) |
+| Windows x64 | NSIS installer | `One-Brain-<version>-win-x64.exe` | `One-Brain-win-x64.exe` | [Download](https://github.com/toolvoid/one-brain/releases/latest/download/One-Brain-win-x64.exe) |
+| macOS Apple Silicon | DMG | `One-Brain-<version>-mac-arm64.dmg` | `One-Brain-mac-arm64.dmg` | [Download](https://github.com/toolvoid/one-brain/releases/latest/download/One-Brain-mac-arm64.dmg) |
 
 ## Quick start
 
