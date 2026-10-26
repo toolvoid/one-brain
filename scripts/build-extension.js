@@ -65,7 +65,12 @@ function build(browser, { root = ROOT, store = false } = {}) {
       extensionId = key.id;
     }
   }
-  if (browser === 'firefox') manifest.browser_specific_settings = { gecko: { id: 'one-brain-extension@one-brain.local' } };
+  if (browser === 'firefox') manifest.browser_specific_settings = {
+    gecko: {
+      id: 'one-brain-extension@one-brain.local',
+      data_collection_permissions: { required: ['personalCommunications'], optional: [] }
+    }
+  };
   fs.writeFileSync(path.join(directory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   const rootIcons = path.join(root, 'extension', 'assets', 'icons');
   const icons = fs.existsSync(rootIcons) ? rootIcons : path.join(ROOT, 'extension', 'assets', 'icons');
