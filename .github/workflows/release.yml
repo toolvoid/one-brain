@@ -75,10 +75,12 @@ jobs:
           pattern: One-Brain-*
           path: release
           merge-multiple: true
-      - name: Create stable installer names
+      - name: Create release installers
+        id: installers
         shell: bash
         run: |
           set -euo pipefail
+          enabled="$(node -p 'require("./download-config.cjs").ONEBRAIN_WIN_MAC_DOWNLOADS_ENABLED')"
           copy_installer() {
             local source="$1"
             local stable_name="$2"
@@ -89,9 +91,20 @@ jobs:
             cp "$source" "release/${stable_name}"
           }
           copy_installer 'release/One-Brain-1.5.1-linux-x86_64.AppImage' 'One-Brain-linux-x64.AppImage'
-          copy_installer 'release/One-Brain-1.5.1-win-x64.exe' 'One-Brain-win-x64.exe'
-          copy_installer 'release/One-Brain-1.5.1-mac-arm64.dmg' 'One-Brain-mac-arm64.dmg'
+          if [[ "$enabled" == "true" ]]; then
+            copy_installer 'release/One-Brain-1.5.1-win-x64.exe' 'One-Brain-win-x64.exe'
+            copy_installer 'release/One-Brain-1.5.1-mac-arm64.dmg' 'One-Brain-mac-arm64.dmg'
+          fi
+          files=('release/One-Brain-*linux*')
+          if [[ "$enabled" == "true" ]]; then
+            files+=('release/One-Brain-*win*' 'release/One-Brain-*mac*')
+          fi
+          {
+            echo 'files<<EOF'
+            printf '%s\n' "${files[@]}"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
       - uses: softprops/action-gh-release@v2
         with:
-          files: release/One-Brain-*
+          files: ${{ steps.installers.outputs.files }}
           generate_release_notes: true

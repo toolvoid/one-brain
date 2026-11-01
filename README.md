@@ -22,13 +22,13 @@ Useful context gets split across assistants and browser chats. One Brain keeps y
 
 ## Downloads
 
-Choose the installer for your system from [GitHub Releases](../../releases). The Linux x64 AppImage was measured at about **192 MiB**; artifact sizes can vary by release.
+Windows and macOS builds are paused while we fix a startup bug. Linux is available. Choose the Linux installer from [GitHub Releases](../../releases). The Linux x64 AppImage was measured at about **192 MiB**; artifact sizes can vary by release.
 
 | Platform | Installer | Versioned artifact | Stable name | Download |
 | --- | --- | --- | --- | --- |
 | Linux x64 | AppImage | `One-Brain-<version>-linux-x64.AppImage` | `One-Brain-linux-x64.AppImage` | [Download](https://github.com/toolvoid/one-brain/releases/latest/download/One-Brain-linux-x64.AppImage) |
-| Windows x64 | NSIS installer | `One-Brain-<version>-win-x64.exe` | `One-Brain-win-x64.exe` | [Download](https://github.com/toolvoid/one-brain/releases/latest/download/One-Brain-win-x64.exe) |
-| macOS Apple Silicon | DMG | `One-Brain-<version>-mac-arm64.dmg` | `One-Brain-mac-arm64.dmg` | [Download](https://github.com/toolvoid/one-brain/releases/latest/download/One-Brain-mac-arm64.dmg) |
+| Windows | — | — | — | Temporarily unavailable, fix in progress |
+| macOS | — | — | — | Temporarily unavailable, fix in progress |
 
 ## Quick start
 
@@ -43,17 +43,15 @@ Open **Settings → Connections** to add an AI client or pair the browser extens
 
 ## Supported platforms
 
-Linux x64, Windows x64, and macOS on Apple Silicon only. See [platform details](docs/supported-platforms.md).
+Linux x64 is currently available. See [platform details](docs/supported-platforms.md).
 
 ## Known limitations
 
-- Windows and macOS builds are built and smoke-tested in CI, but have not been manually tested.
-- Installers are unsigned; Windows SmartScreen and macOS Gatekeeper may warn.
+- Installers are unsigned and may trigger operating-system security warnings.
 - A signed automatic update source is not configured; install updates from releases.
 - Ubuntu AppImage use may require `libfuse2`.
 - On Wayland, One Brain re-launches under XWayland when available. Set `ONE_BRAIN_OZONE=auto` to skip that re-launch when collecting logs; XWayland is required for the automatic X11 path.
 - First use of semantic search needs internet to download the roughly 130 MB embedding model. A failure shows **OB-EMBED-001** and a Retry action.
-- Intel macOS is unsupported because the installed ONNX Runtime dependency has no `darwin/x64` native runtime.
 
 ## Project guides
 
