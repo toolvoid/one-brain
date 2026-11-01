@@ -36,8 +36,9 @@ function createTrustedAppUrl({ appRoot, devUrl = null }) {
     if (dev && url.origin === dev.origin) return true;
     if (url.protocol !== 'file:') return false;
     let filename;
-    try { filename = path.resolve(decodeURIComponent(url.pathname)); } catch { return false; }
-    return filename === root || filename.startsWith(`${root}${path.sep}`);
+    try { filename = path.resolve(require('node:url').fileURLToPath(url)); } catch { return false; }
+    const norm = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+    return norm(filename) === norm(root) || norm(filename).startsWith(`${norm(root)}${path.sep}`);
   };
 }
 
