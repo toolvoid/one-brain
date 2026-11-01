@@ -57,6 +57,13 @@ if (smokeFlag) {
       require('onnxruntime-node');
       const { pipeline } = await import('@huggingface/transformers');
       if (typeof pipeline !== 'function') throw new Error('Transformers Node pipeline export is unavailable.');
+      const { createTrustedAppUrl } = require('./electron-security');
+      const { pathToFileURL } = require('node:url');
+      const appRoot = smokeApp.getAppPath();
+      const isTrusted = createTrustedAppUrl({ appRoot });
+      const rendererUrl = pathToFileURL(path.join(appRoot, 'dist', 'index.html')).href;
+      if (!isTrusted(rendererUrl)) throw new Error(`Packaged renderer URL is not trusted: ${rendererUrl}`);
+      if (isTrusted(pathToFileURL(path.join(os.tmpdir(), 'outside.html')).href)) throw new Error('A file outside the app root was trusted.');
       smokeDb.closeDatabaseForTest();
       fs.rmSync(smokeUserData, { recursive: true, force: true });
       console.log('SMOKE_OK');
