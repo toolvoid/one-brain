@@ -1,0 +1,49 @@
+name: Windows launch test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  launch:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build:extension:store
+      - run: npm run build
+      - run: npx electron-builder --win --x64 --dir --publish never
+      - name: Launch the packaged app and inspect it
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path launch-out | Out-Null
+          $exe = (Resolve-Path "release/win-unpacked/One Brain.exe").Path
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 90
+          try {
+            Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+            $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+            $bmp.Save("launch-out/screen.png")
+          } catch { Write-Host "Screenshot failed: $_" }
+          $dir = Join-Path $env:APPDATA "one-brain"
+          $log = Join-Path $dir "lifecycle.log"
+          if (Test-Path $log) { Copy-Item $log launch-out/lifecycle.log; Get-Content $log } else { Write-Host "lifecycle.log missing"; Get-ChildItem $dir -Force -ErrorAction SilentlyContinue | Select Name }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          $text = if (Test-Path $log) { Get-Content $log -Raw } else { "" }
+          if (-not $text) { throw "lifecycle.log is missing or empty" }
+          if ($text -notmatch "window_shown") { throw "Main window was never shown" }
+          if ($text -match "ipc_denied") { throw "ipc_denied found in lifecycle.log" }
+          if ($text -match "window_unresponsive") { throw "window_unresponsive found in lifecycle.log" }
+          Write-Host "LAUNCH_OK"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-launch-out
+          path: launch-out/*
+          if-no-files-found: warn
